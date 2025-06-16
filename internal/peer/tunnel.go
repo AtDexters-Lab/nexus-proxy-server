@@ -1,11 +1,12 @@
-package hub
+package peer
 
 import (
 	"io"
 	"net"
 	"time"
 
-	"github.com/AtDexters-Lab/global-access-relay/internal/protocol"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/protocol"
 	"github.com/google/uuid"
 )
 
@@ -13,13 +14,13 @@ import (
 // that is being tunneled from another peer.
 type TunneledConn struct {
 	clientID uuid.UUID
-	peer     Peer
+	peer     iface.Peer
 	pipe     *io.PipeReader
 	pipeW    *io.PipeWriter
 }
 
 // NewTunneledConn creates a new virtual connection for a tunneled client.
-func NewTunneledConn(clientID uuid.UUID, peer Peer) *TunneledConn {
+func NewTunneledConn(clientID uuid.UUID, peer iface.Peer) *TunneledConn {
 	pr, pw := io.Pipe()
 	return &TunneledConn{
 		clientID: clientID,

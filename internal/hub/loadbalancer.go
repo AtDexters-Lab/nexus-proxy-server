@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"sync"
+
+	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
 )
 
 // LoadBalancerPool manages a collection of backend instances for a single hostname.
@@ -56,7 +58,7 @@ func (p *LoadBalancerPool) HasBackends() bool {
 	return len(p.backends) > 0
 }
 
-func (p *LoadBalancerPool) Select() (*Backend, error) {
+func (p *LoadBalancerPool) Select() (iface.Backend, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.backends) == 0 {

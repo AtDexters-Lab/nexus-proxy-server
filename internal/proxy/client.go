@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AtDexters-Lab/global-access-relay/internal/config"
-	"github.com/AtDexters-Lab/global-access-relay/internal/hub"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
 	"github.com/google/uuid"
 )
 
@@ -36,12 +36,12 @@ func PutBuffer(buf *[]byte) {
 type Client struct {
 	id      uuid.UUID
 	conn    net.Conn
-	backend *hub.Backend
+	backend iface.Backend
 	config  *config.Config
 }
 
 // NewClient creates a new client handler.
-func NewClient(conn net.Conn, backend *hub.Backend, cfg *config.Config) *Client {
+func NewClient(conn net.Conn, backend iface.Backend, cfg *config.Config) *Client {
 	return &Client{
 		id:      uuid.New(),
 		conn:    conn,

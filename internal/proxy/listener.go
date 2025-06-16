@@ -7,9 +7,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/AtDexters-Lab/global-access-relay/internal/config"
-	"github.com/AtDexters-Lab/global-access-relay/internal/hub"
-	"github.com/AtDexters-Lab/global-access-relay/internal/peer"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
 )
 
 const httpPort = 80
@@ -17,26 +16,26 @@ const httpPort = 80
 // Listener is responsible for accepting incoming connections from end-users.
 type Listener struct {
 	config      *config.Config
-	hub         *hub.Hub
-	peerManager peer.PeerManager
+	hub         iface.Hub
+	peerManager iface.PeerManager
 	wg          sync.WaitGroup
 	listeners   []net.Listener
 	mu          sync.Mutex
 }
 
 // NewListener creates a new Listener instance.
-func NewListener(cfg *config.Config, hub *hub.Hub, pm peer.PeerManager) *Listener {
+func NewListener(cfg *config.Config, hub iface.Hub, pm iface.PeerManager) *Listener {
 	return &Listener{
 		config:      cfg,
 		hub:         hub,
 		peerManager: pm,
-		listeners:   make([]net.Listener, 0, len(cfg.ProxyPorts)),
+		listeners:   make([]net.Listener, 0, len(cfg.RelayPorts)),
 	}
 }
 
 // Run starts listeners on all configured proxy ports.
 func (l *Listener) Run() {
-	for _, port := range l.config.ProxyPorts {
+	for _, port := range l.config.RelayPorts {
 		l.wg.Add(1)
 		go l.listenOnPort(port)
 	}

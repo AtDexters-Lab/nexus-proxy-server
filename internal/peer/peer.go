@@ -1,4 +1,4 @@
-package hub
+package peer
 
 import (
 	"context"
@@ -9,21 +9,19 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AtDexters-Lab/global-access-relay/internal/config"
-	"github.com/AtDexters-Lab/global-access-relay/internal/protocol"
-	"github.com/AtDexters-Lab/global-access-relay/internal/proxy"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/protocol"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/proxy"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
-const reconnectDelay = 5 * time.Second
-
-// Peer represents a single, persistent WebSocket connection to another Nexus node.
-type Peer interface {
-	Addr() string
-	Send(message []byte)
-	StartTunnel(conn net.Conn, hostname string)
-}
+const (
+	writeWait      = 10 * time.Second
+	pongWait       = 60 * time.Second
+	pingPeriod     = (pongWait * 9) / 10
+	reconnectDelay = 5 * time.Second
+)
 
 type peerImpl struct {
 	addr    string
@@ -31,7 +29,6 @@ type peerImpl struct {
 	config  *config.Config
 	manager *Manager
 	send    chan []byte
-	connMu  sync.Mutex
 }
 
 // NewPeer creates a new Peer instance.
@@ -99,6 +96,7 @@ func (p *peerImpl) handleConnection(ctx context.Context) {
 
 // Send queues a message to be sent to the peer.
 func (p *peerImpl) Send(message []byte) {
+	// A non-blocking send to the channel.
 	select {
 	case p.send <- message:
 	default:

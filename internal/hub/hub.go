@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AtDexters-Lab/global-access-relay/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
@@ -19,26 +19,18 @@ const (
 	shutdownTimeout = 5 * time.Second
 )
 
-// Hub manages the lifecycle of backend and peer WebSocket connections.
-type Hub struct {
+// Hub manages the lifecycle of backend WebSocket connections.
+type hubImpl struct {
 	config      *config.Config
 	server      *http.Server
 	upgrader    websocket.Upgrader
 	pools       sync.Map // key: hostname (string), value: *LoadBalancerPool
-	peerManager peer.PeerManager
+	peerManager iface.PeerManager
 }
 
-// PeerManager is an interface that the Hub uses to interact with the peer manager.
-type PeerManager interface {
-	HandleInboundPeer(conn *websocket.Conn)
-	AnnounceLocalRoutes()
-	GetPeerForHostname(hostname string) (peer.Peer, bool)
-	HandleTunnelRequest(p peer.Peer, hostname string, clientID uuid.UUID)
-}
-
-// NewHub creates and returns a new Hub instance.
-func NewHub(cfg *config.Config) *Hub {
-	return &Hub{
+// New creates and returns a new Hub instance.
+func New(cfg *config.Config) *hubImpl {
+	return &hubImpl{
 		config: cfg,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
@@ -46,30 +38,31 @@ func NewHub(cfg *config.Config) *Hub {
 	}
 }
 
-// SetPeerManager sets the peer manager for the hub.
-func (h *Hub) SetPeerManager(pm PeerManager) {
+// SetPeerManager sets the peer manager for the hub. This is done after
+// initialization to break the circular dependency.
+func (h *hubImpl) SetPeerManager(pm iface.PeerManager) {
 	h.peerManager = pm
 }
 
 // Run starts the Hub's HTTP server.
-func (h *Hub) Run() {
+func (h *hubImpl) Run() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/connect", h.handleBackendConnect)
-	mux.HandleFunc("/mesh", h.handlePeerConnect)
+	mux.HandleFunc("/mesh", h.HandlePeerConnect)
 
 	h.server = &http.Server{
-		Addr:    h.config.ListenAddress,
+		Addr:    h.config.BackendListenAddress,
 		Handler: mux,
 	}
 
-	log.Printf("INFO: Hub listening on %s", h.config.ListenAddress)
+	log.Printf("INFO: Hub listening on %s", h.config.BackendListenAddress)
 	if err := h.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("FATAL: Hub failed to start: %v", err)
 	}
 }
 
 // Stop gracefully shuts down the Hub's HTTP server.
-func (h *Hub) Stop() {
+func (h *hubImpl) Stop() {
 	log.Println("INFO: Shutting down hub...")
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
@@ -82,7 +75,7 @@ func (h *Hub) Stop() {
 }
 
 // SelectBackend finds the load balancer pool for the given hostname.
-func (h *Hub) SelectBackend(hostname string) (*Backend, error) {
+func (h *hubImpl) SelectBackend(hostname string) (iface.Backend, error) {
 	rawPool, ok := h.pools.Load(hostname)
 	if !ok {
 		return nil, fmt.Errorf("no backend pool available for hostname: %s", hostname)
@@ -93,7 +86,7 @@ func (h *Hub) SelectBackend(hostname string) (*Backend, error) {
 }
 
 // handleBackendConnect handles a connection from a backend service.
-func (h *Hub) handleBackendConnect(w http.ResponseWriter, r *http.Request) {
+func (h *hubImpl) handleBackendConnect(w http.ResponseWriter, r *http.Request) {
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("ERROR: Failed to upgrade backend connection: %v", err)
@@ -116,8 +109,8 @@ func (h *Hub) handleBackendConnect(w http.ResponseWriter, r *http.Request) {
 	backend.StartPumps()
 }
 
-// handlePeerConnect handles a connection from another Nexus node.
-func (h *Hub) handlePeerConnect(w http.ResponseWriter, r *http.Request) {
+// HandlePeerConnect handles a connection from another Nexus node.
+func (h *hubImpl) HandlePeerConnect(w http.ResponseWriter, r *http.Request) {
 	if h.peerManager == nil {
 		log.Printf("ERROR: Peer manager not initialized, cannot handle peer connection.")
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
@@ -148,7 +141,7 @@ type BackendClaims struct {
 }
 
 // authenticateBackend waits for and validates a backend's JWT.
-func (h *Hub) authenticateBackend(conn *websocket.Conn) (*Backend, error) {
+func (h *hubImpl) authenticateBackend(conn *websocket.Conn) (*Backend, error) {
 	if err := conn.SetReadDeadline(time.Now().Add(authTimeout)); err != nil {
 		return nil, fmt.Errorf("failed to set read deadline: %w", err)
 	}
@@ -165,11 +158,7 @@ func (h *Hub) authenticateBackend(conn *websocket.Conn) (*Backend, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
-		secret, ok := h.config.Backends[claims.Hostname]
-		if !ok {
-			return nil, fmt.Errorf("unrecognized hostname in JWT claims: %s", claims.Hostname)
-		}
-		return []byte(secret), nil
+		return []byte(h.config.BackendsJWTSecret), nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("JWT validation failed: %w", err)
@@ -177,10 +166,14 @@ func (h *Hub) authenticateBackend(conn *websocket.Conn) (*Backend, error) {
 	if !token.Valid {
 		return nil, fmt.Errorf("invalid JWT token")
 	}
+	if claims.Hostname == "" {
+		return nil, fmt.Errorf("JWT claim 'hostname' is missing or empty")
+	}
+
 	return NewBackend(conn, claims.Hostname, claims.Weight, h.config), nil
 }
 
-func (h *Hub) register(b *Backend) {
+func (h *hubImpl) register(b *Backend) {
 	rawPool, _ := h.pools.LoadOrStore(b.hostname, NewLoadBalancerPool())
 	pool := rawPool.(*LoadBalancerPool)
 	pool.AddBackend(b)
@@ -188,7 +181,7 @@ func (h *Hub) register(b *Backend) {
 	h.updateAndAnnounceRoutes()
 }
 
-func (h *Hub) unregister(b *Backend) {
+func (h *hubImpl) unregister(b *Backend) {
 	b.Close()
 	if rawPool, ok := h.pools.Load(b.hostname); ok {
 		pool := rawPool.(*LoadBalancerPool)
@@ -198,17 +191,14 @@ func (h *Hub) unregister(b *Backend) {
 	}
 }
 
-// updateAndAnnounceRoutes calculates the current set of locally available hostnames
-// and tells the peer manager to broadcast this state to all peers.
-func (h *Hub) updateAndAnnounceRoutes() {
+func (h *hubImpl) updateAndAnnounceRoutes() {
 	if h.peerManager == nil {
 		return
 	}
 	h.peerManager.AnnounceLocalRoutes()
 }
 
-// GetLocalRoutes returns a slice of all hostnames currently serviced by local backends.
-func (h *Hub) GetLocalRoutes() []string {
+func (h *hubImpl) GetLocalRoutes() []string {
 	hostnames := make([]string, 0)
 	h.pools.Range(func(key, value interface{}) bool {
 		hostname := key.(string)

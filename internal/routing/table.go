@@ -4,7 +4,7 @@ import (
 	"log"
 	"sync"
 
-	"github.com/AtDexters-Lab/global-access-relay/internal/peer"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
 )
 
 // Table holds the dynamic routing information for the mesh.
@@ -28,7 +28,7 @@ func NewTable() *Table {
 
 // UpdateRoutesForPeer updates the routing table with the hostnames serviced by a peer,
 // but only if the provided version number is newer than the last one seen.
-func (t *Table) UpdateRoutesForPeer(p peer.Peer, version uint64, hostnames []string) {
+func (t *Table) UpdateRoutesForPeer(p iface.Peer, version uint64, hostnames []string) {
 	// Get the last known state for this peer.
 	rawState, _ := t.peerStates.LoadOrStore(p.Addr(), peerState{version: 0, hostnames: make(map[string]struct{})})
 	state := rawState.(peerState)
@@ -58,7 +58,7 @@ func (t *Table) UpdateRoutesForPeer(p peer.Peer, version uint64, hostnames []str
 }
 
 // ClearRoutesForPeer removes all routes associated with a given peer.
-func (t *Table) ClearRoutesForPeer(p peer.Peer) {
+func (t *Table) ClearRoutesForPeer(p iface.Peer) {
 	if rawState, ok := t.peerStates.Load(p.Addr()); ok {
 		state := rawState.(peerState)
 		for hostname := range state.hostnames {
@@ -69,9 +69,9 @@ func (t *Table) ClearRoutesForPeer(p peer.Peer) {
 }
 
 // GetPeerForHostname finds a peer that services the given hostname.
-func (t *Table) GetPeerForHostname(hostname string) (peer.Peer, bool) {
+func (t *Table) GetPeerForHostname(hostname string) (iface.Peer, bool) {
 	if rawPeer, ok := t.routes.Load(hostname); ok {
-		if p, ok := rawPeer.(peer.Peer); ok {
+		if p, ok := rawPeer.(iface.Peer); ok {
 			return p, true
 		}
 	}

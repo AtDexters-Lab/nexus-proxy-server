@@ -7,7 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AtDexters-Lab/global-access-relay/internal/protocol"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/protocol"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
@@ -23,6 +24,7 @@ const (
 type Backend struct {
 	id          string
 	conn        *websocket.Conn
+	config      *config.Config
 	hostname    string
 	weight      int
 	connMu      sync.Mutex
@@ -31,10 +33,11 @@ type Backend struct {
 }
 
 // NewBackend creates a new Backend instance.
-func NewBackend(conn *websocket.Conn, hostname string, weight int) *Backend {
+func NewBackend(conn *websocket.Conn, hostname string, weight int, cfg *config.Config) *Backend {
 	return &Backend{
 		id:          uuid.New().String(),
 		conn:        conn,
+		config:      cfg,
 		hostname:    hostname,
 		weight:      weight,
 		dataForSelf: make(chan []byte, 256),

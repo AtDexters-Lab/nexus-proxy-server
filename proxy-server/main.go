@@ -9,10 +9,10 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/AtDexters-Lab/global-access-relay/internal/config"
-	"github.com/AtDexters-Lab/global-access-relay/internal/hub"
-	"github.com/AtDexters-Lab/global-access-relay/internal/peer"
-	"github.com/AtDexters-Lab/global-access-relay/internal/proxy"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/hub"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/peer"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/proxy"
 )
 
 func main() {
@@ -40,7 +40,7 @@ func main() {
 
 	// We must initialize components in an order that allows dependency injection
 	// while avoiding circular dependencies.
-	backendHub := hub.NewHub(cfg)
+	backendHub := hub.New(cfg)
 	peerManager := peer.NewManager(cfg, backendHub)
 	clientListener := proxy.NewListener(cfg, backendHub, peerManager)
 

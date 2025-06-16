@@ -11,7 +11,7 @@ import (
 // Config holds the entire application configuration, loaded from a YAML file.
 type Config struct {
 	BackendListenAddress string   `yaml:"backendListenAddress"`
-	BackendJWTSecret     string   `yaml:"backendsJWTSecret"`
+	BackendsJWTSecret    string   `yaml:"backendsJWTSecret"`
 	RelayPorts           []int    `yaml:"relayPorts"`
 	IdleTimeoutSeconds   int      `yaml:"idleTimeoutSeconds"`
 	PeerSecret           string   `yaml:"peerSecret"`
@@ -37,13 +37,13 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	if cfg.BackendListenAddress == "" {
-		return nil, fmt.Errorf("config validation failed: listenAddress must be set")
+		return nil, fmt.Errorf("config validation failed: backendListenAddress must be set")
 	}
 	if len(cfg.RelayPorts) == 0 {
-		return nil, fmt.Errorf("config validation failed: at least one proxyPort must be specified")
+		return nil, fmt.Errorf("config validation failed: at least one relayPort must be specified")
 	}
-	if len(cfg.BackendJWTSecret) == 0 {
-		return nil, fmt.Errorf("config validation failed: BackendJWTSecret must be set")
+	if cfg.BackendsJWTSecret == "" {
+		return nil, fmt.Errorf("config validation failed: backendsJWTSecret must be set")
 	}
 	if cfg.IdleTimeoutSeconds < 0 {
 		return nil, fmt.Errorf("config validation failed: idleTimeoutSeconds cannot be negative")

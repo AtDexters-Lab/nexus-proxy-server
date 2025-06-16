@@ -1,4 +1,4 @@
-package hub
+package peer
 
 import (
 	"context"
@@ -7,10 +7,11 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/AtDexters-Lab/global-access-relay/internal/config"
-	"github.com/AtDexters-Lab/global-access-relay/internal/protocol"
-	"github.com/AtDexters-Lab/global-access-relay/internal/proxy"
-	"github.com/AtDexters-Lab/global-access-relay/internal/routing"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/protocol"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/proxy"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/routing"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
@@ -19,7 +20,7 @@ import (
 // to all peer Nexus nodes and managing the global routing table.
 type Manager struct {
 	config        *config.Config
-	hub           Hub
+	hub           iface.Hub
 	routingTable  *routing.Table
 	outboundPeers sync.Map // Map of peer address to *Peer
 	inboundPeers  sync.Map // Map of peer connection to *Peer
@@ -30,7 +31,7 @@ type Manager struct {
 }
 
 // NewManager creates a new peer manager.
-func NewManager(cfg *config.Config, hub Hub) *Manager {
+func NewManager(cfg *config.Config, hub iface.Hub) *Manager {
 	return &Manager{
 		config:       cfg,
 		hub:          hub,
@@ -116,13 +117,13 @@ func (m *Manager) ClearRoutesForPeer(p *peerImpl) {
 }
 
 // GetPeerForHostname checks the routing table for a peer that can service a given hostname.
-func (m *Manager) GetPeerForHostname(hostname string) (Peer, bool) {
+func (m *Manager) GetPeerForHostname(hostname string) (iface.Peer, bool) {
 	return m.routingTable.GetPeerForHostname(hostname)
 }
 
 // HandleTunnelRequest is called by a peer's read pump when it receives a request to
 // establish a tunnel for a client. It selects a local backend and starts the proxying.
-func (m *Manager) HandleTunnelRequest(p Peer, hostname string, clientID uuid.UUID) {
+func (m *Manager) HandleTunnelRequest(p iface.Peer, hostname string, clientID uuid.UUID) {
 	log.Printf("INFO: [TUNNEL-IN] Received tunnel request for client %s to hostname '%s' from peer %s", clientID, hostname, p.Addr())
 	backend, err := m.hub.SelectBackend(hostname)
 	if err != nil {
