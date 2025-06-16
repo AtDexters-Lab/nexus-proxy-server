@@ -1,5 +1,5 @@
 # Address for the backend hub to listen on for WebSocket connections.
-backendListenAddress: "8443"
+backendListenAddress: ":8443"
 
 # Ports to listen on for public client traffic.
 # Port 80 is treated as L7 HTTP, all others as L4 TCP.
