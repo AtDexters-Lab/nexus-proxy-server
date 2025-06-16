@@ -19,12 +19,12 @@ The core mission of Nexus is to intelligently route client requests to the appro
 
 ## Architectural Decisions & Rationale
 
-| Decision                   | Rationale                                                                                                                                                                                                                                                                                                                                                        |
-| :------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **No Session Stickiness** | We initially explored IP-based stickiness and consistent hashing. Both introduced significant complexity and state-synchronization challenges. The most robust and scalable modern architecture is to make the edge stateless and delegate session management to the backend services themselves (e.g., using a shared Redis or database). This simplifies the proxy immeasurably. |
-| **WebSockets for Backends**| Instead of requiring backends to accept raw TCP, they connect *outbound* to the proxy via WebSockets. This is more firewall-friendly, uses a standard, well-supported protocol, and provides a natural framing mechanism for our multiplexing protocol.                                                                                                    |
-| **No TLS Termination** | This is the core privacy and security principle. It ensures the unencrypted application data never touches the proxy. It also delegates the responsibility of certificate management entirely to the backend services, where it belongs.                                                                                                                                    |
-| **Hybrid L4/L7 Proxy** | While a pure passthrough proxy is architecturally "cleaner," it's not practical. To support automated certificate renewal via the standard `HTTP-01` challenge, the proxy must be able to route plain HTTP traffic from port 80. We chose this over the `DNS-01` challenge to avoid creating a dependency on external DNS provider APIs, making Nexus more self-contained. |
+| Decision                           | Rationale                                                                                                                                                                                                                                                                                                                                                                           |
+| :--------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **No Session Stickiness**          | We initially explored IP-based stickiness and consistent hashing. Both introduced significant complexity and state-synchronization challenges. The most robust and scalable modern architecture is to make the edge stateless and delegate session management to the backend services themselves (e.g., using a shared Redis or database). This simplifies the proxy immeasurably.  |
+| **WebSockets for Backends**        | Instead of requiring backends to accept raw TCP, they connect *outbound* to the proxy via WebSockets. This is more firewall-friendly, uses a standard, well-supported protocol, and provides a natural framing mechanism for our multiplexing protocol.                                                                                                                             |
+| **No TLS Termination**             | This is the core privacy and security principle. It ensures the unencrypted application data never touches the proxy. It also delegates the responsibility of certificate management entirely to the backend services, where it belongs.                                                                                                                                            |
+| **Hybrid L4/L7 Proxy**             | While a pure passthrough proxy is architecturally "cleaner," it's not practical. To support automated certificate renewal via the standard `HTTP-01` challenge, the proxy must be able to route plain HTTP traffic from port 80. We chose this over the `DNS-01` challenge to avoid creating a dependency on external DNS provider APIs, making Nexus more self-contained.          |
 | **Inter-Proxy Mesh for Tunneling** | Requiring every backend to connect to every proxy globally does not scale. The mesh design allows backends to connect to a small regional "pod" of proxies. If a client connects to a different region, the proxy can tunnel the traffic to the correct region. This optimizes for backend connection resources and uses tunneling as a cross-region failover or routing mechanism. |
 
 
@@ -105,3 +105,13 @@ backendsJWTSecret: "a-very-strong-jwt-secret-from-the-central-authorizer"
 peers:
   - "wss://[nexus-eu.example.com/mesh](https://nexus-eu.example.com/mesh)"
 ```
+
+## The Piccolo Ecosystem: A Perfect Backend for Nexus
+
+Nexus Proxy was designed to be the ideal gateway for personal, self-hosted services that prioritize privacy and data ownership. A perfect reference implementation for a Nexus-compatible backend is the **Piccolo**.
+
+Piccolo is a palm-sized personal server that gives you global access to your files and applications while ensuring total privacy. It's designed to offer the convenience of cloud services without sacrificing control over your digital life.
+
+By connecting a Piccolo device as a backend to Nexus, you can securely expose your self-hosted services to the world without compromising your privacy.
+
+Learn more about running your own personal server here: **[Get Piccolo](https://piccolospace.com/getpiccolo/)**
