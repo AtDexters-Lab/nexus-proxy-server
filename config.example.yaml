@@ -1,0 +1,32 @@
+# Address for the backend hub to listen on for WebSocket connections.
+backendListenAddress: ":8443"
+
+# TLS certificate and key for the hub server. (Mandatory)
+# For local dev generate with: https://mkcert.dev/
+hubTlsCertFile: "/path/to/your/cert.pem"
+hubTlsKeyFile: "/path/to/your/key.pem"
+
+# Ports to listen on for public client traffic.
+# Port 80 is treated as L7 HTTP, all others as L4 TCP.
+relayPorts:
+  - 443
+  - 80
+
+# Time in seconds that a client connection can be idle before being closed.
+# Set to 0 to disable idle timeouts.
+idleTimeoutSeconds: 60
+
+# A shared secret used to authenticate connections between peer nodes.
+# Must be the same on all nodes in the mesh.
+peerSecret: "a-very-strong-secret-for-the-mesh-change-this"
+
+# A secret used to authenticate connections with backends.
+# The backends authenticate with a central authorizer to generate their JWTs.
+# This secret will be used to validate those JWTs.
+backendsJWTSecret: "a-very-strong-jwt-secret-for-the-central authorizer"
+
+# A map of peer Nexus nodes that this node will connect to, to form the mesh.
+# This enables cross-region request tunneling.
+peers:
+  - "wss://nexus-eu.example.com/mesh"
+  - "wss://nexus-ap.example.com/mesh"
