@@ -108,7 +108,7 @@ peers:
 
 ## The Piccolo Ecosystem: A Perfect Backend for Nexus
 
-Nexus Proxy was designed to be the ideal gateway for personal, self-hosted services that prioritize privacy and data ownership. A perfect reference implementation for a Nexus-compatible backend is the **Piccolo**.
+Nexus Proxy was designed to be the ideal gateway for personal, self-hosted services that prioritize privacy and data ownership. A perfect reference implementation for a Nexus-compatible backend is the **[Piccolo](https://piccolospace.com/)**.
 
 Piccolo is a palm-sized personal server that gives you global access to your files and applications while ensuring total privacy. It's designed to offer the convenience of cloud services without sacrificing control over your digital life.
 
