@@ -77,6 +77,7 @@ func (b *Backend) StartPumps() {
 
 func (b *Backend) AddClient(clientConn net.Conn, clientID uuid.UUID) {
 	b.clients.Store(clientID, clientConn)
+	// TODO: Extend protocol to include original dest port
 	msg := protocol.ControlMessage{Event: protocol.EventConnect, ClientID: clientID}
 	b.SendControlMessage(msg)
 }
@@ -95,7 +96,12 @@ func (b *Backend) SendData(clientID uuid.UUID, data []byte) {
 	copy(header[1:], clientID[:])
 
 	message := append(header, data...)
-	b.dataForSelf <- message
+	// Use a non-blocking send to avoid a slow client blocking the proxy.
+	select {
+	case b.dataForSelf <- message:
+	default:
+		log.Printf("WARN: Backend %s send channel full. Dropping data for client %s.", b.id, clientID)
+	}
 }
 
 func (b *Backend) SendControlMessage(msg protocol.ControlMessage) {
@@ -130,29 +136,67 @@ func (b *Backend) readPump() {
 			break
 		}
 
-		if len(message) < 1+protocol.ClientIDLength {
-			log.Printf("WARN: Received malformed message from backend %s: too short", b.id)
+		if len(message) < 1 {
 			continue
 		}
 
-		var clientID uuid.UUID
-		copy(clientID[:], message[1:1+protocol.ClientIDLength])
+		controlByte := message[0]
+		payload := message[1:]
 
-		payload := message[1+protocol.ClientIDLength:]
+		switch controlByte {
+		case protocol.ControlByteControl:
+			var msg protocol.ControlMessage
+			if err := json.Unmarshal(payload, &msg); err != nil {
+				log.Printf("WARN: Malformed control message from backend %s", b.id)
+				continue
+			}
+			b.handleControlMessage(msg)
 
-		if rawConn, ok := b.clients.Load(clientID); ok {
-			if clientConn, ok := rawConn.(net.Conn); ok {
-				if b.config.IdleTimeout() > 0 {
-					clientConn.SetWriteDeadline(time.Now().Add(b.config.IdleTimeout()))
-				}
-				if _, err := clientConn.Write(payload); err != nil {
-					log.Printf("WARN: Failed to write to client %s: %v. Closing.", clientID, err)
-					clientConn.Close()
+		case protocol.ControlByteData:
+			if len(payload) < protocol.ClientIDLength {
+				continue
+			}
+			var clientID uuid.UUID
+			copy(clientID[:], payload[:protocol.ClientIDLength])
+			data := payload[protocol.ClientIDLength:]
+
+			if rawConn, ok := b.clients.Load(clientID); ok {
+				if clientConn, ok := rawConn.(net.Conn); ok {
+					if b.config.IdleTimeout() > 0 {
+						clientConn.SetWriteDeadline(time.Now().Add(b.config.IdleTimeout()))
+					}
+					if _, err := clientConn.Write(data); err != nil {
+						log.Printf("WARN: Failed to write to client %s: %v. Closing.", clientID, err)
+						clientConn.Close()
+					}
 				}
 			}
-		} else {
-			log.Printf("WARN: Received data from backend %s for unknown client %s", b.id, clientID)
 		}
+	}
+}
+
+func (b *Backend) handleControlMessage(msg protocol.ControlMessage) {
+	switch msg.Event {
+	case protocol.EventPingClient:
+		log.Printf("DEBUG: Received ping for client %s from backend %s", msg.ClientID, b.id)
+		// Check if the client is still considered active by the proxy.
+		if _, ok := b.clients.Load(msg.ClientID); ok {
+			pongMsg := protocol.ControlMessage{Event: protocol.EventPongClient, ClientID: msg.ClientID}
+			b.SendControlMessage(pongMsg)
+		} else {
+			log.Printf("INFO: Client %s is no longer active, not sending pong to backend %s", msg.ClientID, b.id)
+		}
+	case protocol.EventDisconnect:
+		// This happens if the local service connection closes first.
+		if rawConn, ok := b.clients.Load(msg.ClientID); ok {
+			if conn, ok := rawConn.(net.Conn); ok {
+				log.Printf("INFO: Backend %s reported disconnect for client %s. Closing client connection.", b.id, msg.ClientID)
+				conn.Close()
+				b.clients.Delete(msg.ClientID)
+			}
+		}
+	default:
+		log.Printf("WARN: Unknown control event '%s' from backend %s", msg.Event, b.id)
 	}
 }
 

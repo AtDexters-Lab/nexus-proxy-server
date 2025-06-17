@@ -1,9 +1,5 @@
 # Nexus Proxy: A Privacy-First Passthrough Proxy
 
-[![Go Version](https://img.shields.io/badge/go-1.21+-blue.svg)](https://golang.org)
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](https://github.com/your-username/nexus)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-
 **Nexus Proxy** is a **privacy-first passthrough proxy**, built on the principle of zero-trust networking. It intelligently routes encrypted traffic **without ever terminating the TLS connection**, preserving true end-to-end encryption between your clients and backend services. The data stream remains completely **opaque and private** to Nexus, making it a secure-by-default gateway for your infrastructure.
 
 The core mission of Nexus is to intelligently route client requests to the appropriate backend server cluster based on the requested hostname (FQDN), even when those clusters are spread across the globe. It achieves this while keeping the proxy layer itself completely stateless regarding user sessions, which dramatically simplifies deployment and scaling.
@@ -105,6 +101,14 @@ backendsJWTSecret: "a-very-strong-jwt-secret-from-the-central-authorizer"
 peers:
   - "wss://[nexus-eu.example.com/mesh](https://nexus-eu.example.com/mesh)"
 ```
+
+## Reference Backend Client
+
+A complete, working reference implementation for a backend client that connects to Nexus Proxy can be found here:
+
+-   **[Nexus Proxy Backend Client](https://github.com/AtDexters-Lab/nexus-proxy-backend-client)**
+
+This backend client demonstrates how to handle the WebSocket connection, authentication, and multiplexing protocol required to serve traffic from Nexus.
 
 ## The Piccolo Ecosystem: A Perfect Backend for Nexus
 

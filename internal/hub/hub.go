@@ -19,7 +19,7 @@ const (
 	shutdownTimeout = 5 * time.Second
 )
 
-// Hub manages the lifecycle of backend WebSocket connections.
+// hubImpl manages the lifecycle of backend WebSocket connections.
 type hubImpl struct {
 	config      *config.Config
 	server      *http.Server

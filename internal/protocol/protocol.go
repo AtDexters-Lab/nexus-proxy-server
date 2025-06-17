@@ -19,6 +19,10 @@ const (
 	EventConnect EventType = "connect"
 	// EventDisconnect is sent to a backend when a client disconnects.
 	EventDisconnect EventType = "disconnect"
+	// EventPingClient is sent from a backend to the proxy to check liveness.
+	EventPingClient EventType = "ping_client"
+	// EventPongClient is sent from the proxy to a backend in response to a ping.
+	EventPongClient EventType = "pong_client"
 )
 
 // ControlMessage defines the structure for out-of-band communication
