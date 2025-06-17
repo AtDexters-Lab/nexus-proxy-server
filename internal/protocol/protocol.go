@@ -30,4 +30,6 @@ const (
 type ControlMessage struct {
 	Event    EventType `json:"event"`
 	ClientID uuid.UUID `json:"client_id"`
+	ConnPort int       `json:"conn_port,omitempty"`
+	ClientIP string    `json:"client_ip,omitempty"`
 }

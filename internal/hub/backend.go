@@ -77,8 +77,20 @@ func (b *Backend) StartPumps() {
 
 func (b *Backend) AddClient(clientConn net.Conn, clientID uuid.UUID) {
 	b.clients.Store(clientID, clientConn)
-	// TODO: Extend protocol to include original dest port
-	msg := protocol.ControlMessage{Event: protocol.EventConnect, ClientID: clientID}
+	var connPort int
+	if tcpAddr, ok := clientConn.LocalAddr().(*net.TCPAddr); ok {
+		connPort = tcpAddr.Port
+	} else {
+		// Handle cases where it might not be a TCP connection, though it always should be.
+		log.Printf("WARN: Could not determine destination port for client %s", clientID)
+	}
+	msg := protocol.ControlMessage{
+		Event:    protocol.EventConnect,
+		ClientID: clientID,
+		ConnPort: connPort,
+		ClientIP: clientConn.RemoteAddr().String(),
+	}
+
 	b.SendControlMessage(msg)
 }
 
