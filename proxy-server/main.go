@@ -9,10 +9,10 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
-	"github.com/AtDexters-Lab/nexus-proxy/internal/hub"
-	"github.com/AtDexters-Lab/nexus-proxy/internal/peer"
-	"github.com/AtDexters-Lab/nexus-proxy/internal/proxy"
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/hub"
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/peer"
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/proxy"
 )
 
 func main() {

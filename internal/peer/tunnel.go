@@ -5,8 +5,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
-	"github.com/AtDexters-Lab/nexus-proxy/internal/protocol"
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/protocol"
 	"github.com/google/uuid"
 )
 

@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
-	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 )
@@ -53,6 +53,9 @@ func (h *hubImpl) Run() {
 	h.server = &http.Server{
 		Addr:    h.config.BackendListenAddress,
 		Handler: mux,
+		// TODO - security, reliability hardening
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
 	}
 
 	log.Printf("INFO: Hub listening on %s", h.config.BackendListenAddress)

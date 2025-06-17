@@ -1,4 +1,4 @@
-module github.com/AtDexters-Lab/nexus-proxy
+module github.com/AtDexters-Lab/nexus-proxy-server
 
 go 1.22.2
 
