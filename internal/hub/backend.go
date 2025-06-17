@@ -27,7 +27,6 @@ type Backend struct {
 	config      *config.Config
 	hostname    string
 	weight      int
-	connMu      sync.Mutex
 	clients     sync.Map
 	dataForSelf chan []byte
 }

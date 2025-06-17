@@ -11,8 +11,6 @@ import (
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
 )
 
-const httpPort = 80
-
 // Listener is responsible for accepting incoming connections from end-users.
 type Listener struct {
 	config      *config.Config
@@ -74,26 +72,30 @@ func (l *Listener) listenOnPort(port int) {
 			log.Printf("ERROR: Failed to accept new connection on port %d: %v", port, err)
 			continue
 		}
-		go l.handleConnection(conn, port)
+		go l.handleConnection(conn)
 	}
 }
 
-func (l *Listener) handleConnection(conn net.Conn, port int) {
+func (l *Listener) handleConnection(conn net.Conn) {
 	peekableConn := NewPeekableConn(conn)
 	var hostname string
 	var err error
 
-	if port == httpPort {
-		hostname, err = PeekHost(peekableConn)
-	} else {
-		hostname, err = PeekServerName(peekableConn)
+	hostname, err = PeekServerName(peekableConn)
+	if err != nil {
+		log.Printf("INFO: TLS Method: Could not determine hostname for %s: %v", conn.RemoteAddr(), err)
+		hn, newStream, herr := PeekHost(peekableConn)
+		hostname = hn
+		err = herr
+		peekableConn.reader = newStream
 	}
 
 	if err != nil {
-		log.Printf("WARN: Could not determine hostname for %s: %v. Closing connection.", conn.RemoteAddr(), err)
+		log.Printf("WARN: HTTP Method: Could not determine hostname for %s: %v. Closing connection.", conn.RemoteAddr(), err)
 		conn.Close()
 		return
 	}
+
 	log.Printf("INFO: Identified request for hostname '%s' from %s", hostname, conn.RemoteAddr())
 
 	// First, try to find a local backend.

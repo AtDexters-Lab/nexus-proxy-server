@@ -71,6 +71,7 @@ func (c *Client) Start() {
 			if err != io.EOF {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					log.Printf("INFO: Client %s idle timeout reached. Closing connection.", c.id)
+					c.conn.Close()
 				} else {
 					log.Printf("ERROR: Failed to read from client %s: %v", c.id, err)
 				}
