@@ -101,8 +101,8 @@ func (l *Listener) handleConnection(conn net.Conn) {
 	// First, try to find a local backend.
 	backend, err := l.hub.SelectBackend(hostname)
 	if err == nil {
-		log.Printf("INFO: [LOCAL] Routing client %s for hostname '%s' to backend %s", conn.RemoteAddr(), hostname, backend.ID())
 		client := NewClient(peekableConn, backend, l.config)
+		log.Printf("INFO: [LOCAL] Routing client %s [%s] for hostname '%s' to backend %s", conn.RemoteAddr(), client.id, hostname, backend.ID())
 		client.Start()
 		return
 	}

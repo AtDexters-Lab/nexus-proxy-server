@@ -55,7 +55,15 @@ func (b *Backend) Close() {
 		}
 		return true
 	})
-	close(b.dataForSelf)
+	select {
+	case _, ok := <-b.dataForSelf:
+		if ok {
+			close(b.dataForSelf)
+		}
+	default:
+		close(b.dataForSelf)
+	}
+
 }
 
 func (b *Backend) StartPumps() {
@@ -202,8 +210,8 @@ func (b *Backend) handleControlMessage(msg protocol.ControlMessage) {
 		if rawConn, ok := b.clients.Load(msg.ClientID); ok {
 			if conn, ok := rawConn.(net.Conn); ok {
 				log.Printf("INFO: Backend %s reported disconnect for client %s. Closing client connection.", b.id, msg.ClientID)
-				conn.Close()
 				b.clients.Delete(msg.ClientID)
+				conn.Close() // conn is closed after client removal so that the RemoveClient call does not try to close it again.
 			}
 		}
 	default:
