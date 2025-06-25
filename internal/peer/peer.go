@@ -25,11 +25,12 @@ const (
 )
 
 type peerImpl struct {
-	addr    string
-	conn    *websocket.Conn
-	config  *config.Config
-	manager *Manager
-	send    chan []byte
+	addr          string
+	conn          *websocket.Conn
+	config        *config.Config
+	manager       *Manager
+	send          chan []byte
+	activeTunnels sync.Map
 }
 
 // NewPeer creates a new Peer instance.
@@ -169,7 +170,18 @@ func (p *peerImpl) readPump() {
 				var clientID uuid.UUID
 				copy(clientID[:], message[1:1+protocol.ClientIDLength])
 				payload := message[1+protocol.ClientIDLength:]
-				p.manager.HandleTunnelData(clientID, payload)
+
+				if rawConn, ok := p.activeTunnels.Load(clientID); ok {
+					if clientConn, ok := rawConn.(net.Conn); ok {
+						if _, err := clientConn.Write(payload); err != nil {
+							log.Printf("WARN: [PEER-TUNNEL] Failed to write back to client %s: %v. Closing connection.", clientID, err)
+							clientConn.Close() // This will cause the StartTunnel read loop to exit.
+						}
+					}
+				} else {
+					// Otherwise, it's for an inbound tunnel. Let the manager handle it.
+					p.manager.HandleTunnelData(clientID, payload)
+				}
 
 			case protocol.PeerTunnelClose:
 				if len(message) < 1+protocol.ClientIDLength {
@@ -177,7 +189,17 @@ func (p *peerImpl) readPump() {
 				}
 				var clientID uuid.UUID
 				copy(clientID[:], message[1:1+protocol.ClientIDLength])
-				p.manager.HandleTunnelClose(clientID)
+
+				if rawConn, ok := p.activeTunnels.Load(clientID); ok {
+					if clientConn, ok := rawConn.(net.Conn); ok {
+						log.Printf("INFO: [PEER-TUNNEL] Peer signaled close for our outbound tunnel %s. Closing client connection.", clientID)
+						clientConn.Close()
+						p.activeTunnels.Delete(clientID) // Clean up the map.
+					}
+				} else {
+					// Otherwise, it's for an inbound tunnel.
+					p.manager.HandleTunnelClose(clientID)
+				}
 
 			default:
 				log.Printf("WARN: [PEER] Received unknown binary control byte from %s", p.addr)
@@ -202,7 +224,6 @@ func (p *peerImpl) writePump(ctx context.Context) {
 			}
 
 			// Determine message type by trying to unmarshal it as JSON.
-			// A more robust way might be to wrap messages in a struct, but this works.
 			var jsonCheck map[string]interface{}
 			msgType := websocket.BinaryMessage
 			if json.Unmarshal(message, &jsonCheck) == nil {
@@ -252,6 +273,9 @@ func (p *peerImpl) StartTunnel(conn net.Conn, hostname string) {
 	payload, _ := json.Marshal(req)
 	p.Send(payload)
 
+	p.activeTunnels.Store(clientID, conn)
+	defer p.activeTunnels.Delete(clientID)
+
 	// 2. Start proxying data from the client to the peer (as binary messages).
 	bufPtr := proxy.GetBuffer()
 	defer proxy.PutBuffer(bufPtr)
@@ -260,6 +284,7 @@ func (p *peerImpl) StartTunnel(conn net.Conn, hostname string) {
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
+			// Connection closed or error from client side.
 			break
 		}
 
