@@ -18,7 +18,7 @@ type PeerManager interface {
 	HandleInboundPeer(conn *websocket.Conn)
 	AnnounceLocalRoutes()
 	GetPeerForHostname(hostname string) (Peer, bool)
-	HandleTunnelRequest(p Peer, hostname string, clientID uuid.UUID)
+	HandleTunnelRequest(p Peer, hostname string, clientID uuid.UUID, clientIP string, connPort int)
 }
 
 // Peer represents a single connection to another Nexus node.

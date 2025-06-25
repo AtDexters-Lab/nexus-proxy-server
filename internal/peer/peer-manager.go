@@ -123,7 +123,7 @@ func (m *Manager) GetPeerForHostname(hostname string) (iface.Peer, bool) {
 
 // HandleTunnelRequest is called by a peer's read pump when it receives a request to
 // establish a tunnel for a client. It selects a local backend and starts the proxying.
-func (m *Manager) HandleTunnelRequest(p iface.Peer, hostname string, clientID uuid.UUID) {
+func (m *Manager) HandleTunnelRequest(p iface.Peer, hostname string, clientID uuid.UUID, clientIP string, connPort int) {
 	log.Printf("INFO: [TUNNEL-IN] Received tunnel request for client %s to hostname '%s' from peer %s", clientID, hostname, p.Addr())
 	backend, err := m.hub.SelectBackend(hostname)
 	if err != nil {
@@ -133,7 +133,7 @@ func (m *Manager) HandleTunnelRequest(p iface.Peer, hostname string, clientID uu
 	}
 
 	// Create a virtual client connection that will be managed by the peer.
-	tunneledConn := NewTunneledConn(clientID, p)
+	tunneledConn := NewTunneledConn(clientID, p, clientIP, connPort)
 	m.tunnels.Store(clientID, tunneledConn)
 
 	// This looks like a regular client connection to the backend.

@@ -147,7 +147,8 @@ func (p *peerImpl) readPump() {
 			case protocol.PeerAnnounce:
 				p.manager.UpdatePeerRoutes(p, msg.Version, msg.Hostnames)
 			case protocol.PeerTunnelRequest:
-				p.manager.HandleTunnelRequest(p, msg.Hostname, msg.ClientID)
+				log.Println("INFO: [PEER] Received tunnel request from", p.addr, "for client", msg.ClientID, "on hostname", msg.Hostname, "with IP", msg.ClientIP, "and port", msg.ConnPort)
+				p.manager.HandleTunnelRequest(p, msg.Hostname, msg.ClientID, msg.ClientIP, msg.ConnPort)
 			default:
 				log.Printf("WARN: [PEER] Received unknown text message type from %s", p.addr)
 			}
@@ -162,6 +163,7 @@ func (p *peerImpl) readPump() {
 			switch controlByte {
 			case protocol.PeerTunnelData:
 				if len(message) < 1+protocol.ClientIDLength {
+					log.Printf("WARN: [PEER] Received tunnel data with insufficient length from %s", p.addr)
 					continue
 				}
 				var clientID uuid.UUID
@@ -223,17 +225,29 @@ func (p *peerImpl) writePump(ctx context.Context) {
 	}
 }
 
-// StartTunnel initiates the tunneling of a client connection to this peer.
+// StartTunnel initiates the tunneling of a client connection to target peer.
 func (p *peerImpl) StartTunnel(conn net.Conn, hostname string) {
 	defer conn.Close()
 
 	clientID := uuid.New()
+
+	clientIp := conn.RemoteAddr().String()
+	var connPort int
+	if tcpAddr, ok := conn.LocalAddr().(*net.TCPAddr); ok {
+		connPort = tcpAddr.Port
+	} else {
+		// Handle cases where it might not be a TCP connection, though it always should be.
+		log.Printf("WARN: [PEER] Unable to determine local port for connection from %s. Using default port 0.", clientIp)
+		return
+	}
 
 	// 1. Send the tunnel request to the peer (as a JSON text message).
 	req := protocol.PeerMessage{
 		Type:     protocol.PeerTunnelRequest,
 		Hostname: hostname,
 		ClientID: clientID,
+		ConnPort: connPort,
+		ClientIP: clientIp,
 	}
 	payload, _ := json.Marshal(req)
 	p.Send(payload)

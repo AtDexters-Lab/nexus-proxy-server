@@ -56,7 +56,7 @@ func (l *Listener) listenOnPort(port int) {
 	listenAddr := ":" + strconv.Itoa(port)
 	tcpListener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		log.Printf("ERROR: Failed to start listener on port %d: %v", port, err)
+		log.Fatalf("ERROR: Failed to start listener on port %d: %v", port, err)
 		return
 	}
 	l.mu.Lock()

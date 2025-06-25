@@ -25,5 +25,7 @@ type PeerMessage struct {
 	Hostnames []string        `json:"hostnames,omitempty"`
 	// Fields for tunneling request
 	ClientID uuid.UUID `json:"client_id,omitempty"`
+	ConnPort int       `json:"conn_port,omitempty"`
+	ClientIP string    `json:"client_ip,omitempty"`
 	Hostname string    `json:"hostname,omitempty"`
 }

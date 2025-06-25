@@ -14,16 +14,20 @@ import (
 // that is being tunneled from another peer.
 type TunneledConn struct {
 	clientID uuid.UUID
-	peer     iface.Peer
-	pipe     *io.PipeReader
-	pipeW    *io.PipeWriter
+	clientIp string
+	connPort int
+	peer     iface.Peer     // The peer that this connection is tunneled through.
+	pipe     *io.PipeReader // The read end of the pipe that receives data from the peer's read pump.
+	pipeW    *io.PipeWriter // The write end of the pipe that sends data to the peer's read pump.
 }
 
 // NewTunneledConn creates a new virtual connection for a tunneled client.
-func NewTunneledConn(clientID uuid.UUID, peer iface.Peer) *TunneledConn {
+func NewTunneledConn(clientID uuid.UUID, peer iface.Peer, clientIp string, connPort int) *TunneledConn {
 	pr, pw := io.Pipe()
 	return &TunneledConn{
 		clientID: clientID,
+		clientIp: clientIp,
+		connPort: connPort,
 		peer:     peer,
 		pipe:     pr,
 		pipeW:    pw,
@@ -63,10 +67,10 @@ func (c *TunneledConn) Close() error {
 
 // LocalAddr, RemoteAddr, SetDeadline, etc., are part of the net.Conn interface.
 func (c *TunneledConn) LocalAddr() net.Addr {
-	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}
+	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: c.connPort}
 }
 func (c *TunneledConn) RemoteAddr() net.Addr {
-	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}
+	return &net.TCPAddr{IP: net.ParseIP(c.clientIp), Port: 0}
 }
 func (c *TunneledConn) SetDeadline(t time.Time) error      { return nil }
 func (c *TunneledConn) SetReadDeadline(t time.Time) error  { return nil }
