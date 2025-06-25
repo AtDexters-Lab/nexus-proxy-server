@@ -61,42 +61,10 @@ The routing logic is designed to be simple and explicit.
 
 ## Getting Started (Example)
 
-Nexus is configured via a `config.yaml` file.
+Nexus is configured via a `config.yaml` file. See [example](config.example.yaml)
 
 ### Hub TLS (Mandatory)
 The hub server (for backend and peer connections) requires TLS. For local development, you can [generate a self-signed certificate](https://mkcert.dev)
-
-```yaml
-# config.yaml
-
-# Address for the backend hub to listen on for WebSocket connections.
-backendListenAddress: ":8443"
-
-# TLS certificate and key for the hub server. (Mandatory)
-hubTlsCertFile: "hub.crt"
-hubTlsKeyFile: "hub.key"
-
-# Ports to listen on for public client traffic.
-# Port 80 is treated as L7 HTTP, all others as L4 TCP.
-relayPorts:
-  - 443
-  - 80
-
-# Time in seconds that a client connection can be idle before being closed.
-idleTimeoutSeconds: 60
-
-# A shared secret used to authenticate connections between peer nodes.
-# Must be the same on all nodes in the mesh.
-peerSecret: "a-very-strong-secret-for-the-mesh"
-
-# A secret used to authenticate connections with backends.
-# This secret is used to validate JWTs issued by a central authorizer.
-backendsJWTSecret: "a-very-strong-jwt-secret-from-the-central-authorizer"
-
-# A map of peer Nexus nodes to form the mesh
-peers:
-  - "wss://[nexus-eu.example.com/mesh](https://nexus-eu.example.com/mesh)"
-```
 
 ## Reference Backend Client
 

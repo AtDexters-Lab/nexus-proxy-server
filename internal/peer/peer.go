@@ -2,6 +2,7 @@ package peer
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"log"
 	"net"
@@ -45,18 +46,34 @@ func (p *peerImpl) Addr() string {
 	return p.addr
 }
 
-// Connect attempts to establish an outbound WebSocket connection to the peer.
+// Connect attempts to establish an outbound mTLS WebSocket connection to the peer.
 func (p *peerImpl) Connect(ctx context.Context) {
-	headers := http.Header{}
-	headers.Add("X-Nexus-Secret", p.config.PeerSecret)
+	// Create a custom websocket dialer with our client certificate for mTLS.
+	cert, err := tls.LoadX509KeyPair(p.config.HubTlsCertFile, p.config.HubTlsKeyFile)
+	if err != nil {
+		// This is a fatal configuration error. Log it and stop trying to connect.
+		log.Printf("FATAL: [PEER] Failed to load client certificate for mTLS dialing to %s: %v. This peer connection will not be established.", p.addr, err)
+		return
+	}
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		// We trust the system's root CAs to verify the server certificate,
+		// which is what we want for public CAs like Let's Encrypt.
+	}
+	dialer := websocket.Dialer{
+		Proxy:            http.ProxyFromEnvironment,
+		HandshakeTimeout: 15 * time.Second,
+		TLSClientConfig:  tlsConfig,
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			log.Printf("INFO: [PEER] Attempting to connect to %s", p.addr)
-			conn, _, err := websocket.DefaultDialer.Dial(p.addr, headers)
+			log.Printf("INFO: [PEER] Attempting to connect to %s via mTLS", p.addr)
+			// Use the custom dialer and pass nil for headers.
+			conn, _, err := dialer.Dial(p.addr, nil)
 			if err != nil {
 				log.Printf("WARN: [PEER] Failed to connect to %s: %v. Retrying in %s...", p.addr, err, reconnectDelay)
 				time.Sleep(reconnectDelay)

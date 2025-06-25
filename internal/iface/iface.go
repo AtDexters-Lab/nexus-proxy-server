@@ -2,7 +2,6 @@ package iface
 
 import (
 	"net"
-	"net/http"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -12,7 +11,6 @@ import (
 type Hub interface {
 	GetLocalRoutes() []string
 	SelectBackend(hostname string) (Backend, error)
-	HandlePeerConnect(w http.ResponseWriter, r *http.Request)
 }
 
 // PeerManager is an interface that components use to interact with the peer manager.

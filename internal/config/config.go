@@ -8,16 +8,22 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// PeerAuthentication holds the settings for peer mTLS authentication.
+type PeerAuthentication struct {
+	TrustedDomainSuffixes []string `yaml:"trustedDomainSuffixes"`
+}
+
 // Config holds the entire application configuration, loaded from a YAML file.
 type Config struct {
-	BackendListenAddress string   `yaml:"backendListenAddress"`
-	HubTlsCertFile       string   `yaml:"hubTlsCertFile"`
-	HubTlsKeyFile        string   `yaml:"hubTlsKeyFile"`
-	RelayPorts           []int    `yaml:"relayPorts"`
-	IdleTimeoutSeconds   int      `yaml:"idleTimeoutSeconds"`
-	BackendsJWTSecret    string   `yaml:"backendsJWTSecret"`
-	PeerSecret           string   `yaml:"peerSecret"`
-	Peers                []string `yaml:"peers"`
+	BackendListenAddress string             `yaml:"backendListenAddress"`
+	PeerListenAddress    string             `yaml:"peerListenAddress"`
+	HubTlsCertFile       string             `yaml:"hubTlsCertFile"`
+	HubTlsKeyFile        string             `yaml:"hubTlsKeyFile"`
+	RelayPorts           []int              `yaml:"relayPorts"`
+	IdleTimeoutSeconds   int                `yaml:"idleTimeoutSeconds"`
+	BackendsJWTSecret    string             `yaml:"backendsJWTSecret"`
+	PeerAuthentication   PeerAuthentication `yaml:"peerAuthentication"` // New: mTLS settings
+	Peers                []string           `yaml:"peers"`
 }
 
 // IdleTimeout returns the idle timeout as a time.Duration.
@@ -53,8 +59,15 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.IdleTimeoutSeconds < 0 {
 		return nil, fmt.Errorf("config validation failed: idleTimeoutSeconds cannot be negative")
 	}
-	if len(cfg.Peers) > 0 && cfg.PeerSecret == "" {
-		return nil, fmt.Errorf("config validation failed: peerSecret must be set if peers are defined")
+
+	// Validation for new peer settings
+	if len(cfg.Peers) > 0 {
+		if cfg.PeerListenAddress == "" {
+			return nil, fmt.Errorf("config validation failed: peerListenAddress must be set if peers are defined")
+		}
+		if len(cfg.PeerAuthentication.TrustedDomainSuffixes) == 0 {
+			return nil, fmt.Errorf("config validation failed: peerAuthentication.trustedDomainSuffixes must be set if peers are defined")
+		}
 	}
 
 	return &cfg, nil

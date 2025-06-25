@@ -2,9 +2,12 @@ package hub
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,13 +22,14 @@ const (
 	shutdownTimeout = 5 * time.Second
 )
 
-// hubImpl manages the lifecycle of backend WebSocket connections.
+// hubImpl manages the lifecycle of backend and peer connections.
 type hubImpl struct {
-	config      *config.Config
-	server      *http.Server
-	upgrader    websocket.Upgrader
-	pools       sync.Map // key: hostname (string), value: *LoadBalancerPool
-	peerManager iface.PeerManager
+	config        *config.Config
+	backendServer *http.Server // Listens for backend connections
+	peerServer    *http.Server // Listens for peer connections (mTLS)
+	upgrader      websocket.Upgrader
+	pools         sync.Map // key: hostname (string), value: *LoadBalancerPool
+	peerManager   iface.PeerManager
 }
 
 // New creates and returns a new Hub instance.
@@ -44,37 +48,129 @@ func (h *hubImpl) SetPeerManager(pm iface.PeerManager) {
 	h.peerManager = pm
 }
 
-// Run starts the Hub's HTTP server.
+// Run starts the Hub's HTTP servers for both backends and peers.
 func (h *hubImpl) Run() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/connect", h.handleBackendConnect)
-	mux.HandleFunc("/mesh", h.HandlePeerConnect)
-
-	h.server = &http.Server{
+	// --- Backend Server Setup (JWT Auth) ---
+	backendMux := http.NewServeMux()
+	backendMux.HandleFunc("/connect", h.handleBackendConnect)
+	h.backendServer = &http.Server{
 		Addr:    h.config.BackendListenAddress,
-		Handler: mux,
-		// TODO - security, reliability hardening
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		Handler: backendMux,
 	}
 
-	log.Printf("INFO: Hub listening on %s", h.config.BackendListenAddress)
-	if err := h.server.ListenAndServeTLS(h.config.HubTlsCertFile, h.config.HubTlsKeyFile); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("FATAL: Hub failed to start: %v", err)
+	log.Printf("INFO: Backend Hub (JWT) listening on %s", h.config.BackendListenAddress)
+	go func() {
+		if err := h.backendServer.ListenAndServeTLS(h.config.HubTlsCertFile, h.config.HubTlsKeyFile); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("FATAL: Backend Hub failed to start: %v", err)
+		}
+	}()
+
+	// --- Peer Server Setup (mTLS Auth) ---
+	if len(h.config.Peers) > 0 {
+		peerMux := http.NewServeMux()
+		peerMux.HandleFunc("/mesh", h.handlePeerConnect)
+
+		tlsConfig, err := h.createPeerTlsConfig()
+		if err != nil {
+			log.Fatalf("FATAL: Could not create peer mTLS config: %v. Peer hub not starting.", err)
+			return
+		}
+
+		h.peerServer = &http.Server{
+			Addr:      h.config.PeerListenAddress,
+			Handler:   peerMux,
+			TLSConfig: tlsConfig,
+		}
+
+		log.Printf("INFO: Peer Hub (mTLS) listening on %s", h.config.PeerListenAddress)
+		go func() {
+			// ListenAndServeTLS uses the pre-configured TLSConfig
+			if err := h.peerServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("FATAL: Peer Hub failed to start: %v", err)
+			}
+		}()
 	}
 }
 
-// Stop gracefully shuts down the Hub's HTTP server.
+// createPeerTlsConfig builds the TLS configuration for the mTLS-secured peer server.
+func (h *hubImpl) createPeerTlsConfig() (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(h.config.HubTlsCertFile, h.config.HubTlsKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load server certificate for peer hub: %w", err)
+	}
+
+	return &tls.Config{
+		Certificates:          []tls.Certificate{cert},
+		ClientAuth:            tls.RequireAndVerifyClientCert,
+		VerifyPeerCertificate: h.buildVerifyPeerCertificateFunc(),
+	}, nil
+}
+
+// buildVerifyPeerCertificateFunc is a closure that creates the verification function.
+// This function checks if a peer's certificate FQDN belongs to a trusted domain.
+func (h *hubImpl) buildVerifyPeerCertificateFunc() func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+	return func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+		if len(verifiedChains) == 0 || len(verifiedChains[0]) == 0 {
+			return fmt.Errorf("no verified certificate chain presented by peer")
+		}
+
+		// The first certificate in the first verified chain is the client's cert.
+		cert := verifiedChains[0][0]
+
+		// Check against all trusted domain suffixes
+		for _, suffix := range h.config.PeerAuthentication.TrustedDomainSuffixes {
+			// Check Subject Alternative Names first (preferred)
+			for _, san := range cert.DNSNames {
+				if strings.HasSuffix(san, suffix) {
+					log.Printf("INFO: Peer certificate validated via SAN for: %s", san)
+					return nil // Success
+				}
+			}
+			// Fallback to checking Common Name
+			if strings.HasSuffix(cert.Subject.CommonName, suffix) {
+				log.Printf("INFO: Peer certificate validated via CN for: %s", cert.Subject.CommonName)
+				return nil // Success
+			}
+		}
+
+		// If no match was found
+		return fmt.Errorf("peer certificate FQDN ('%s' / SANs: %v) is not in any trusted domain", cert.Subject.CommonName, cert.DNSNames)
+	}
+}
+
+// Stop gracefully shuts down the Hub's HTTP servers.
 func (h *hubImpl) Stop() {
-	log.Println("INFO: Shutting down hub...")
+	log.Println("INFO: Shutting down hub servers...")
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	if err := h.server.Shutdown(ctx); err != nil {
-		log.Printf("WARN: Hub graceful shutdown failed: %v", err)
-	} else {
-		log.Println("INFO: Hub shut down gracefully.")
-	}
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if h.backendServer != nil {
+			if err := h.backendServer.Shutdown(ctx); err != nil {
+				log.Printf("WARN: Backend hub graceful shutdown failed: %v", err)
+			} else {
+				log.Println("INFO: Backend hub shut down gracefully.")
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if h.peerServer != nil {
+			if err := h.peerServer.Shutdown(ctx); err != nil {
+				log.Printf("WARN: Peer hub graceful shutdown failed: %v", err)
+			} else {
+				log.Println("INFO: Peer hub shut down gracefully.")
+			}
+		}
+	}()
+
+	wg.Wait()
 }
 
 // SelectBackend finds the load balancer pool for the given hostname.
@@ -88,7 +184,7 @@ func (h *hubImpl) SelectBackend(hostname string) (iface.Backend, error) {
 	return pool.Select()
 }
 
-// handleBackendConnect handles a connection from a backend service.
+// handleBackendConnect handles a connection from a backend service (JWT Auth).
 func (h *hubImpl) handleBackendConnect(w http.ResponseWriter, r *http.Request) {
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -112,27 +208,23 @@ func (h *hubImpl) handleBackendConnect(w http.ResponseWriter, r *http.Request) {
 	backend.StartPumps()
 }
 
-// HandlePeerConnect handles a connection from another Nexus node.
-func (h *hubImpl) HandlePeerConnect(w http.ResponseWriter, r *http.Request) {
+// handlePeerConnect handles a connection from another Nexus node (mTLS Auth).
+func (h *hubImpl) handlePeerConnect(w http.ResponseWriter, r *http.Request) {
 	if h.peerManager == nil {
 		log.Printf("ERROR: Peer manager not initialized, cannot handle peer connection.")
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
-	if r.Header.Get("X-Nexus-Secret") != h.config.PeerSecret {
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		log.Printf("WARN: Peer connection attempt from %s with invalid secret.", r.RemoteAddr)
-		return
-	}
-
+	// The mTLS verification is handled by the server's TLSConfig before this handler is called.
+	// If we've reached this point, the peer's certificate is already validated.
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("ERROR: Failed to upgrade peer connection: %v", err)
 		return
 	}
 
-	log.Printf("INFO: Inbound peer connection established from %s", conn.RemoteAddr())
+	log.Printf("INFO: Inbound mTLS-authenticated peer connection established from %s", conn.RemoteAddr())
 	h.peerManager.HandleInboundPeer(conn)
 }
 
