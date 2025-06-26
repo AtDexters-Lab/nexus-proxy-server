@@ -32,6 +32,7 @@ type Backend struct {
 	dataForSelf chan []byte
 	quit        chan struct{}
 	closeOnce   sync.Once
+	isClosed    bool // Indicates if the backend is closed
 }
 
 // NewBackend creates a new Backend instance.
@@ -45,6 +46,7 @@ func NewBackend(conn *websocket.Conn, hostname string, weight int, cfg *config.C
 		dataForSelf: make(chan []byte, 256),
 		quit:        make(chan struct{}),
 		closeOnce:   sync.Once{},
+		isClosed:    false,
 	}
 }
 
@@ -54,6 +56,7 @@ func (b *Backend) ID() string {
 
 func (b *Backend) Close() {
 	b.closeOnce.Do(func() {
+		b.quit <- struct{}{} // Signal the pumps to stop.
 		b.conn.Close()
 		b.clients.Range(func(key, value interface{}) bool {
 			if clientConn, ok := value.(net.Conn); ok {
@@ -62,6 +65,8 @@ func (b *Backend) Close() {
 			return true
 		})
 		close(b.dataForSelf)
+		b.isClosed = true
+		close(b.quit)
 	})
 }
 
@@ -124,6 +129,9 @@ func (b *Backend) SendData(clientID uuid.UUID, data []byte) error {
 		return fmt.Errorf("backend %s is closing", b.id)
 	default:
 	}
+	if b.isClosed {
+		return fmt.Errorf("backend %s is already closed", b.id)
+	}
 
 	header := make([]byte, 1+protocol.ClientIDLength)
 	header[0] = protocol.ControlByteData
@@ -145,6 +153,9 @@ func (b *Backend) SendControlMessage(msg protocol.ControlMessage) error {
 	case <-b.quit:
 		return fmt.Errorf("backend %s is closing", b.id)
 	default:
+	}
+	if b.isClosed {
+		return fmt.Errorf("backend %s is already closed", b.id)
 	}
 
 	payload, err := json.Marshal(msg)
