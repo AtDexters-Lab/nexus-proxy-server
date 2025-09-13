@@ -3,6 +3,7 @@ package proxy
 import (
 	"log"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,17 +17,19 @@ type Listener struct {
 	config      *config.Config
 	hub         iface.Hub
 	peerManager iface.PeerManager
+	acmeHandler http.Handler // Handler for ACME HTTP-01 challenges
 	wg          sync.WaitGroup
 	listeners   []net.Listener
 	mu          sync.Mutex
 }
 
 // NewListener creates a new Listener instance.
-func NewListener(cfg *config.Config, hub iface.Hub, pm iface.PeerManager) *Listener {
+func NewListener(cfg *config.Config, hub iface.Hub, pm iface.PeerManager, acme http.Handler) *Listener {
 	return &Listener{
 		config:      cfg,
 		hub:         hub,
 		peerManager: pm,
+		acmeHandler: acme,
 		listeners:   make([]net.Listener, 0, len(cfg.RelayPorts)),
 	}
 }
@@ -82,21 +85,29 @@ func (l *Listener) handleConnection(conn net.Conn) {
 	var err error
 
 	hostname, err = PeekServerName(peekableConn)
+	isTLS := err == nil
+
 	if err != nil {
 		log.Printf("INFO: TLS Method: Could not determine hostname for %s: %v", conn.RemoteAddr(), err)
-		hn, newStream, herr := PeekHost(peekableConn)
-		hostname = hn
-		err = herr
-		peekableConn.reader = newStream
+		hostname, err = PeekHost(peekableConn)
+		if err == nil {
+			// It's an HTTP request. Check if it's for our ACME challenge.
+			if l.acmeHandler != nil && strings.EqualFold(hostname, l.config.HubPublicHostname) {
+				log.Printf("INFO: Intercepting HTTP request for proxy's own hostname '%s' to handle ACME challenge", hostname)
+				simpleHttpServer := &http.Server{Handler: l.acmeHandler}
+				simpleHttpServer.Serve(NewSingleConnListener(peekableConn))
+				return
+			}
+		}
 	}
 
 	if err != nil {
-		log.Printf("WARN: HTTP Method: Could not determine hostname for %s: %v. Closing connection.", conn.RemoteAddr(), err)
+		log.Printf("WARN: Could not determine hostname for %s: %v. Closing connection.", conn.RemoteAddr(), err)
 		conn.Close()
 		return
 	}
 
-	log.Printf("INFO: Identified request for hostname '%s' from %s", hostname, conn.RemoteAddr())
+	log.Printf("INFO: Identified request for hostname '%s' from %s (TLS: %v)", hostname, conn.RemoteAddr(), isTLS)
 
 	// First, try to find a local backend.
 	backend, err := l.hub.SelectBackend(hostname)

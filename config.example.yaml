@@ -4,12 +4,24 @@ backendListenAddress: ":8443"
 # Address for the peer hub to listen on for mTLS-secured connections from other Nexus nodes.
 peerListenAddress: ":8444"
 
-# TLS certificate and key for the hub servers.
-# These are used for both backend and peer connections. For peers, this certificate
-# acts as the node's unique, verifiable identity.
-# It MUST be a publicly-trusted certificate (e.g., from Let's Encrypt).
-hubTlsCertFile: "/path/to/your/fullchain.pem"
-hubTlsKeyFile: "/path/to/your/privkey.pem"
+# --- Hub TLS Configuration ---
+# Choose ONE of the following methods: Automatic (recommended) or Manual.
+
+# --- Automatic TLS (Recommended) ---
+# The server will automatically obtain and renew a TLS certificate from Let's Encrypt.
+# The server must be reachable from the public internet on port 80.
+hubPublicHostname: "nexus.example.com"
+
+# Optional: Directory to cache the ACME certificates.
+# If omitted, defaults to a directory named "acme_certs" in the current working directory.
+# acmeCacheDir: "/var/lib/nexus/certs"
+
+
+# --- Manual TLS ---
+# Manually provide your own TLS certificate and key files.
+# hubTlsCertFile: "/path/to/your/fullchain.pem"
+# hubTlsKeyFile: "/path/to/your/privkey.pem"
+
 
 # Ports to listen on for public client traffic.
 # Port 80 is treated as L7 HTTP, all others as L4 TCP.

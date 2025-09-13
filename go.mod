@@ -1,6 +1,8 @@
 module github.com/AtDexters-Lab/nexus-proxy-server
 
-go 1.22.2
+go 1.24.0
+
+toolchain go1.24.7
 
 require (
 	github.com/golang-jwt/jwt/v5 v5.2.1
@@ -13,5 +15,7 @@ require (
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	golang.org/x/net v0.17.0 // indirect
+	golang.org/x/crypto v0.42.0 // indirect
+	golang.org/x/net v0.43.0 // indirect
+	golang.org/x/text v0.29.0 // indirect
 )

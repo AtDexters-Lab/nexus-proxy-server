@@ -15,15 +15,21 @@ type PeerAuthentication struct {
 
 // Config holds the entire application configuration, loaded from a YAML file.
 type Config struct {
-	BackendListenAddress string             `yaml:"backendListenAddress"`
-	PeerListenAddress    string             `yaml:"peerListenAddress"`
-	HubTlsCertFile       string             `yaml:"hubTlsCertFile"`
-	HubTlsKeyFile        string             `yaml:"hubTlsKeyFile"`
-	RelayPorts           []int              `yaml:"relayPorts"`
-	IdleTimeoutSeconds   int                `yaml:"idleTimeoutSeconds"`
-	BackendsJWTSecret    string             `yaml:"backendsJWTSecret"`
-	PeerAuthentication   PeerAuthentication `yaml:"peerAuthentication"` // New: mTLS settings
-	Peers                []string           `yaml:"peers"`
+	BackendListenAddress string `yaml:"backendListenAddress"`
+	PeerListenAddress    string `yaml:"peerListenAddress"`
+	RelayPorts           []int  `yaml:"relayPorts"`
+	IdleTimeoutSeconds   int    `yaml:"idleTimeoutSeconds"`
+	BackendsJWTSecret    string `yaml:"backendsJWTSecret"`
+	Peers                []string `yaml:"peers"`
+	PeerAuthentication   PeerAuthentication `yaml:"peerAuthentication"`
+
+	// Manual TLS configuration
+	HubTlsCertFile string `yaml:"hubTlsCertFile"`
+	HubTlsKeyFile  string `yaml:"hubTlsKeyFile"`
+
+	// Automatic TLS configuration via ACME
+	HubPublicHostname string `yaml:"hubPublicHostname"`
+	AcmeCacheDir      string `yaml:"acmeCacheDir"`
 }
 
 // IdleTimeout returns the idle timeout as a time.Duration.
@@ -31,8 +37,50 @@ func (c *Config) IdleTimeout() time.Duration {
 	return time.Duration(c.IdleTimeoutSeconds) * time.Second
 }
 
+// validate performs comprehensive validation of the loaded configuration.
+func (c *Config) validate() error {
+	if c.BackendListenAddress == "" {
+		return fmt.Errorf("backendListenAddress must be set")
+	}
+	if len(c.RelayPorts) == 0 {
+		return fmt.Errorf("at least one relayPort must be specified")
+	}
+	if c.BackendsJWTSecret == "" {
+		return fmt.Errorf("backendsJWTSecret must be set")
+	}
+	if c.IdleTimeoutSeconds < 0 {
+		return fmt.Errorf("idleTimeoutSeconds cannot be negative")
+	}
+
+	// Validate TLS configuration: must be either manual or automatic, but not both.
+	manualTls := c.HubTlsCertFile != "" || c.HubTlsKeyFile != ""
+	automaticTls := c.HubPublicHostname != ""
+
+	if manualTls && automaticTls {
+		return fmt.Errorf("cannot specify both manual TLS (hubTlsCertFile/hubTlsKeyFile) and automatic TLS (hubPublicHostname) settings")
+	}
+	if !manualTls && !automaticTls {
+		return fmt.Errorf("must specify either manual TLS (hubTlsCertFile/hubTlsKeyFile) or automatic TLS (hubPublicHostname) settings")
+	}
+	if manualTls && (c.HubTlsCertFile == "" || c.HubTlsKeyFile == "") {
+		return fmt.Errorf("both hubTlsCertFile and hubTlsKeyFile must be set for manual TLS")
+	}
+
+	// Validate peer settings
+	if len(c.Peers) > 0 {
+		if c.PeerListenAddress == "" {
+			return fmt.Errorf("peerListenAddress must be set if peers are defined")
+		}
+		if len(c.PeerAuthentication.TrustedDomainSuffixes) == 0 {
+			return fmt.Errorf("peerAuthentication.trustedDomainSuffixes must be set if peers are defined")
+		}
+	}
+
+	return nil
+}
+
 // LoadConfig reads the configuration from the given file path, unmarshals it,
-// and performs basic validation.
+// and performs validation.
 func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -44,30 +92,8 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to unmarshal yaml from %s: %w", path, err)
 	}
 
-	if cfg.BackendListenAddress == "" {
-		return nil, fmt.Errorf("config validation failed: backendListenAddress must be set")
-	}
-	if cfg.HubTlsCertFile == "" || cfg.HubTlsKeyFile == "" {
-		return nil, fmt.Errorf("config validation failed: both hubTlsCertFile and hubTlsKeyFile must be set")
-	}
-	if len(cfg.RelayPorts) == 0 {
-		return nil, fmt.Errorf("config validation failed: at least one relayPort must be specified")
-	}
-	if cfg.BackendsJWTSecret == "" {
-		return nil, fmt.Errorf("config validation failed: backendsJWTSecret must be set")
-	}
-	if cfg.IdleTimeoutSeconds < 0 {
-		return nil, fmt.Errorf("config validation failed: idleTimeoutSeconds cannot be negative")
-	}
-
-	// Validation for new peer settings
-	if len(cfg.Peers) > 0 {
-		if cfg.PeerListenAddress == "" {
-			return nil, fmt.Errorf("config validation failed: peerListenAddress must be set if peers are defined")
-		}
-		if len(cfg.PeerAuthentication.TrustedDomainSuffixes) == 0 {
-			return nil, fmt.Errorf("config validation failed: peerAuthentication.trustedDomainSuffixes must be set if peers are defined")
-		}
+	if err := cfg.validate(); err != nil {
+		return nil, fmt.Errorf("config validation failed: %w", err)
 	}
 
 	return &cfg, nil

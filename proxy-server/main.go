@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -13,6 +15,7 @@ import (
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/hub"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/peer"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/proxy"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 func main() {
@@ -27,27 +30,57 @@ func main() {
 
 	log.Printf("INFO: Configuration loaded successfully from %s", *configPath)
 	log.Printf("INFO: Hub Address: %s", cfg.BackendListenAddress)
+
+	// --- 2. Server Initialization ---
+	log.Println("INFO: Server initialization sequence starting...")
+
+	var acmeHandler http.Handler
+	var hubTlsConfig *tls.Config
+
+	if cfg.HubPublicHostname != "" {
+		log.Println("INFO: Hub TLS mode: Automatic (Let's Encrypt using HTTP-01)")
+
+		cacheDir := cfg.AcmeCacheDir
+		if cacheDir == "" {
+			cacheDir = "acme_certs"
+		}
+		if err := os.MkdirAll(cacheDir, 0700); err != nil {
+			log.Fatalf("FATAL: Could not create ACME cache directory %s: %v", cacheDir, err)
+		}
+		log.Printf("INFO: ACME certificate cache directory: %s", cacheDir)
+
+		certManager := &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(cfg.HubPublicHostname),
+			Cache:      autocert.DirCache(cacheDir),
+		}
+
+		hubTlsConfig = certManager.TLSConfig()
+		acmeHandler = certManager.HTTPHandler(nil)
+
+	} else {
+		log.Println("INFO: Hub TLS mode: Manual (from file)")
+		cert, err := tls.LoadX509KeyPair(cfg.HubTlsCertFile, cfg.HubTlsKeyFile)
+		if err != nil {
+			log.Fatalf("FATAL: Failed to load manual TLS certificates: %v", err)
+		}
+		hubTlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+	}
+
 	log.Printf("INFO: Public Ports: %v", cfg.RelayPorts)
 	if cfg.IdleTimeout() > 0 {
 		log.Printf("INFO: Client idle timeout is %s", cfg.IdleTimeout())
 	}
 
-	// --- 2. Server Initialization ---
-	log.Println("INFO: Server initialization sequence starting...")
-
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 
-	// We must initialize components in an order that allows dependency injection
-	// while avoiding circular dependencies.
-	backendHub := hub.New(cfg)
+	backendHub := hub.New(cfg, hubTlsConfig)
 	peerManager := peer.NewManager(cfg, backendHub)
-	clientListener := proxy.NewListener(cfg, backendHub, peerManager)
+	clientListener := proxy.NewListener(cfg, backendHub, peerManager, acmeHandler)
 
-	// Now that all components are created, inject the peer manager into the hub.
 	backendHub.SetPeerManager(peerManager)
 
-	// Run all components in goroutines.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()

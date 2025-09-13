@@ -30,12 +30,14 @@ type hubImpl struct {
 	upgrader      websocket.Upgrader
 	pools         sync.Map // key: hostname (string), value: *LoadBalancerPool
 	peerManager   iface.PeerManager
+	hubTlsConfig  *tls.Config
 }
 
 // New creates and returns a new Hub instance.
-func New(cfg *config.Config) *hubImpl {
+func New(cfg *config.Config, tlsConfig *tls.Config) *hubImpl {
 	return &hubImpl{
-		config: cfg,
+		config:       cfg,
+		hubTlsConfig: tlsConfig,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
@@ -54,13 +56,14 @@ func (h *hubImpl) Run() {
 	backendMux := http.NewServeMux()
 	backendMux.HandleFunc("/connect", h.handleBackendConnect)
 	h.backendServer = &http.Server{
-		Addr:    h.config.BackendListenAddress,
-		Handler: backendMux,
+		Addr:      h.config.BackendListenAddress,
+		Handler:   backendMux,
+		TLSConfig: h.hubTlsConfig,
 	}
 
 	log.Printf("INFO: Backend Hub (JWT) listening on %s", h.config.BackendListenAddress)
 	go func() {
-		if err := h.backendServer.ListenAndServeTLS(h.config.HubTlsCertFile, h.config.HubTlsKeyFile); err != nil && err != http.ErrServerClosed {
+		if err := h.backendServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("FATAL: Backend Hub failed to start: %v", err)
 		}
 	}()
@@ -70,40 +73,24 @@ func (h *hubImpl) Run() {
 		peerMux := http.NewServeMux()
 		peerMux.HandleFunc("/mesh", h.handlePeerConnect)
 
-		tlsConfig, err := h.createPeerTlsConfig()
-		if err != nil {
-			log.Fatalf("FATAL: Could not create peer mTLS config: %v. Peer hub not starting.", err)
-			return
-		}
+		// Clone the base TLS config and add peer-specific mTLS settings.
+		peerTlsConfig := h.hubTlsConfig.Clone()
+		peerTlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+		peerTlsConfig.VerifyPeerCertificate = h.buildVerifyPeerCertificateFunc()
 
 		h.peerServer = &http.Server{
 			Addr:      h.config.PeerListenAddress,
 			Handler:   peerMux,
-			TLSConfig: tlsConfig,
+			TLSConfig: peerTlsConfig,
 		}
 
 		log.Printf("INFO: Peer Hub (mTLS) listening on %s", h.config.PeerListenAddress)
 		go func() {
-			// ListenAndServeTLS uses the pre-configured TLSConfig
 			if err := h.peerServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
 				log.Fatalf("FATAL: Peer Hub failed to start: %v", err)
 			}
 		}()
 	}
-}
-
-// createPeerTlsConfig builds the TLS configuration for the mTLS-secured peer server.
-func (h *hubImpl) createPeerTlsConfig() (*tls.Config, error) {
-	cert, err := tls.LoadX509KeyPair(h.config.HubTlsCertFile, h.config.HubTlsKeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load server certificate for peer hub: %w", err)
-	}
-
-	return &tls.Config{
-		Certificates:          []tls.Certificate{cert},
-		ClientAuth:            tls.RequireAndVerifyClientCert,
-		VerifyPeerCertificate: h.buildVerifyPeerCertificateFunc(),
-	}, nil
 }
 
 // buildVerifyPeerCertificateFunc is a closure that creates the verification function.

@@ -9,6 +9,7 @@ The core mission of Nexus is to intelligently route client requests to the appro
 -   **Privacy by Design:** The proxy's primary security feature is that it *cannot* see your data. By passing the encrypted TLS stream through without termination, it guarantees privacy from the proxy layer itself.
 -   **Stateless at the Edge:** The proxy does not maintain any user session state (like sticky sessions). This makes the proxy nodes themselves trivial to scale and highly resilient. State is managed by the backend application layer.
 -   **Hybrid L4/L7 Operation:** Nexus is a pure passthrough proxy for standard traffic but also operates as a lightweight L7 proxy on port 80. This provides a practical solution for backend services that need to solve the Let's Encrypt `HTTP-01` challenge for certificate automation.
+-   **Automatic TLS for the Hub:** Nexus can automatically obtain and renew its own TLS certificates for its backend and peer hub endpoints using Let's Encrypt (`HTTP-01` challenge). This enables a zero-configuration TLS setup.
 -   **Intelligent Geo-Routing:** Nexus nodes form a mesh, allowing them to tunnel traffic to one another. This enables efficient geo-distribution where backends only need to connect to their nearest regional proxies, not the entire global fleet.
 -   **Efficient Backend Communication:** Backends connect to the proxy mesh via a persistent WebSocket connection, over which many concurrent client streams are multiplexed. This is highly efficient and resilient to network firewalls.
 -   **Simple, Weighted Load Balancing:** Uses a straightforward Weighted Round Robin (WRR) algorithm to distribute load across available backend instances for a given service.
@@ -59,12 +60,27 @@ The routing logic is designed to be simple and explicit.
     -   If the `Host` header is missing or malformed, the request cannot be routed and the connection is closed.
 
 
-## Getting Started (Example)
+## Getting Started
 
-Nexus is configured via a `config.yaml` file. See [example](config.example.yaml)
+Nexus is configured via a `config.yaml` file. See the [example config](config.example.yaml) for all available options.
 
-### Hub TLS (Mandatory)
-The hub server (for backend and peer connections) requires TLS. For local development, you can [generate a self-signed certificate](https://mkcert.dev)
+### Hub TLS (Automatic or Manual)
+
+The hub server (for backend and peer connections) requires TLS. You can choose between two modes:
+
+1.  **Automatic (Recommended):** Simply provide your server's public hostname in the `config.yaml`. Nexus will automatically obtain and renew a free TLS certificate from Let's Encrypt.
+
+    ```yaml
+    hubPublicHostname: "nexus.example.com"
+    ```
+
+2.  **Manual:** Manually specify the path to your own certificate and key files.
+
+    ```yaml
+    hubTlsCertFile: "/path/to/your/fullchain.pem"
+    hubTlsKeyFile: "/path/to/your/privkey.pem"
+    ```
+    For local development, you can [generate a self-signed certificate](https://mkcert.dev)
 
 ## Reference Backend Client
 

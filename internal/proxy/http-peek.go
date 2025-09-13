@@ -12,12 +12,16 @@ import (
 
 var ErrNotHTTPRequest = errors.New("stream does not contain a valid HTTP request")
 
-func PeekHost(conn *PeekableConn) (host string, finalStream io.Reader, err error) {
+func PeekHost(conn *PeekableConn) (host string, err error) {
 	if conn == nil || conn.reader == nil {
-		return "", nil, errors.New("PeekableConn or its reader is nil")
+		return "", errors.New("PeekableConn or its reader is nil")
 	}
 
 	var capturedBytes bytes.Buffer
+	defer func() {
+		conn.reader = io.MultiReader(&capturedBytes, conn.reader)
+	}()
+
 	teeReader := io.TeeReader(conn.reader, &capturedBytes)
 
 	bufferedStream := bufio.NewReader(teeReader)
@@ -25,7 +29,7 @@ func PeekHost(conn *PeekableConn) (host string, finalStream io.Reader, err error
 	req, err := http.ReadRequest(bufferedStream)
 	if err != nil {
 		log.Printf("DEBUG: Failed to read HTTP request: %v | %s", err, capturedBytes.String())
-		return "", io.MultiReader(&capturedBytes, conn.reader), ErrNotHTTPRequest
+		return "", ErrNotHTTPRequest
 	}
 
 	targetHost := req.Host
@@ -34,12 +38,12 @@ func PeekHost(conn *PeekableConn) (host string, finalStream io.Reader, err error
 	}
 
 	if targetHost == "" {
-		return "", io.MultiReader(&capturedBytes, conn.reader), errors.New("could not determine target host")
+		return "", errors.New("could not determine target host")
 	}
 
 	if h, _, err := net.SplitHostPort(targetHost); err == nil {
 		targetHost = h
 	}
 
-	return targetHost, io.MultiReader(&capturedBytes, conn.reader), nil
+	return targetHost, nil
 }
