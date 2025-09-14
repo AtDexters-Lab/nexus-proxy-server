@@ -60,9 +60,7 @@ The routing logic is designed to be simple and explicit.
     -   If the `Host` header is missing or malformed, the request cannot be routed and the connection is closed.
 
 
-## Getting Started
-
-Nexus is configured via a `config.yaml` file. See the [example config](config.example.yaml) for all available options.
+## Install
 
 ### Quick Install (Linux)
 
@@ -71,24 +69,24 @@ Nexus is configured via a `config.yaml` file. See the [example config](config.ex
   - A DNS A record you can point to this server.
   - Systemd-based Linux (for service installation).
 
-- Install using the one-liner:
+- One-liner installer:
 
 ```
 sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/AtDexters-Lab/nexus-proxy-server/main/scripts/install.sh | bash'
 ```
 
-- Script behavior:
+- What the script does:
   - Detects CPU arch and downloads the latest release.
-  - Prompts for your Nexus hostname (FQDN).
-  - Guides you to update DNS A record and checks it against your public IP.
+  - Prompts for your Nexus hostname (FQDN) and guides DNS A record setup.
   - Writes `/etc/nexus-proxy-server/config.yaml` with a generated JWT secret.
   - Installs and starts a `systemd` service named `nexus-proxy-server`.
 
-- Useful environment overrides:
-  - Pin to a specific version: `NEXUS_VERSION=v0.1.2`
+- Environment overrides:
+  - Pin version: `NEXUS_VERSION=v0.1.2`
   - Provide hostname non-interactively: `NEXUS_HOST=nexus.example.com`
   - Skip DNS wait (CI/testing): `NEXUS_SKIP_DNS=skip`
-  - Example:
+
+Example:
 
 ```
 sudo NEXUS_VERSION=v0.1.2 NEXUS_HOST=nexus.example.com NEXUS_SKIP_DNS=skip \
@@ -101,7 +99,16 @@ sudo NEXUS_VERSION=v0.1.2 NEXUS_HOST=nexus.example.com NEXUS_SKIP_DNS=skip \
 - Artifacts include the server binary and `config.example.yaml`.
 - See the GitHub Releases page for download links and `SHA256SUMS`.
 
-### Building From Source
+### Build From Source
+
+- Build: `go build -o bin/nexus-proxy-server ./proxy-server`
+- Run (dev): `go run ./proxy-server -config config.example.yaml`
+- Test: `go test ./...`
+- Format: `go fmt ./...`  |  Vet: `go vet ./...`
+
+## Configure
+
+Nexus is configured via a `config.yaml` file. See the [example config](config.example.yaml) for all available options.
 
 ### Hub TLS (Automatic or Manual)
 
