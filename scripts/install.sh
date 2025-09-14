@@ -48,14 +48,22 @@ gen_secret() {
   fi
 }
 
+TTY_DEVICE="/dev/tty"
+
 prompt() {
   local msg="$1" def="${2:-}"
-  if [[ -n "$def" ]]; then
-    read -rp "$msg [$def]: " ans
-    echo "${ans:-$def}"
+  local ans=""
+  if [[ -r "$TTY_DEVICE" ]]; then
+    if [[ -n "$def" ]]; then
+      read -r -p "$msg [$def]: " ans < "$TTY_DEVICE" || true
+      echo "${ans:-$def}"
+    else
+      read -r -p "$msg: " ans < "$TTY_DEVICE" || true
+      echo "$ans"
+    fi
   else
-    read -rp "$msg: " ans
-    echo "$ans"
+    # Non-interactive: honor defaults or env vars
+    echo "$def"
   fi
 }
 
@@ -67,12 +75,14 @@ normalize_host() {
 }
 
 get_public_ip() {
+  local ip=""
   if command -v dig >/dev/null 2>&1; then
-    dig +short -4 myip.opendns.com @resolver1.opendns.com || true
+    ip=$(dig +short -4 myip.opendns.com @resolver1.opendns.com 2>/dev/null | head -n1 || true)
   fi
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL https://api.ipify.org || true
+  if [[ -z "$ip" ]] && command -v curl >/dev/null 2>&1; then
+    ip=$(curl -fsSL https://api.ipify.org 2>/dev/null || true)
   fi
+  echo -n "$ip"
 }
 
 resolve_a() {
@@ -159,9 +169,11 @@ main() {
 
   echo "==> Gathering configuration"
   local host idle
-  host=$(prompt "Enter the FQDN for Nexus (for Let's Encrypt HTTP-01)" "nexus.example.com")
+  # Allow non-interactive override via env var NEXUS_HOST
+  host=${NEXUS_HOST:-$(prompt "Enter the FQDN for Nexus (for Let's Encrypt HTTP-01)" "nexus.example.com")}
   host=$(normalize_host "$host")
-  idle=$(prompt "Idle timeout (seconds)" "60")
+  # Idle timeout: use default 60 unless overridden via env
+  idle=${NEXUS_IDLE_TIMEOUT:-60}
   local secret
   secret=$(gen_secret)
 
@@ -170,13 +182,19 @@ main() {
   myip=$(get_public_ip)
   echo "Detected public IP: ${myip:-unknown}"
   while true; do
-    read -rp "Press Enter after updating DNS (or type 'skip' to continue): " ans
+    local ans=""
+    if [[ -r "$TTY_DEVICE" ]]; then
+      read -r -p "Press Enter after updating DNS (or type 'skip' to continue): " ans < "$TTY_DEVICE" || true
+    else
+      # Non-interactive environment: honor NEXUS_SKIP_DNS or continue once
+      ans=${NEXUS_SKIP_DNS:-skip}
+    fi
     if [[ "${ans:-}" == "skip" ]]; then
       break
     fi
     aips=$(resolve_a "$host")
     echo "Current $host A records: ${aips:-none}"
-    if [[ -n "$myip" && -n "$aips" && "$aips" == *"$myip"* ]]; then
+    if [[ -n "$myip" && -n "$aips" ]] && echo "$aips" | grep -Fxq "$myip"; then
       echo "DNS appears to point to this server."
       break
     fi
@@ -202,4 +220,3 @@ main() {
 }
 
 main "$@"
-
