@@ -64,6 +64,45 @@ The routing logic is designed to be simple and explicit.
 
 Nexus is configured via a `config.yaml` file. See the [example config](config.example.yaml) for all available options.
 
+### Quick Install (Linux)
+
+- Requirements:
+  - Public ports `80` and `443` reachable from the internet (HTTP-01 ACME).
+  - A DNS A record you can point to this server.
+  - Systemd-based Linux (for service installation).
+
+- Install using the one-liner:
+
+```
+sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/AtDexters-Lab/nexus-proxy-server/main/scripts/install.sh | bash'
+```
+
+- Script behavior:
+  - Detects CPU arch and downloads the latest release.
+  - Prompts for your Nexus hostname (FQDN).
+  - Guides you to update DNS A record and checks it against your public IP.
+  - Writes `/etc/nexus-proxy-server/config.yaml` with a generated JWT secret.
+  - Installs and starts a `systemd` service named `nexus-proxy-server`.
+
+- Useful environment overrides:
+  - Pin to a specific version: `NEXUS_VERSION=v0.1.2`
+  - Provide hostname non-interactively: `NEXUS_HOST=nexus.example.com`
+  - Skip DNS wait (CI/testing): `NEXUS_SKIP_DNS=skip`
+  - Example:
+
+```
+sudo NEXUS_VERSION=v0.1.2 NEXUS_HOST=nexus.example.com NEXUS_SKIP_DNS=skip \
+  bash -c 'curl -fsSL https://raw.githubusercontent.com/AtDexters-Lab/nexus-proxy-server/main/scripts/install.sh | bash'
+```
+
+### Releases (Binaries)
+
+- We publish Linux binaries for `amd64` and `arm64` on every Git tag `v*`.
+- Artifacts include the server binary and `config.example.yaml`.
+- See the GitHub Releases page for download links and `SHA256SUMS`.
+
+### Building From Source
+
 ### Hub TLS (Automatic or Manual)
 
 The hub server (for backend and peer connections) requires TLS. You can choose between two modes:
@@ -81,6 +120,14 @@ The hub server (for backend and peer connections) requires TLS. You can choose b
     hubTlsKeyFile: "/path/to/your/privkey.pem"
     ```
     For local development, you can [generate a self-signed certificate](https://mkcert.dev)
+
+### Managing the Service
+
+- Check status: `systemctl status nexus-proxy-server`
+- Restart: `sudo systemctl restart nexus-proxy-server`
+- Logs: `journalctl -u nexus-proxy-server -f`
+
+### Backend Clients
 
 ## Reference Backend Client
 

@@ -34,10 +34,29 @@ detect_arch() {
   esac
 }
 
-latest_asset_url() {
+asset_filename() {
   local arch="$1"
-  # Use GitHub's latest release endpoint for asset name
-  echo "https://github.com/${REPO}/releases/latest/download/${BIN_NAME}_linux_${arch}.tar.gz"
+  echo "${BIN_NAME}_linux_${arch}.tar.gz"
+}
+
+asset_url() {
+  local arch="$1" version="${NEXUS_VERSION:-}"
+  local base
+  base=$(asset_filename "$arch")
+  if [[ -n "$version" ]]; then
+    echo "https://github.com/${REPO}/releases/download/${version}/${base}"
+  else
+    echo "https://github.com/${REPO}/releases/latest/download/${base}"
+  fi
+}
+
+sums_url() {
+  local version="${NEXUS_VERSION:-}"
+  if [[ -n "$version" ]]; then
+    echo "https://github.com/${REPO}/releases/download/${version}/SHA256SUMS"
+  else
+    echo "https://github.com/${REPO}/releases/latest/download/SHA256SUMS"
+  fi
 }
 
 gen_secret() {
@@ -139,11 +158,30 @@ WantedBy=multi-user.target
 UNIT
 }
 
+existing_install() {
+  [[ -f "$ETC_DIR/config.yaml" ]] || [[ -f "$SYSTEMD_UNIT" ]]
+}
+
+prompt_choice() {
+  local msg="$1" def="$2"
+  local ans=""
+  if [[ -r "$TTY_DEVICE" ]]; then
+    read -r -p "$msg [$def]: " ans < "$TTY_DEVICE" || true
+    echo "${ans:-$def}"
+  else
+    echo "$def"
+  fi
+}
+
 main() {
   require_root
   need curl
   need tar
   need systemctl
+  # Prefer sha256sum, fallback to shasum if present
+  if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+    echo "WARN: sha256sum/shasum not found; release checksum verification will be skipped" >&2
+  fi
 
   local arch
   arch=$(detect_arch)
@@ -154,12 +192,43 @@ main() {
   chown -R nexus:nexus "$ETC_DIR" "$DATA_DIR"
 
   echo "==> Downloading ${BIN_NAME} for linux_${arch}"
-  local url
-  url=$(latest_asset_url "$arch")
+  local url sumsurl asset sumsfile
+  url=$(asset_url "$arch")
+  sumsurl=$(sums_url)
+  asset=$(asset_filename "$arch")
+  sumsfile="SHA256SUMS"
   tmpdir=$(mktemp -d)
   trap 'rm -rf "$tmpdir"' EXIT
-  curl -fL "$url" -o "$tmpdir/${BIN_NAME}.tar.gz"
-  tar -xzf "$tmpdir/${BIN_NAME}.tar.gz" -C "$tmpdir"
+  echo "    -> $url"
+  curl -fL "$url" -o "$tmpdir/${asset}"
+  echo "    -> $sumsurl"
+  curl -fL "$sumsurl" -o "$tmpdir/${sumsfile}" || true
+
+  # Verify checksum if tools and sums are present
+  if [[ -s "$tmpdir/${sumsfile}" ]]; then
+    echo "==> Verifying artifact checksum"
+    local expected actual
+    expected=$(awk -v f="$asset" '$2==f {print $1}' "$tmpdir/${sumsfile}" | head -n1 || true)
+    if [[ -n "$expected" ]]; then
+      if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$tmpdir/${asset}" | awk '{print $1}')
+      else
+        actual=$(shasum -a 256 "$tmpdir/${asset}" | awk '{print $1}')
+      fi
+      if [[ "$expected" != "$actual" ]]; then
+        echo "ERROR: checksum mismatch for $asset" >&2
+        echo "  expected: $expected" >&2
+        echo "  actual:   $actual" >&2
+        exit 1
+      fi
+    else
+      echo "WARN: Could not find $asset in SHA256SUMS; skipping verification" >&2
+    fi
+  else
+    echo "WARN: SHA256SUMS not downloaded; skipping verification" >&2
+  fi
+
+  tar -xzf "$tmpdir/${asset}" -C "$tmpdir"
   install -m 0755 "$tmpdir/${BIN_NAME}" "$INSTALL_DIR/${BIN_NAME}"
 
   if command -v setcap >/dev/null 2>&1; then
@@ -167,38 +236,63 @@ main() {
     setcap cap_net_bind_service=+ep "$INSTALL_DIR/${BIN_NAME}" || true
   fi
 
-  echo "==> Gathering configuration"
-  local host idle
-  # Allow non-interactive override via env var NEXUS_HOST
-  host=${NEXUS_HOST:-$(prompt "Enter the FQDN for Nexus (for Let's Encrypt HTTP-01)" "nexus.example.com")}
-  host=$(normalize_host "$host")
-  # Idle timeout: use default 60 unless overridden via env
-  idle=${NEXUS_IDLE_TIMEOUT:-60}
-  local secret
-  secret=$(gen_secret)
+  local reconfig_mode="new"
+  if existing_install; then
+    echo "==> Existing Nexus installation detected"
+    local choice
+    choice=$(prompt_choice "Choose action: [U]pgrade binary only, [R]econfigure, [A]bort" "U")
+    case "${choice^^}" in
+      U) reconfig_mode="upgrade" ;;
+      R) reconfig_mode="reconfigure" ;;
+      A) echo "Aborting per selection."; exit 0 ;;
+      *) reconfig_mode="upgrade" ;;
+    esac
+  fi
 
-  echo "==> Please create/point DNS A record for $host to this server's public IP"
-  local myip aips
-  myip=$(get_public_ip)
-  echo "Detected public IP: ${myip:-unknown}"
-  while true; do
-    local ans=""
-    if [[ -r "$TTY_DEVICE" ]]; then
-      read -r -p "Press Enter after updating DNS (or type 'skip' to continue): " ans < "$TTY_DEVICE" || true
-    else
-      # Non-interactive environment: honor NEXUS_SKIP_DNS or continue once
-      ans=${NEXUS_SKIP_DNS:-skip}
+  local host idle secret
+  idle=${NEXUS_IDLE_TIMEOUT:-60}
+  if [[ "$reconfig_mode" == "reconfigure" || "$reconfig_mode" == "new" ]]; then
+    echo "==> Gathering configuration"
+    # Allow non-interactive override via env var NEXUS_HOST
+    host=${NEXUS_HOST:-$(prompt "Enter the FQDN for Nexus (for Let's Encrypt HTTP-01)" "nexus.example.com")}
+    host=$(normalize_host "$host")
+    secret=$(gen_secret)
+
+    echo "==> Please create/point DNS A record for $host to this server's public IP"
+    local myip aips
+    myip=$(get_public_ip)
+    echo "Detected public IP: ${myip:-unknown}"
+    while true; do
+      local ans=""
+      if [[ -r "$TTY_DEVICE" ]]; then
+        read -r -p "Press Enter after updating DNS (or type 'skip' to continue): " ans < "$TTY_DEVICE" || true
+      else
+        # Non-interactive environment: honor NEXUS_SKIP_DNS or continue once
+        ans=${NEXUS_SKIP_DNS:-skip}
+      fi
+      if [[ "${ans:-}" == "skip" ]]; then
+        break
+      fi
+      aips=$(resolve_a "$host")
+      echo "Current $host A records: ${aips:-none}"
+      if [[ -n "$myip" && -n "$aips" ]] && echo "$aips" | grep -Fxq "$myip"; then
+        echo "DNS appears to point to this server."
+        break
+      fi
+    done
+
+    printf "==> Writing configuration to %s\n" "$ETC_DIR/config.yaml"
+    # Backup existing config if present
+    if [[ -f "$ETC_DIR/config.yaml" ]]; then
+      cp -f "$ETC_DIR/config.yaml" "$ETC_DIR/config.yaml.bak-$(date +%s)"
     fi
-    if [[ "${ans:-}" == "skip" ]]; then
-      break
-    fi
-    aips=$(resolve_a "$host")
-    echo "Current $host A records: ${aips:-none}"
-    if [[ -n "$myip" && -n "$aips" ]] && echo "$aips" | grep -Fxq "$myip"; then
-      echo "DNS appears to point to this server."
-      break
-    fi
-  done
+    write_config "$ETC_DIR/config.yaml" "$host" "$secret" "$idle"
+    chown nexus:nexus "$ETC_DIR/config.yaml"
+    chmod 0640 "$ETC_DIR/config.yaml"
+  else
+    # Upgrade path: keep existing config and secret
+    printf "==> Keeping existing configuration at %s\n" "$ETC_DIR/config.yaml"
+  fi
 
   echo "==> Writing configuration to $ETC_DIR/config.yaml"
   write_config "$ETC_DIR/config.yaml" "$host" "$secret" "$idle"
@@ -206,17 +300,22 @@ main() {
   chmod 0640 "$ETC_DIR/config.yaml"
 
   echo "==> Installing systemd service"
-  write_systemd "$SYSTEMD_UNIT" nexus
+  if [[ ! -f "$SYSTEMD_UNIT" ]]; then
+    write_systemd "$SYSTEMD_UNIT" nexus
+  fi
   systemctl daemon-reload
-  systemctl enable "$SERVICE_NAME"
-  systemctl restart "$SERVICE_NAME"
+  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+  systemctl restart "$SERVICE_NAME" || systemctl start "$SERVICE_NAME" || true
 
-  echo "\nInstallation complete. Details:"
-  echo "  Binary: $INSTALL_DIR/$BIN_NAME"
-  echo "  Config: $ETC_DIR/config.yaml"
-  echo "  Data:   $DATA_DIR (ACME cache: $ACME_DIR)"
-  echo "  Service: systemctl status $SERVICE_NAME"
-  echo "\nBackend JWT secret (share with your backend clients):\n  $secret\n"
+  printf "\nInstallation complete. Details:\n"
+  printf "  Binary: %s\n" "$INSTALL_DIR/$BIN_NAME"
+  printf "  Config: %s\n" "$ETC_DIR/config.yaml"
+  printf "  Data:   %s (ACME cache: %s)\n" "$DATA_DIR" "$ACME_DIR"
+  printf "  Service: systemctl status %s\n" "$SERVICE_NAME"
+
+  if [[ "$reconfig_mode" == "reconfigure" || "$reconfig_mode" == "new" ]]; then
+    printf "\nBackend JWT secret (share with your backend clients):\n  %s\n\n" "$secret"
+  fi
 }
 
 main "$@"
