@@ -15,12 +15,12 @@ type PeerAuthentication struct {
 
 // Config holds the entire application configuration, loaded from a YAML file.
 type Config struct {
-	BackendListenAddress string `yaml:"backendListenAddress"`
-	PeerListenAddress    string `yaml:"peerListenAddress"`
-	RelayPorts           []int  `yaml:"relayPorts"`
-	IdleTimeoutSeconds   int    `yaml:"idleTimeoutSeconds"`
-	BackendsJWTSecret    string `yaml:"backendsJWTSecret"`
-	Peers                []string `yaml:"peers"`
+	BackendListenAddress string             `yaml:"backendListenAddress"`
+	PeerListenAddress    string             `yaml:"peerListenAddress"`
+	RelayPorts           []int              `yaml:"relayPorts"`
+	IdleTimeoutSeconds   int                `yaml:"idleTimeoutSeconds"`
+	BackendsJWTSecret    string             `yaml:"backendsJWTSecret"`
+	Peers                []string           `yaml:"peers"`
 	PeerAuthentication   PeerAuthentication `yaml:"peerAuthentication"`
 
 	// Manual TLS configuration

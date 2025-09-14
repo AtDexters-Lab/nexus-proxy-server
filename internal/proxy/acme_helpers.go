@@ -5,32 +5,58 @@ import (
 	"sync"
 )
 
-// SingleConnListener is a net.Listener that returns a single connection.
-// This is used to serve a single HTTP request from an existing connection.
+// SingleConnListener is a net.Listener that exposes exactly one pre-existing
+// connection to an http.Server. It returns the connection once from Accept.
+// Subsequent Accept calls block until the connection is closed, then return
+// net.ErrClosed. This prevents premature server shutdown races.
 type SingleConnListener struct {
-	conn net.Conn
-	once sync.Once
+	conn      net.Conn
+	handedOut bool
+	mu        sync.Mutex
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+// closeSignalConn wraps a net.Conn and signals on Close so the listener can
+// know when it is safe to have Accept stop blocking and return ErrClosed.
+type closeSignalConn struct {
+	net.Conn
+	notify func()
+	once   sync.Once
+}
+
+func (c *closeSignalConn) Close() error {
+	c.once.Do(c.notify)
+	return c.Conn.Close()
 }
 
 // NewSingleConnListener creates a new SingleConnListener.
 func NewSingleConnListener(conn net.Conn) net.Listener {
-	return &SingleConnListener{conn: conn}
+	l := &SingleConnListener{closed: make(chan struct{})}
+	// Wrap provided conn to notify when it is closed by http.Server.
+	l.conn = &closeSignalConn{Conn: conn, notify: func() { l.closeOnce.Do(func() { close(l.closed) }) }}
+	return l
 }
 
-// Accept returns the single connection.
+// Accept returns the connection on the first call. On subsequent calls it
+// blocks until the connection is closed, then returns net.ErrClosed.
 func (l *SingleConnListener) Accept() (net.Conn, error) {
-	var c net.Conn
-	l.once.Do(func() {
-		c = l.conn
-	})
-	if c == nil {
-		return nil, net.ErrClosed
+	l.mu.Lock()
+	if !l.handedOut {
+		l.handedOut = true
+		c := l.conn
+		l.mu.Unlock()
+		return c, nil
 	}
-	return c, nil
+	ch := l.closed
+	l.mu.Unlock()
+	<-ch
+	return nil, net.ErrClosed
 }
 
-// Close closes the single connection.
+// Close closes the underlying connection and unblocks any Accept waiters.
 func (l *SingleConnListener) Close() error {
+	l.closeOnce.Do(func() { close(l.closed) })
 	return l.conn.Close()
 }
 

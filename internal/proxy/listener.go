@@ -1,12 +1,14 @@
 package proxy
 
 import (
+	"crypto/tls"
 	"log"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
@@ -18,18 +20,20 @@ type Listener struct {
 	hub         iface.Hub
 	peerManager iface.PeerManager
 	acmeHandler http.Handler // Handler for ACME HTTP-01 challenges
+	acmeTLS     *tls.Config  // TLS config to satisfy TLS-ALPN-01 on :443
 	wg          sync.WaitGroup
 	listeners   []net.Listener
 	mu          sync.Mutex
 }
 
 // NewListener creates a new Listener instance.
-func NewListener(cfg *config.Config, hub iface.Hub, pm iface.PeerManager, acme http.Handler) *Listener {
+func NewListener(cfg *config.Config, hub iface.Hub, pm iface.PeerManager, acme http.Handler, acmeTLS *tls.Config) *Listener {
 	return &Listener{
 		config:      cfg,
 		hub:         hub,
 		peerManager: pm,
 		acmeHandler: acme,
+		acmeTLS:     acmeTLS,
 		listeners:   make([]net.Listener, 0, len(cfg.RelayPorts)),
 	}
 }
@@ -80,39 +84,65 @@ func (l *Listener) listenOnPort(port int) {
 }
 
 func (l *Listener) handleConnection(conn net.Conn) {
-	peekableConn := NewPeekableConn(conn)
 	var hostname string
-	var err error
+	var prelude []byte
+	var isTLS bool
 
-	hostname, err = PeekServerName(peekableConn)
-	isTLS := err == nil
+	localPort := 0
+	if tcpAddr, ok := conn.LocalAddr().(*net.TCPAddr); ok {
+		localPort = tcpAddr.Port
+	}
 
-	if err != nil {
-		log.Printf("INFO: TLS Method: Could not determine hostname for %s: %v", conn.RemoteAddr(), err)
-		hostname, err = PeekHost(peekableConn)
-		if err == nil {
-			// It's an HTTP request. Check if it's for our ACME challenge.
-			if l.acmeHandler != nil && strings.EqualFold(hostname, l.config.HubPublicHostname) {
-				log.Printf("INFO: Intercepting HTTP request for proxy's own hostname '%s' to handle ACME challenge", hostname)
-				simpleHttpServer := &http.Server{Handler: l.acmeHandler}
-				simpleHttpServer.Serve(NewSingleConnListener(peekableConn))
+	// Try TLS SNI first using a robust aborted handshake.
+	sni, tlsPrelude, tlsErr := PeekSNIAndPrelude(conn, 5*time.Second, 32<<10)
+	if tlsErr == nil && sni != "" {
+		hostname = normalizeHostname(sni)
+		prelude = tlsPrelude
+		isTLS = true
+	} else {
+		// Reinstate any bytes read during TLS sniff before attempting HTTP.
+		if len(tlsPrelude) > 0 {
+			conn = WithPrelude(conn, tlsPrelude)
+		}
+		// Fallback to HTTP Host sniffing on plaintext.
+		host, path, httpPrelude, httpErr := PeekHTTPHostAndPrelude(conn, 5*time.Second, 64<<10)
+		if httpErr == nil && host != "" {
+			hostname = host
+			prelude = httpPrelude
+			isTLS = false
+			// Check if it's for our ACME HTTP-01 challenge.
+			hubHostNorm := normalizeHostname(l.config.HubPublicHostname)
+			if l.acmeHandler != nil && hostname == hubHostNorm && localPort == 80 && strings.HasPrefix(path, "/.well-known/acme-challenge/") {
+				log.Printf("INFO: Intercepting HTTP request for proxy's own hostname '%s' on :80 to handle ACME challenge", hostname)
+				simpleHttpServer := &http.Server{Handler: l.acmeHandler, ReadHeaderTimeout: 5 * time.Second}
+				// Reinsert the bytes we consumed into the stream for the HTTP server.
+				connWithPrelude := WithPrelude(conn, prelude)
+				err := simpleHttpServer.Serve(NewSingleConnListener(connWithPrelude))
+				log.Printf("INFO: ACME HTTP handler finished for '%s' on :80: %v", hostname, err)
 				return
 			}
+		} else {
+			// Neither TLS nor HTTP
+			if len(httpPrelude) > 0 {
+				previewLen := len(httpPrelude)
+				if previewLen > 24 {
+					previewLen = 24
+				}
+				log.Printf("DEBUG: HTTP sniff read %d bytes on :%d (hex preview %x)", len(httpPrelude), localPort, httpPrelude[:previewLen])
+			}
+			log.Printf("WARN: Could not determine hostname for %s on :%d: tlsErr=%v httpErr=%v. Closing connection.", conn.RemoteAddr(), localPort, tlsErr, httpErr)
+			conn.Close()
+			return
 		}
 	}
 
-	if err != nil {
-		log.Printf("WARN: Could not determine hostname for %s: %v. Closing connection.", conn.RemoteAddr(), err)
-		conn.Close()
-		return
-	}
-
-	log.Printf("INFO: Identified request for hostname '%s' from %s (TLS: %v)", hostname, conn.RemoteAddr(), isTLS)
+	log.Printf("INFO: Identified request for hostname '%s' from %s on :%d (TLS: %v)", hostname, conn.RemoteAddr(), localPort, isTLS)
 
 	// First, try to find a local backend.
 	backend, err := l.hub.SelectBackend(hostname)
 	if err == nil {
-		client := NewClient(peekableConn, backend, l.config)
+		// Forward the prelude first, then stream the rest.
+		client := NewClientWithPrelude(conn, backend, l.config, prelude)
 		log.Printf("INFO: [LOCAL] Routing client %s [%s] for hostname '%s' to backend %s", conn.RemoteAddr(), client.id, hostname, backend.ID())
 		client.Start()
 		return
@@ -122,7 +152,9 @@ func (l *Listener) handleConnection(conn net.Conn) {
 	if l.peerManager != nil {
 		if remotePeer, ok := l.peerManager.GetPeerForHostname(hostname); ok {
 			log.Printf("INFO: [TUNNEL] No local backend for '%s'. Tunneling to peer %s", hostname, remotePeer.Addr())
-			remotePeer.StartTunnel(peekableConn, hostname)
+			// Ensure the tunneled peer sees the bytes we consumed during sniffing.
+			connWithPrelude := WithPrelude(conn, prelude)
+			remotePeer.StartTunnel(connWithPrelude, hostname)
 			return
 		}
 	}

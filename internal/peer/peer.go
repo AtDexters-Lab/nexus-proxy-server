@@ -49,17 +49,29 @@ func (p *peerImpl) Addr() string {
 
 // Connect attempts to establish an outbound mTLS WebSocket connection to the peer.
 func (p *peerImpl) Connect(ctx context.Context) {
-	// Create a custom websocket dialer with our client certificate for mTLS.
-	cert, err := tls.LoadX509KeyPair(p.config.HubTlsCertFile, p.config.HubTlsKeyFile)
-	if err != nil {
-		// This is a fatal configuration error. Log it and stop trying to connect.
-		log.Printf("FATAL: [PEER] Failed to load client certificate for mTLS dialing to %s: %v. This peer connection will not be established.", p.addr, err)
-		return
-	}
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		// We trust the system's root CAs to verify the server certificate,
-		// which is what we want for public CAs like Let's Encrypt.
+	// Prepare TLS config for client auth (mTLS).
+	tlsConfig := &tls.Config{}
+
+	// Prefer automatic TLS if configured (uses the same autocert-managed cert as the hub servers).
+	if p.config.HubPublicHostname != "" && p.manager != nil && p.manager.tlsBase != nil {
+		base := p.manager.tlsBase
+		if base.GetCertificate != nil {
+			// Dynamically fetch cert at handshake time so renewals are picked up.
+			tlsConfig.GetClientCertificate = func(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+				return base.GetCertificate(&tls.ClientHelloInfo{ServerName: p.config.HubPublicHostname})
+			}
+		} else if len(base.Certificates) > 0 {
+			// Fallback: reuse the first loaded certificate.
+			tlsConfig.Certificates = base.Certificates
+		}
+	} else {
+		// Manual TLS mode: load from configured files.
+		cert, err := tls.LoadX509KeyPair(p.config.HubTlsCertFile, p.config.HubTlsKeyFile)
+		if err != nil {
+			log.Printf("FATAL: [PEER] Failed to load client certificate for mTLS dialing to %s: %v. This peer connection will not be established.", p.addr, err)
+			return
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
 	}
 	dialer := websocket.Dialer{
 		Proxy:            http.ProxyFromEnvironment,

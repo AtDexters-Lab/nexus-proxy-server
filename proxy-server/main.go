@@ -15,6 +15,7 @@ import (
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/hub"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/peer"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/proxy"
+	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 )
 
@@ -36,9 +37,12 @@ func main() {
 
 	var acmeHandler http.Handler
 	var hubTlsConfig *tls.Config
+	// Keep a reference so peers can reuse the same cert for client auth.
+	var certManager *autocert.Manager
 
 	if cfg.HubPublicHostname != "" {
 		log.Println("INFO: Hub TLS mode: Automatic (Let's Encrypt using HTTP-01)")
+		log.Println("WARN: Using Let's Encrypt staging environment. Certificates are not trusted.")
 
 		cacheDir := cfg.AcmeCacheDir
 		if cacheDir == "" {
@@ -49,14 +53,31 @@ func main() {
 		}
 		log.Printf("INFO: ACME certificate cache directory: %s", cacheDir)
 
-		certManager := &autocert.Manager{
+		certManager = &autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
 			HostPolicy: autocert.HostWhitelist(cfg.HubPublicHostname),
 			Cache:      autocert.DirCache(cacheDir),
 		}
 
 		hubTlsConfig = certManager.TLSConfig()
-		acmeHandler = certManager.HTTPHandler(nil)
+		certHandler := certManager.HTTPHandler(nil)
+		// Wrap ACME HTTP handler to add debug logs when challenges arrive.
+		acmeHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			log.Printf("INFO: ACME HTTP-01 request: method=%s path=%s host=%s from=%s", r.Method, r.URL.Path, r.Host, r.RemoteAddr)
+			certHandler.ServeHTTP(w, r)
+		})
+
+		// Proactively trigger certificate acquisition so challenges start immediately,
+		// rather than waiting for the first TLS handshake on the hub listeners.
+		go func(host string) {
+			log.Printf("INFO: Autocert pre-warm for %s (staging)", host)
+			// Prewarm both normal and ALPN challenge paths.
+			if _, err := certManager.GetCertificate(&tls.ClientHelloInfo{ServerName: host, SupportedProtos: []string{acme.ALPNProto, "http/1.1"}}); err != nil {
+				log.Printf("WARN: Autocert pre-warm error: %v", err)
+			} else {
+				log.Printf("INFO: Autocert challenge initiated for %s", host)
+			}
+		}(cfg.HubPublicHostname)
 
 	} else {
 		log.Println("INFO: Hub TLS mode: Manual (from file)")
@@ -76,8 +97,8 @@ func main() {
 	var wg sync.WaitGroup
 
 	backendHub := hub.New(cfg, hubTlsConfig)
-	peerManager := peer.NewManager(cfg, backendHub)
-	clientListener := proxy.NewListener(cfg, backendHub, peerManager, acmeHandler)
+	peerManager := peer.NewManager(cfg, backendHub, hubTlsConfig)
+	clientListener := proxy.NewListener(cfg, backendHub, peerManager, acmeHandler, hubTlsConfig)
 
 	backendHub.SetPeerManager(peerManager)
 

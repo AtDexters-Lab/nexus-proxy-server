@@ -39,6 +39,7 @@ type Client struct {
 	conn    net.Conn
 	backend iface.Backend
 	config  *config.Config
+	initial []byte
 }
 
 // NewClient creates a new client handler.
@@ -51,6 +52,16 @@ func NewClient(conn net.Conn, backend iface.Backend, cfg *config.Config) *Client
 	}
 }
 
+// NewClientWithPrelude is like NewClient, but will send the provided initial
+// bytes to the backend immediately after establishing the client association
+// before streaming any further data read from conn. Useful when earlier sniff
+// logic consumed and recorded initial bytes (e.g., TLS ClientHello or HTTP headers).
+func NewClientWithPrelude(conn net.Conn, backend iface.Backend, cfg *config.Config, initial []byte) *Client {
+	c := NewClient(conn, backend, cfg)
+	c.initial = initial
+	return c
+}
+
 // Start begins the bi-directional proxying of data.
 func (c *Client) Start() {
 	c.backend.AddClient(c.conn, c.id)
@@ -59,6 +70,17 @@ func (c *Client) Start() {
 	bufPtr := GetBuffer()
 	defer PutBuffer(bufPtr)
 	buf := *bufPtr
+
+	// If we have captured initial bytes (from protocol sniffing), send them
+	// to the backend before reading anything further from the client.
+	if len(c.initial) > 0 {
+		if err := c.backend.SendData(c.id, c.initial); err != nil {
+			log.Printf("ERROR: Failed to send initial bytes to backend %s for client %s: %v\nTerminating client connection", c.backend.ID(), c.id, err)
+			return
+		}
+		// Allow GC to reclaim the slice.
+		c.initial = nil
+	}
 
 	for {
 		var readDeadline time.Time

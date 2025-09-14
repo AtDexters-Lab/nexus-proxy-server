@@ -2,6 +2,7 @@ package peer
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"log"
 	"sync"
@@ -28,14 +29,16 @@ type Manager struct {
 	localVersion  atomic.Uint64
 	ctx           context.Context
 	cancel        context.CancelFunc
+	tlsBase       *tls.Config
 }
 
 // NewManager creates a new peer manager.
-func NewManager(cfg *config.Config, hub iface.Hub) *Manager {
+func NewManager(cfg *config.Config, hub iface.Hub, tlsBase *tls.Config) *Manager {
 	return &Manager{
 		config:       cfg,
 		hub:          hub,
 		routingTable: routing.NewTable(),
+		tlsBase:      tlsBase,
 	}
 }
 
