@@ -160,6 +160,13 @@ Backends authenticate to the Hub using a JWT signed with the shared secret from 
 
 At runtime, the proxy sends a `connect` control message to your backend for each client with the resolved `hostname` field so a multi-tenant backend can route appropriately.
 
+### Wildcard Hostnames (Single-Label)
+
+Backends may register wildcard hostnames using a single leftmost label (TLS-style), e.g. `*.example.com`.
+
+- Matching: `a.example.com` matches; `a.b.example.com` does not. Exact hostnames always take precedence over wildcard.
+- Peers announce wildcard patterns as `*.example.com`; routing tables use the suffix `.example.com` internally.
+
 ## Reference Backend Client
 
 A complete, working reference implementation for a backend client that connects to Nexus Proxy can be found here:

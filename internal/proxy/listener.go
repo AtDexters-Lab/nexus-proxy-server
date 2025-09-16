@@ -1,17 +1,18 @@
 package proxy
 
 import (
-	"crypto/tls"
-	"log"
-	"net"
-	"net/http"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
+    "crypto/tls"
+    "log"
+    "net"
+    "net/http"
+    "strconv"
+    "strings"
+    "sync"
+    "time"
 
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
+    "github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
+    "github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
+    hn "github.com/AtDexters-Lab/nexus-proxy-server/internal/hostnames"
 )
 
 // Listener is responsible for accepting incoming connections from end-users.
@@ -96,7 +97,7 @@ func (l *Listener) handleConnection(conn net.Conn) {
 	// Try TLS SNI first using a robust aborted handshake.
 	sni, tlsPrelude, tlsErr := PeekSNIAndPrelude(conn, 5*time.Second, 32<<10)
     if tlsErr == nil && sni != "" {
-        hostname = NormalizeHostname(sni)
+        hostname = hn.Normalize(sni)
 		prelude = tlsPrelude
 		isTLS = true
 	} else {
@@ -111,7 +112,7 @@ func (l *Listener) handleConnection(conn net.Conn) {
 			prelude = httpPrelude
 			isTLS = false
 			// Check if it's for our ACME HTTP-01 challenge.
-            hubHostNorm := NormalizeHostname(l.config.HubPublicHostname)
+            hubHostNorm := hn.Normalize(l.config.HubPublicHostname)
 			if l.acmeHandler != nil && hostname == hubHostNorm && localPort == 80 && strings.HasPrefix(path, "/.well-known/acme-challenge/") {
 				log.Printf("INFO: Intercepting HTTP request for proxy's own hostname '%s' on :80 to handle ACME challenge", hostname)
 				simpleHttpServer := &http.Server{Handler: l.acmeHandler, ReadHeaderTimeout: 5 * time.Second}
