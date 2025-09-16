@@ -10,7 +10,7 @@ import (
 // - Drops a trailing dot
 // - Applies IDNA Lookup ToASCII mapping
 // - Lower-cases the result
-func normalizeHostname(host string) string {
+func NormalizeHostname(host string) string {
 	host = strings.TrimSpace(host)
 	if host == "" {
 		return ""

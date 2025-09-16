@@ -46,7 +46,7 @@ func PeekHTTPHostAndPrelude(conn net.Conn, timeout time.Duration, _ int) (host s
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
-	host = normalizeHostname(host)
+    host = NormalizeHostname(host)
 
 	if req.URL != nil {
 		path = req.URL.Path

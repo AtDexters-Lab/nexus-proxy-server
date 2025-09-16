@@ -35,36 +35,38 @@ func PutBuffer(buf *[]byte) {
 
 // Client represents a single connection from an end-user.
 type Client struct {
-	id      uuid.UUID
-	conn    net.Conn
-	backend iface.Backend
-	config  *config.Config
-	initial []byte
+    id      uuid.UUID
+    conn    net.Conn
+    backend iface.Backend
+    config  *config.Config
+    hostname string
+    initial []byte
 }
 
 // NewClient creates a new client handler.
-func NewClient(conn net.Conn, backend iface.Backend, cfg *config.Config) *Client {
-	return &Client{
-		id:      uuid.New(),
-		conn:    conn,
-		backend: backend,
-		config:  cfg,
-	}
+func NewClient(conn net.Conn, backend iface.Backend, cfg *config.Config, hostname string) *Client {
+    return &Client{
+        id:      uuid.New(),
+        conn:    conn,
+        backend: backend,
+        config:  cfg,
+        hostname: hostname,
+    }
 }
 
 // NewClientWithPrelude is like NewClient, but will send the provided initial
 // bytes to the backend immediately after establishing the client association
 // before streaming any further data read from conn. Useful when earlier sniff
 // logic consumed and recorded initial bytes (e.g., TLS ClientHello or HTTP headers).
-func NewClientWithPrelude(conn net.Conn, backend iface.Backend, cfg *config.Config, initial []byte) *Client {
-	c := NewClient(conn, backend, cfg)
-	c.initial = initial
-	return c
+func NewClientWithPrelude(conn net.Conn, backend iface.Backend, cfg *config.Config, hostname string, initial []byte) *Client {
+    c := NewClient(conn, backend, cfg, hostname)
+    c.initial = initial
+    return c
 }
 
 // Start begins the bi-directional proxying of data.
 func (c *Client) Start() {
-	c.backend.AddClient(c.conn, c.id)
+    c.backend.AddClient(c.conn, c.id, c.hostname)
 	defer c.backend.RemoveClient(c.id)
 
 	bufPtr := GetBuffer()

@@ -30,8 +30,10 @@ const (
 // ControlMessage defines the structure for out-of-band communication
 // between the proxy and the backend.
 type ControlMessage struct {
-	Event    EventType `json:"event"`
-	ClientID uuid.UUID `json:"client_id"`
-	ConnPort int       `json:"conn_port,omitempty"`
-	ClientIP string    `json:"client_ip,omitempty"`
+    Event    EventType `json:"event"`
+    ClientID uuid.UUID `json:"client_id"`
+    ConnPort int       `json:"conn_port,omitempty"`
+    ClientIP string    `json:"client_ip,omitempty"`
+    // Hostname is the virtual host this client connected for. Included on connect.
+    Hostname string    `json:"hostname,omitempty"`
 }
