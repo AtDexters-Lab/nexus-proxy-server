@@ -1,19 +1,22 @@
 package routing
 
 import (
-	"log"
-	"sync"
+    "log"
+    "sync"
 
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
+    hn "github.com/AtDexters-Lab/nexus-proxy-server/internal/hostnames"
+    "github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
 )
 
 // Table holds the dynamic routing information for the mesh.
 type Table struct {
-	// routes maps a hostname (string) to a PeerList.
-	routes sync.Map
-	// peerStates maps a peer's address (string) to the last known version
-	// and set of hostnames for that peer.
-	peerStates sync.Map // map[peer.Addr()]peerState
+    // routes maps a hostname (string) to a PeerList.
+    routes sync.Map
+    // wildcardRoutes maps a suffix like ".example.com" to a PeerList for single-label wildcard patterns.
+    wildcardRoutes sync.Map
+    // peerStates maps a peer's address (string) to the last known version
+    // and set of hostnames for that peer.
+    peerStates sync.Map // map[peer.Addr()]peerState
 }
 
 type peerState struct {
@@ -41,26 +44,39 @@ func (t *Table) UpdateRoutesForPeer(p iface.Peer, version uint64, hostnames []st
 		newHostnameSet[h] = struct{}{}
 	}
 
-	// Add new routes
-	for hostname := range newHostnameSet {
-		if _, ok := state.hostnames[hostname]; !ok {
-			// This is a new route for this peer
-			rawList, _ := t.routes.LoadOrStore(hostname, NewPeerList())
-			peerList := rawList.(*PeerList)
-			peerList.Add(p)
-		}
-	}
+    // Add new routes
+    for hostname := range newHostnameSet {
+        if _, ok := state.hostnames[hostname]; ok {
+            continue
+        }
+        if suffix, ok := hn.WildcardSuffix(hostname); ok {
+            rawList, _ := t.wildcardRoutes.LoadOrStore(suffix, NewPeerList())
+            peerList := rawList.(*PeerList)
+            peerList.Add(p)
+        } else {
+            rawList, _ := t.routes.LoadOrStore(hostname, NewPeerList())
+            peerList := rawList.(*PeerList)
+            peerList.Add(p)
+        }
+    }
 
 	// Remove old routes
-	for hostname := range state.hostnames {
-		if _, ok := newHostnameSet[hostname]; !ok {
-			// This route was removed
-			if rawList, ok := t.routes.Load(hostname); ok {
-				peerList := rawList.(*PeerList)
-				peerList.Remove(p)
-			}
-		}
-	}
+    for hostname := range state.hostnames {
+        if _, ok := newHostnameSet[hostname]; ok {
+            continue
+        }
+        if suffix, ok := hn.WildcardSuffix(hostname); ok {
+            if rawList, ok := t.wildcardRoutes.Load(suffix); ok {
+                peerList := rawList.(*PeerList)
+                peerList.Remove(p)
+            }
+        } else {
+            if rawList, ok := t.routes.Load(hostname); ok {
+                peerList := rawList.(*PeerList)
+                peerList.Remove(p)
+            }
+        }
+    }
 
 	t.peerStates.Store(p.Addr(), peerState{version: version, hostnames: newHostnameSet})
 	log.Printf("DEBUG: Routing table updated for peer %s to version %d.", p.Addr(), version)
@@ -81,12 +97,22 @@ func (t *Table) ClearRoutesForPeer(p iface.Peer) {
 
 // GetPeerForHostname finds a peer that services the given hostname.
 func (t *Table) GetPeerForHostname(hostname string) (iface.Peer, bool) {
-	if rawList, ok := t.routes.Load(hostname); ok {
-		peerList := rawList.(*PeerList)
-		if peer, err := peerList.Select(); err == nil {
-			return peer, true
-		}
-		log.Println("DEBUG: No available peer for hostname", hostname)
-	}
-	return nil, false
+    if rawList, ok := t.routes.Load(hostname); ok {
+        peerList := rawList.(*PeerList)
+        if peer, err := peerList.Select(); err == nil {
+            return peer, true
+        }
+        log.Println("DEBUG: No available peer for hostname", hostname)
+    }
+    // Try single-label wildcard based on first-dot suffix
+    if suffix, ok := hn.FirstDotSuffix(hostname); ok {
+        if rawList, ok := t.wildcardRoutes.Load(suffix); ok {
+            peerList := rawList.(*PeerList)
+            if peer, err := peerList.Select(); err == nil {
+                return peer, true
+            }
+            log.Println("DEBUG: No available peer for wildcard suffix", suffix)
+        }
+    }
+    return nil, false
 }

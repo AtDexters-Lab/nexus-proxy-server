@@ -1,13 +1,14 @@
 package proxy
 
 import (
-	"bufio"
-	"bytes"
-	"errors"
-	"io"
-	"net"
-	"net/http"
-	"time"
+    "bufio"
+    "bytes"
+    "errors"
+    "io"
+    "net"
+    "net/http"
+    "time"
+    hn "github.com/AtDexters-Lab/nexus-proxy-server/internal/hostnames"
 )
 
 var ErrNotHTTP = errors.New("not an http/1.x request")
@@ -46,7 +47,7 @@ func PeekHTTPHostAndPrelude(conn net.Conn, timeout time.Duration, _ int) (host s
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
-    host = NormalizeHostname(host)
+    host = hn.Normalize(host)
 
 	if req.URL != nil {
 		path = req.URL.Path

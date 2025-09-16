@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
-	proxyutil "github.com/AtDexters-Lab/nexus-proxy-server/internal/proxy"
+    "github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
+    hostn "github.com/AtDexters-Lab/nexus-proxy-server/internal/hostnames"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 )
@@ -25,13 +25,14 @@ const (
 
 // hubImpl manages the lifecycle of backend and peer connections.
 type hubImpl struct {
-	config        *config.Config
-	backendServer *http.Server // Listens for backend connections
-	peerServer    *http.Server // Listens for peer connections (mTLS)
-	upgrader      websocket.Upgrader
-	pools         sync.Map // key: hostname (string), value: *LoadBalancerPool
-	peerManager   iface.PeerManager
-	hubTlsConfig  *tls.Config
+    config        *config.Config
+    backendServer *http.Server // Listens for backend connections
+    peerServer    *http.Server // Listens for peer connections (mTLS)
+    upgrader      websocket.Upgrader
+    pools         sync.Map // key: exact hostname (string) -> *LoadBalancerPool
+    wildcardPools sync.Map // key: suffix like ".example.com" -> *LoadBalancerPool
+    peerManager   iface.PeerManager
+    hubTlsConfig  *tls.Config
 }
 
 // New creates and returns a new Hub instance.
@@ -163,13 +164,17 @@ func (h *hubImpl) Stop() {
 
 // SelectBackend finds the load balancer pool for the given hostname.
 func (h *hubImpl) SelectBackend(hostname string) (iface.Backend, error) {
-	rawPool, ok := h.pools.Load(hostname)
-	if !ok {
-		return nil, fmt.Errorf("no backend pool available for hostname: %s", hostname)
-	}
-
-	pool := rawPool.(*LoadBalancerPool)
-	return pool.Select()
+    // 1) Exact match first
+    if rawPool, ok := h.pools.Load(hostname); ok {
+        return rawPool.(*LoadBalancerPool).Select()
+    }
+    // 2) Single-label wildcard fallback based on first-dot suffix
+    if suffix, ok := hostn.FirstDotSuffix(hostname); ok {
+        if rawPool, ok := h.wildcardPools.Load(suffix); ok {
+            return rawPool.(*LoadBalancerPool).Select()
+        }
+    }
+    return nil, fmt.Errorf("no backend pool available for hostname: %s", hostname)
 }
 
 // handleBackendConnect handles a connection from a backend service (JWT Auth).
@@ -264,7 +269,7 @@ func (h *hubImpl) authenticateBackend(conn *websocket.Conn) (*Backend, error) {
     uniq := make(map[string]struct{}, len(hosts))
     normalized := make([]string, 0, len(hosts))
     for _, hname := range hosts {
-        n := proxyutil.NormalizeHostname(hname)
+        n := hostn.NormalizeOrWildcard(hname)
         if n == "" {
             continue
         }
@@ -281,25 +286,40 @@ func (h *hubImpl) authenticateBackend(conn *websocket.Conn) (*Backend, error) {
 }
 
 func (h *hubImpl) register(b *Backend) {
-	for _, hn := range b.hostnames {
-		rawPool, _ := h.pools.LoadOrStore(hn, NewLoadBalancerPool())
-		pool := rawPool.(*LoadBalancerPool)
-		pool.AddBackend(b)
-		log.Printf("INFO: Backend %s registered to pool for hostname '%s'", b.id, hn)
-	}
-	h.updateAndAnnounceRoutes()
+    for _, hn := range b.hostnames {
+        if suffix, ok := hostn.WildcardSuffix(hn); ok {
+            rawPool, _ := h.wildcardPools.LoadOrStore(suffix, NewLoadBalancerPool())
+            pool := rawPool.(*LoadBalancerPool)
+            pool.AddBackend(b)
+            log.Printf("INFO: Backend %s registered to wildcard pool for pattern '%s' (suffix '%s')", b.id, hn, suffix)
+        } else {
+            rawPool, _ := h.pools.LoadOrStore(hn, NewLoadBalancerPool())
+            pool := rawPool.(*LoadBalancerPool)
+            pool.AddBackend(b)
+            log.Printf("INFO: Backend %s registered to pool for hostname '%s'", b.id, hn)
+        }
+    }
+    h.updateAndAnnounceRoutes()
 }
 
 func (h *hubImpl) unregister(b *Backend) {
-	b.Close()
-	for _, hn := range b.hostnames {
-		if rawPool, ok := h.pools.Load(hn); ok {
-			pool := rawPool.(*LoadBalancerPool)
-			pool.RemoveBackend(b)
-			log.Printf("INFO: Backend %s unregistered from pool for hostname '%s'", b.id, hn)
-		}
-	}
-	h.updateAndAnnounceRoutes()
+    b.Close()
+    for _, hn := range b.hostnames {
+        if suffix, ok := hostn.WildcardSuffix(hn); ok {
+            if rawPool, ok := h.wildcardPools.Load(suffix); ok {
+                pool := rawPool.(*LoadBalancerPool)
+                pool.RemoveBackend(b)
+                log.Printf("INFO: Backend %s unregistered from wildcard pool for pattern '%s' (suffix '%s')", b.id, hn, suffix)
+            }
+        } else {
+            if rawPool, ok := h.pools.Load(hn); ok {
+                pool := rawPool.(*LoadBalancerPool)
+                pool.RemoveBackend(b)
+                log.Printf("INFO: Backend %s unregistered from pool for hostname '%s'", b.id, hn)
+            }
+        }
+    }
+    h.updateAndAnnounceRoutes()
 }
 
 func (h *hubImpl) updateAndAnnounceRoutes() {
@@ -310,14 +330,22 @@ func (h *hubImpl) updateAndAnnounceRoutes() {
 }
 
 func (h *hubImpl) GetLocalRoutes() []string {
-	hostnames := make([]string, 0)
-	h.pools.Range(func(key, value interface{}) bool {
-		hostname := key.(string)
-		pool := value.(*LoadBalancerPool)
-		if pool.HasBackends() {
-			hostnames = append(hostnames, hostname)
-		}
-		return true
-	})
-	return hostnames
+    hostnames := make([]string, 0)
+    h.pools.Range(func(key, value interface{}) bool {
+        hostname := key.(string)
+        pool := value.(*LoadBalancerPool)
+        if pool.HasBackends() {
+            hostnames = append(hostnames, hostname)
+        }
+        return true
+    })
+    h.wildcardPools.Range(func(key, value interface{}) bool {
+        suffix := key.(string)
+        pool := value.(*LoadBalancerPool)
+        if pool.HasBackends() {
+            hostnames = append(hostnames, "*"+suffix)
+        }
+        return true
+    })
+    return hostnames
 }
