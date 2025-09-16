@@ -42,7 +42,7 @@ A client connects to their nearest Nexus node. That node identifies the target s
 -   **The Peer Manager:** Manages outbound WebSocket connections to all other peer Nexus nodes in the fleet, and exchanges routing information with them.
 -   **The Load Balancer:** A simple, stateless module that performs Weighted Round Robin selection from a list of healthy, locally-connected backends.
 -   **Backend Multiplexing Protocol:** All communication with a backend happens over a single WebSocket.
-    -   **Control Messages (JSON):** `{"event": "connect", "client_id": "..."}` signals a new client.
+    -   **Control Messages (JSON):** `{"event": "connect", "client_id": "...", "hostname": "example.com"}` signals a new client and the target virtual host.
     -   **Data Messages (Binary):** `[1-byte Control][16-byte ClientID][Payload]` carries the actual proxied data.
 
 #### Routing Logic & Edge Cases
@@ -135,6 +135,30 @@ The hub server (for backend and peer connections) requires TLS. You can choose b
 - Logs: `journalctl -u nexus-proxy-server -f`
 
 ### Backend Clients
+
+Backends authenticate to the Hub using a JWT signed with the shared secret from `config.yaml`.
+
+- Preferred claim: `hostnames` (array of FQDNs this backend serves)
+
+```json
+{
+  "hostnames": ["app.example.com", "api.example.com"],
+  "weight": 5,
+  "exp": 1735689600
+}
+```
+
+- Legacy claim (still supported): `hostname` (single FQDN)
+
+```json
+{
+  "hostname": "app.example.com",
+  "weight": 5,
+  "exp": 1735689600
+}
+```
+
+At runtime, the proxy sends a `connect` control message to your backend for each client with the resolved `hostname` field so a multi-tenant backend can route appropriately.
 
 ## Reference Backend Client
 

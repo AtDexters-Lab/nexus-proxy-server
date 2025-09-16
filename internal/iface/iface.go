@@ -30,8 +30,10 @@ type Peer interface {
 
 // Backend represents a single connection from a backend service.
 type Backend interface {
-	ID() string
-	AddClient(clientConn net.Conn, clientID uuid.UUID) error
-	RemoveClient(clientID uuid.UUID)
-	SendData(clientID uuid.UUID, data []byte) error
+    ID() string
+    // AddClient associates a client connection and informs the backend about it.
+    // The hostname indicates which virtual host this client targets.
+    AddClient(clientConn net.Conn, clientID uuid.UUID, hostname string) error
+    RemoveClient(clientID uuid.UUID)
+    SendData(clientID uuid.UUID, data []byte) error
 }

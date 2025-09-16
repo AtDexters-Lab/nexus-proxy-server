@@ -23,31 +23,31 @@ const (
 
 // Backend represents a single, authenticated WebSocket connection from a backend service.
 type Backend struct {
-	id          string
-	conn        *websocket.Conn
-	config      *config.Config
-	hostname    string
-	weight      int
-	clients     sync.Map
-	dataForSelf chan []byte
-	quit        chan struct{}
-	closeOnce   sync.Once
-	isClosed    bool // Indicates if the backend is closed
+    id          string
+    conn        *websocket.Conn
+    config      *config.Config
+    hostnames   []string
+    weight      int
+    clients     sync.Map
+    dataForSelf chan []byte
+    quit        chan struct{}
+    closeOnce   sync.Once
+    isClosed    bool // Indicates if the backend is closed
 }
 
 // NewBackend creates a new Backend instance.
-func NewBackend(conn *websocket.Conn, hostname string, weight int, cfg *config.Config) *Backend {
-	return &Backend{
-		id:          uuid.New().String(),
-		conn:        conn,
-		config:      cfg,
-		hostname:    hostname,
-		weight:      weight,
-		dataForSelf: make(chan []byte, 256),
-		quit:        make(chan struct{}),
-		closeOnce:   sync.Once{},
-		isClosed:    false,
-	}
+func NewBackend(conn *websocket.Conn, hostnames []string, weight int, cfg *config.Config) *Backend {
+    return &Backend{
+        id:          uuid.New().String(),
+        conn:        conn,
+        config:      cfg,
+        hostnames:   hostnames,
+        weight:      weight,
+        dataForSelf: make(chan []byte, 256),
+        quit:        make(chan struct{}),
+        closeOnce:   sync.Once{},
+        isClosed:    false,
+    }
 }
 
 func (b *Backend) ID() string {
@@ -86,20 +86,21 @@ func (b *Backend) StartPumps() {
 	wg.Wait()
 }
 
-func (b *Backend) AddClient(clientConn net.Conn, clientID uuid.UUID) error {
-	var connPort int
-	if tcpAddr, ok := clientConn.LocalAddr().(*net.TCPAddr); ok {
-		connPort = tcpAddr.Port
-	} else {
-		// Handle cases where it might not be a TCP connection, though it always should be.
-		return fmt.Errorf("WARN: Could not determine destination port for client %s", clientID)
-	}
-	msg := protocol.ControlMessage{
-		Event:    protocol.EventConnect,
-		ClientID: clientID,
-		ConnPort: connPort,
-		ClientIP: clientConn.RemoteAddr().String(),
-	}
+func (b *Backend) AddClient(clientConn net.Conn, clientID uuid.UUID, hostname string) error {
+    var connPort int
+    if tcpAddr, ok := clientConn.LocalAddr().(*net.TCPAddr); ok {
+        connPort = tcpAddr.Port
+    } else {
+        // Handle cases where it might not be a TCP connection, though it always should be.
+        return fmt.Errorf("WARN: Could not determine destination port for client %s", clientID)
+    }
+    msg := protocol.ControlMessage{
+        Event:    protocol.EventConnect,
+        ClientID: clientID,
+        ConnPort: connPort,
+        ClientIP: clientConn.RemoteAddr().String(),
+        Hostname: hostname,
+    }
 
 	err := b.SendControlMessage(msg)
 	if err != nil {

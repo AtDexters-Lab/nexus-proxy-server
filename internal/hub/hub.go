@@ -13,6 +13,7 @@ import (
 
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
+	proxyutil "github.com/AtDexters-Lab/nexus-proxy-server/internal/proxy"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 )
@@ -187,7 +188,7 @@ func (h *hubImpl) handleBackendConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("INFO: Backend for hostname '%s' authenticated successfully from %s", backend.hostname, conn.RemoteAddr())
+log.Printf("INFO: Backend for hostnames %v authenticated successfully from %s", backend.hostnames, conn.RemoteAddr())
 
 	h.register(backend)
 	defer h.unregister(backend)
@@ -217,8 +218,9 @@ func (h *hubImpl) handlePeerConnect(w http.ResponseWriter, r *http.Request) {
 
 // BackendClaims defines the JWT claims for a backend.
 type BackendClaims struct {
-	Hostname string `json:"hostname"`
-	Weight   int    `json:"weight"`
+	Hostnames []string `json:"hostnames"`
+	Hostname  string   `json:"hostname"`
+	Weight    int      `json:"weight"`
 	jwt.RegisteredClaims
 }
 
@@ -248,29 +250,56 @@ func (h *hubImpl) authenticateBackend(conn *websocket.Conn) (*Backend, error) {
 	if !token.Valid {
 		return nil, fmt.Errorf("invalid JWT token")
 	}
-	if claims.Hostname == "" {
-		return nil, fmt.Errorf("JWT claim 'hostname' is missing or empty")
-	}
+    // Determine hostnames from preferred or legacy claim.
+    var hosts []string
+    if len(claims.Hostnames) > 0 {
+        hosts = claims.Hostnames
+    } else if claims.Hostname != "" {
+        hosts = []string{claims.Hostname}
+    }
+    if len(hosts) == 0 {
+        return nil, fmt.Errorf("JWT must include 'hostnames' or legacy 'hostname'")
+    }
+    // Normalize and deduplicate.
+    uniq := make(map[string]struct{}, len(hosts))
+    normalized := make([]string, 0, len(hosts))
+    for _, hname := range hosts {
+        n := proxyutil.NormalizeHostname(hname)
+        if n == "" {
+            continue
+        }
+        if _, ok := uniq[n]; !ok {
+            uniq[n] = struct{}{}
+            normalized = append(normalized, n)
+        }
+    }
+    if len(normalized) == 0 {
+        return nil, fmt.Errorf("no valid hostnames after normalization")
+    }
 
-	return NewBackend(conn, claims.Hostname, claims.Weight, h.config), nil
+    return NewBackend(conn, normalized, claims.Weight, h.config), nil
 }
 
 func (h *hubImpl) register(b *Backend) {
-	rawPool, _ := h.pools.LoadOrStore(b.hostname, NewLoadBalancerPool())
-	pool := rawPool.(*LoadBalancerPool)
-	pool.AddBackend(b)
-	log.Printf("INFO: Backend %s registered to pool for hostname '%s'", b.id, b.hostname)
+	for _, hn := range b.hostnames {
+		rawPool, _ := h.pools.LoadOrStore(hn, NewLoadBalancerPool())
+		pool := rawPool.(*LoadBalancerPool)
+		pool.AddBackend(b)
+		log.Printf("INFO: Backend %s registered to pool for hostname '%s'", b.id, hn)
+	}
 	h.updateAndAnnounceRoutes()
 }
 
 func (h *hubImpl) unregister(b *Backend) {
 	b.Close()
-	if rawPool, ok := h.pools.Load(b.hostname); ok {
-		pool := rawPool.(*LoadBalancerPool)
-		pool.RemoveBackend(b)
-		log.Printf("INFO: Backend %s unregistered from pool for hostname '%s'", b.id, b.hostname)
-		h.updateAndAnnounceRoutes()
+	for _, hn := range b.hostnames {
+		if rawPool, ok := h.pools.Load(hn); ok {
+			pool := rawPool.(*LoadBalancerPool)
+			pool.RemoveBackend(b)
+			log.Printf("INFO: Backend %s unregistered from pool for hostname '%s'", b.id, hn)
+		}
 	}
+	h.updateAndAnnounceRoutes()
 }
 
 func (h *hubImpl) updateAndAnnounceRoutes() {
