@@ -292,12 +292,11 @@ main() {
   else
     # Upgrade path: keep existing config and secret
     printf "==> Keeping existing configuration at %s\n" "$ETC_DIR/config.yaml"
+    if [[ -f "$ETC_DIR/config.yaml" ]]; then
+      chown nexus:nexus "$ETC_DIR/config.yaml"
+      chmod 0640 "$ETC_DIR/config.yaml"
+    fi
   fi
-
-  echo "==> Writing configuration to $ETC_DIR/config.yaml"
-  write_config "$ETC_DIR/config.yaml" "$host" "$secret" "$idle"
-  chown nexus:nexus "$ETC_DIR/config.yaml"
-  chmod 0640 "$ETC_DIR/config.yaml"
 
   echo "==> Installing systemd service"
   if [[ ! -f "$SYSTEMD_UNIT" ]]; then
