@@ -59,6 +59,30 @@ sums_url() {
   fi
 }
 
+read_config_value() {
+  local key="$1" default_value="${2:-}"
+  local file="$ETC_DIR/config.yaml"
+  if [[ -f "$file" ]]; then
+    local value
+    value=$(awk -v key="$key" '
+      $0 ~ "^[[:space:]]*" key ":" {
+        sub("^[[:space:]]*" key ":[[:space:]]*", "", $0)
+        sub(/[[:space:]]+#.*/, "", $0)
+        gsub(/^"/, "", $0)
+        gsub(/"$/, "", $0)
+        sub(/[[:space:]]+$/, "", $0)
+        print
+        exit
+      }
+    ' "$file")
+    if [[ -n "${value:-}" ]]; then
+      echo "$value"
+      return
+    fi
+  fi
+  echo "$default_value"
+}
+
 gen_secret() {
   if command -v openssl >/dev/null 2>&1; then
     openssl rand -hex 32
@@ -306,11 +330,34 @@ main() {
   systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
   systemctl restart "$SERVICE_NAME" || systemctl start "$SERVICE_NAME" || true
 
+  local hub_host_value="${host:-}" backend_addr_value backend_port backend_endpoint=""
+  if [[ -z "$hub_host_value" ]]; then
+    hub_host_value=$(read_config_value "hubPublicHostname")
+  fi
+  backend_addr_value=$(read_config_value "backendListenAddress" ":8443")
+  backend_addr_value=${backend_addr_value//[[:space:]]/}
+  if [[ -n "$backend_addr_value" ]]; then
+    backend_port=${backend_addr_value##*:}
+    if [[ "$backend_port" == "$backend_addr_value" || -z "$backend_port" ]]; then
+      backend_port="8443"
+    fi
+  else
+    backend_port="8443"
+  fi
+  if [[ -n "$hub_host_value" ]]; then
+    backend_endpoint="wss://${hub_host_value}:${backend_port}/connect"
+  fi
+
   printf "\nInstallation complete. Details:\n"
   printf "  Binary: %s\n" "$INSTALL_DIR/$BIN_NAME"
   printf "  Config: %s\n" "$ETC_DIR/config.yaml"
   printf "  Data:   %s (ACME cache: %s)\n" "$DATA_DIR" "$ACME_DIR"
   printf "  Service: systemctl status %s\n" "$SERVICE_NAME"
+  if [[ -n "$backend_endpoint" ]]; then
+    printf "  Backend WSS endpoint: %s\n" "$backend_endpoint"
+  else
+    printf "  Backend WSS endpoint: set hubPublicHostname in %s\n" "$ETC_DIR/config.yaml"
+  fi
 
   if [[ "$reconfig_mode" == "reconfigure" || "$reconfig_mode" == "new" ]]; then
     printf "\nBackend JWT secret (share with your backend clients):\n  %s\n\n" "$secret"
