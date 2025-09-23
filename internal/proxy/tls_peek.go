@@ -44,6 +44,16 @@ func (r *readRecorder) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// Write discards any bytes the TLS stack attempts to emit while we are in
+// peek mode. When GetConfigForClient returns an error, crypto/tls will try to
+// send an alert to the client. We do not want that alert to leak onto the wire
+// because the real backend handshake will continue once we finish sniffing.
+// Pretending the write succeeded keeps the handshake state machine happy
+// without letting any bytes escape.
+func (r *readRecorder) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
 // PeekSNIAndPrelude reads only as much as needed to obtain the SNI from the
 // incoming TLS ClientHello using crypto/tls, capturing the bytes that were read
 // so they can be replayed to the chosen backend. It returns the server name
