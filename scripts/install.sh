@@ -216,15 +216,26 @@ main() {
   chown -R nexus:nexus "$ETC_DIR" "$DATA_DIR"
 
   echo "==> Downloading ${BIN_NAME} for linux_${arch}"
-  local url sumsurl asset sumsfile
+  local url sumsurl asset sumsfile final_url installed_version
   url=$(asset_url "$arch")
   sumsurl=$(sums_url)
   asset=$(asset_filename "$arch")
   sumsfile="SHA256SUMS"
   tmpdir=$(mktemp -d)
   trap 'rm -rf "$tmpdir"' EXIT
+  installed_version="${NEXUS_VERSION:-}"
   echo "    -> $url"
-  curl -fL "$url" -o "$tmpdir/${asset}"
+  if [[ -z "$installed_version" ]]; then
+    final_url=$(curl -fsSL -w '%{url_effective}' -o "$tmpdir/${asset}" "$url")
+    final_url=${final_url//$'\r'/}
+    installed_version=$(basename "$(dirname "${final_url}")")
+  else
+    curl -fsSL "$url" -o "$tmpdir/${asset}"
+    final_url="$url"
+  fi
+  if [[ -n "$final_url" && "$final_url" != "$url" ]]; then
+    echo "    -> resolved to $final_url"
+  fi
   echo "    -> $sumsurl"
   curl -fL "$sumsurl" -o "$tmpdir/${sumsfile}" || true
 
@@ -350,6 +361,7 @@ main() {
 
   printf "\nInstallation complete. Details:\n"
   printf "  Binary: %s\n" "$INSTALL_DIR/$BIN_NAME"
+  printf "  Version: %s\n" "${installed_version:-unknown}"
   printf "  Config: %s\n" "$ETC_DIR/config.yaml"
   printf "  Data:   %s (ACME cache: %s)\n" "$DATA_DIR" "$ACME_DIR"
   printf "  Service: systemctl status %s\n" "$SERVICE_NAME"
