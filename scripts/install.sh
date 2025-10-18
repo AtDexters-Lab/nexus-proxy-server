@@ -216,7 +216,7 @@ main() {
   chown -R nexus:nexus "$ETC_DIR" "$DATA_DIR"
 
   echo "==> Downloading ${BIN_NAME} for linux_${arch}"
-  local url sumsurl asset sumsfile final_url installed_version
+  local url sumsurl asset sumsfile final_url resolved_redirect installed_version
   url=$(asset_url "$arch")
   sumsurl=$(sums_url)
   asset=$(asset_filename "$arch")
@@ -226,12 +226,20 @@ main() {
   installed_version="${NEXUS_VERSION:-}"
   echo "    -> $url"
   if [[ -z "$installed_version" ]]; then
-    final_url=$(curl -fsSL -w '%{url_effective}' -o "$tmpdir/${asset}" "$url")
-    final_url=${final_url//$'\r'/}
-    installed_version=$(basename "$(dirname "${final_url}")")
-  else
-    curl -fsSL "$url" -o "$tmpdir/${asset}"
-    final_url="$url"
+    resolved_redirect=$(curl -fsIL "$url" | awk 'tolower($1) == "location:" {print $2; exit}' | tr -d '\r') || true
+    if [[ -n "$resolved_redirect" ]]; then
+      installed_version=$(basename "$(dirname "$resolved_redirect")")
+      echo "    -> release tag $installed_version"
+    fi
+  fi
+  final_url=$(curl -fsSL -w '%{url_effective}' -o "$tmpdir/${asset}" "$url")
+  final_url=${final_url//$'\r'/}
+  if [[ -z "$installed_version" ]]; then
+    if [[ -n "$resolved_redirect" ]]; then
+      installed_version=$(basename "$(dirname "$resolved_redirect")")
+    else
+      installed_version=$(basename "$(dirname "${final_url}")")
+    fi
   fi
   if [[ -n "$final_url" && "$final_url" != "$url" ]]; then
     echo "    -> resolved to $final_url"
