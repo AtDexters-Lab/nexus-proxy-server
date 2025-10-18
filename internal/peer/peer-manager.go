@@ -126,8 +126,8 @@ func (m *Manager) GetPeerForHostname(hostname string) (iface.Peer, bool) {
 
 // HandleTunnelRequest is called by a peer's read pump when it receives a request to
 // establish a tunnel for a client. It selects a local backend and starts the proxying.
-func (m *Manager) HandleTunnelRequest(p iface.Peer, hostname string, clientID uuid.UUID, clientIP string, connPort int) {
-	log.Printf("INFO: [TUNNEL-IN] Received tunnel request for client %s to hostname '%s' from peer %s", clientID, hostname, p.Addr())
+func (m *Manager) HandleTunnelRequest(p iface.Peer, hostname string, clientID uuid.UUID, clientIP string, connPort int, isTLS bool) {
+	log.Printf("INFO: [TUNNEL-IN] Received tunnel request for client %s to hostname '%s' from peer %s (TLS: %v)", clientID, hostname, p.Addr(), isTLS)
 	backend, err := m.hub.SelectBackend(hostname)
 	if err != nil {
 		log.Printf("WARN: [TUNNEL-IN] No local backend for tunneled client %s. Ignoring.", clientID)
@@ -142,7 +142,7 @@ func (m *Manager) HandleTunnelRequest(p iface.Peer, hostname string, clientID uu
 	// This looks like a regular client connection to the backend.
 	// We pass a nil config because idle timeouts for tunneled connections are
 	// managed by the originating proxy.
-    client := proxy.NewClient(tunneledConn, backend, nil, hostname)
+	client := proxy.NewClient(tunneledConn, backend, nil, hostname, isTLS)
 	go client.Start() // Run in a goroutine because this is initiated by the peer's read pump.
 }
 

@@ -160,8 +160,8 @@ func (p *peerImpl) readPump() {
 			case protocol.PeerAnnounce:
 				p.manager.UpdatePeerRoutes(p, msg.Version, msg.Hostnames)
 			case protocol.PeerTunnelRequest:
-				log.Println("INFO: [PEER] Received tunnel request from", p.addr, "for client", msg.ClientID, "on hostname", msg.Hostname, "with IP", msg.ClientIP, "and port", msg.ConnPort)
-				p.manager.HandleTunnelRequest(p, msg.Hostname, msg.ClientID, msg.ClientIP, msg.ConnPort)
+				log.Println("INFO: [PEER] Received tunnel request from", p.addr, "for client", msg.ClientID, "on hostname", msg.Hostname, "with IP", msg.ClientIP, "and port", msg.ConnPort, "(TLS:", msg.IsTLS, ")")
+				p.manager.HandleTunnelRequest(p, msg.Hostname, msg.ClientID, msg.ClientIP, msg.ConnPort, msg.IsTLS)
 			default:
 				log.Printf("WARN: [PEER] Received unknown text message type from %s", p.addr)
 			}
@@ -259,7 +259,7 @@ func (p *peerImpl) writePump(ctx context.Context) {
 }
 
 // StartTunnel initiates the tunneling of a client connection to target peer.
-func (p *peerImpl) StartTunnel(conn net.Conn, hostname string) {
+func (p *peerImpl) StartTunnel(conn net.Conn, hostname string, isTLS bool) {
 	defer conn.Close()
 
 	clientID := uuid.New()
@@ -281,6 +281,7 @@ func (p *peerImpl) StartTunnel(conn net.Conn, hostname string) {
 		ClientID: clientID,
 		ConnPort: connPort,
 		ClientIP: clientIp,
+		IsTLS:    isTLS,
 	}
 	payload, _ := json.Marshal(req)
 	p.Send(payload)

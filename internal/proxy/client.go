@@ -35,38 +35,44 @@ func PutBuffer(buf *[]byte) {
 
 // Client represents a single connection from an end-user.
 type Client struct {
-    id      uuid.UUID
-    conn    net.Conn
-    backend iface.Backend
-    config  *config.Config
-    hostname string
-    initial []byte
+	id       uuid.UUID
+	conn     net.Conn
+	backend  iface.Backend
+	config   *config.Config
+	hostname string
+	initial  []byte
+	isTLS    bool
 }
 
 // NewClient creates a new client handler.
-func NewClient(conn net.Conn, backend iface.Backend, cfg *config.Config, hostname string) *Client {
-    return &Client{
-        id:      uuid.New(),
-        conn:    conn,
-        backend: backend,
-        config:  cfg,
-        hostname: hostname,
-    }
+func NewClient(conn net.Conn, backend iface.Backend, cfg *config.Config, hostname string, isTLS bool) *Client {
+	return &Client{
+		id:       uuid.New(),
+		conn:     conn,
+		backend:  backend,
+		config:   cfg,
+		hostname: hostname,
+		isTLS:    isTLS,
+	}
 }
 
 // NewClientWithPrelude is like NewClient, but will send the provided initial
 // bytes to the backend immediately after establishing the client association
 // before streaming any further data read from conn. Useful when earlier sniff
 // logic consumed and recorded initial bytes (e.g., TLS ClientHello or HTTP headers).
-func NewClientWithPrelude(conn net.Conn, backend iface.Backend, cfg *config.Config, hostname string, initial []byte) *Client {
-    c := NewClient(conn, backend, cfg, hostname)
-    c.initial = initial
-    return c
+func NewClientWithPrelude(conn net.Conn, backend iface.Backend, cfg *config.Config, hostname string, initial []byte, isTLS bool) *Client {
+	c := NewClient(conn, backend, cfg, hostname, isTLS)
+	c.initial = initial
+	return c
 }
 
 // Start begins the bi-directional proxying of data.
 func (c *Client) Start() {
-    c.backend.AddClient(c.conn, c.id, c.hostname)
+	if err := c.backend.AddClient(c.conn, c.id, c.hostname, c.isTLS); err != nil {
+		log.Printf("ERROR: Failed to register client %s with backend %s: %v", c.id, c.backend.ID(), err)
+		c.conn.Close()
+		return
+	}
 	defer c.backend.RemoveClient(c.id)
 
 	bufPtr := GetBuffer()
