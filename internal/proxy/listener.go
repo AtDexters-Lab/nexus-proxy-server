@@ -1,18 +1,18 @@
 package proxy
 
 import (
-    "crypto/tls"
-    "log"
-    "net"
-    "net/http"
-    "strconv"
-    "strings"
-    "sync"
-    "time"
+	"crypto/tls"
+	"log"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 
-    "github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
-    "github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
-    hn "github.com/AtDexters-Lab/nexus-proxy-server/internal/hostnames"
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
+	hn "github.com/AtDexters-Lab/nexus-proxy-server/internal/hostnames"
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
 )
 
 // Listener is responsible for accepting incoming connections from end-users.
@@ -96,8 +96,8 @@ func (l *Listener) handleConnection(conn net.Conn) {
 
 	// Try TLS SNI first using a robust aborted handshake.
 	sni, tlsPrelude, tlsErr := PeekSNIAndPrelude(conn, 5*time.Second, 32<<10)
-    if tlsErr == nil && sni != "" {
-        hostname = hn.Normalize(sni)
+	if tlsErr == nil && sni != "" {
+		hostname = hn.Normalize(sni)
 		prelude = tlsPrelude
 		isTLS = true
 	} else {
@@ -112,7 +112,7 @@ func (l *Listener) handleConnection(conn net.Conn) {
 			prelude = httpPrelude
 			isTLS = false
 			// Check if it's for our ACME HTTP-01 challenge.
-            hubHostNorm := hn.Normalize(l.config.HubPublicHostname)
+			hubHostNorm := hn.Normalize(l.config.HubPublicHostname)
 			if l.acmeHandler != nil && hostname == hubHostNorm && localPort == 80 && strings.HasPrefix(path, "/.well-known/acme-challenge/") {
 				log.Printf("INFO: Intercepting HTTP request for proxy's own hostname '%s' on :80 to handle ACME challenge", hostname)
 				simpleHttpServer := &http.Server{Handler: l.acmeHandler, ReadHeaderTimeout: 5 * time.Second}
@@ -143,7 +143,7 @@ func (l *Listener) handleConnection(conn net.Conn) {
 	backend, err := l.hub.SelectBackend(hostname)
 	if err == nil {
 		// Forward the prelude first, then stream the rest.
-    client := NewClientWithPrelude(conn, backend, l.config, hostname, prelude)
+		client := NewClientWithPrelude(conn, backend, l.config, hostname, prelude, isTLS)
 		log.Printf("INFO: [LOCAL] Routing client %s [%s] for hostname '%s' to backend %s", conn.RemoteAddr(), client.id, hostname, backend.ID())
 		client.Start()
 		return
@@ -155,7 +155,7 @@ func (l *Listener) handleConnection(conn net.Conn) {
 			log.Printf("INFO: [TUNNEL] No local backend for '%s'. Tunneling to peer %s", hostname, remotePeer.Addr())
 			// Ensure the tunneled peer sees the bytes we consumed during sniffing.
 			connWithPrelude := WithPrelude(conn, prelude)
-			remotePeer.StartTunnel(connWithPrelude, hostname)
+			remotePeer.StartTunnel(connWithPrelude, hostname, isTLS)
 			return
 		}
 	}
