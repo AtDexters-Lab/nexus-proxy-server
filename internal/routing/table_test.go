@@ -45,3 +45,18 @@ func TestWildcardVsExactPrecedence(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "peer-exact", peer.Addr(), "exact should take precedence over wildcard")
 }
+
+func TestClearRoutesForPeerRemovesWildcardEntries(t *testing.T) {
+	tbl := NewTable()
+	p := &dummyPeer{addr: "peer-1"}
+
+	tbl.UpdateRoutesForPeer(p, 1, []string{"*.example.com", "api.example.com"})
+	tbl.ClearRoutesForPeer(p)
+
+	if peer, ok := tbl.GetPeerForHostname("api.example.com"); ok {
+		t.Fatalf("expected no peer after clear, got %s", peer.Addr())
+	}
+	if peer, ok := tbl.GetPeerForHostname("app.example.com"); ok {
+		t.Fatalf("expected no wildcard peer after clear, got %s", peer.Addr())
+	}
+}

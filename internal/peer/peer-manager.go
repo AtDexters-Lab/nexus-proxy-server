@@ -143,7 +143,12 @@ func (m *Manager) HandleTunnelRequest(p iface.Peer, hostname string, clientID uu
 	// We pass a nil config because idle timeouts for tunneled connections are
 	// managed by the originating proxy.
 	client := proxy.NewClient(tunneledConn, backend, nil, hostname, isTLS)
-	go client.Start() // Run in a goroutine because this is initiated by the peer's read pump.
+	go func() {
+		// Ensure the tunnel entry is always cleared, even if the backend rejects
+		// the client immediately or the connection closes normally.
+		defer m.tunnels.Delete(clientID)
+		client.Start()
+	}()
 }
 
 // HandleTunnelData forwards data received from a peer to the correct tunneled connection.
