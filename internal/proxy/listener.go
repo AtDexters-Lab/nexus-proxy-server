@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"crypto/tls"
+	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -130,6 +131,9 @@ func (l *Listener) handleConnection(conn net.Conn) {
 					previewLen = 24
 				}
 				log.Printf("DEBUG: HTTP sniff read %d bytes on :%d (hex preview %x)", len(httpPrelude), localPort, httpPrelude[:previewLen])
+			}
+			if errors.Is(httpErr, ErrHTTPPreludeTooLarge) {
+				log.Printf("WARN: HTTP prelude exceeded limit for %s on :%d; dropping connection", conn.RemoteAddr(), localPort)
 			}
 			log.Printf("WARN: Could not determine hostname for %s on :%d: tlsErr=%v httpErr=%v. Closing connection.", conn.RemoteAddr(), localPort, tlsErr, httpErr)
 			conn.Close()

@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
@@ -32,7 +33,7 @@ type Backend struct {
 	dataForSelf chan []byte
 	quit        chan struct{}
 	closeOnce   sync.Once
-	isClosed    bool // Indicates if the backend is closed
+	closed      atomic.Bool
 }
 
 // NewBackend creates a new Backend instance.
@@ -46,7 +47,6 @@ func NewBackend(conn *websocket.Conn, hostnames []string, weight int, cfg *confi
 		dataForSelf: make(chan []byte, 256),
 		quit:        make(chan struct{}),
 		closeOnce:   sync.Once{},
-		isClosed:    false,
 	}
 }
 
@@ -56,17 +56,17 @@ func (b *Backend) ID() string {
 
 func (b *Backend) Close() {
 	b.closeOnce.Do(func() {
-		b.quit <- struct{}{} // Signal the pumps to stop.
-		b.conn.Close()
+		b.closed.Store(true)
+		close(b.quit)
+		if b.conn != nil {
+			b.conn.Close()
+		}
 		b.clients.Range(func(key, value interface{}) bool {
 			if clientConn, ok := value.(net.Conn); ok {
 				clientConn.Close()
 			}
 			return true
 		})
-		close(b.dataForSelf)
-		b.isClosed = true
-		close(b.quit)
 	})
 }
 
@@ -125,13 +125,7 @@ func (b *Backend) RemoveClient(clientID uuid.UUID) {
 }
 
 func (b *Backend) SendData(clientID uuid.UUID, data []byte) error {
-	// First, check if the backend is shutting down to fail fast.
-	select {
-	case <-b.quit:
-		return fmt.Errorf("backend %s is closing", b.id)
-	default:
-	}
-	if b.isClosed {
+	if b.closed.Load() {
 		return fmt.Errorf("backend %s is already closed", b.id)
 	}
 
@@ -142,21 +136,22 @@ func (b *Backend) SendData(clientID uuid.UUID, data []byte) error {
 	message := append(header, data...)
 	// Use a non-blocking send to avoid a slow backend blocking the clients and thereby increasing memory consumption of proxy.
 	select {
+	case <-b.quit:
+		return fmt.Errorf("backend %s is closing", b.id)
 	case b.dataForSelf <- message:
-		return nil
 	default:
 		return fmt.Errorf("backend %s send channel full, dropping data for client %s", b.id, clientID)
 	}
-}
-
-func (b *Backend) SendControlMessage(msg protocol.ControlMessage) error {
-	// First, check if the backend is shutting down to fail fast.
 	select {
 	case <-b.quit:
 		return fmt.Errorf("backend %s is closing", b.id)
 	default:
 	}
-	if b.isClosed {
+	return nil
+}
+
+func (b *Backend) SendControlMessage(msg protocol.ControlMessage) error {
+	if b.closed.Load() {
 		return fmt.Errorf("backend %s is already closed", b.id)
 	}
 
@@ -171,11 +166,18 @@ func (b *Backend) SendControlMessage(msg protocol.ControlMessage) error {
 
 	message := append(header, payload...)
 	select {
+	case <-b.quit:
+		return fmt.Errorf("backend %s is closing", b.id)
 	case b.dataForSelf <- message:
-		return nil
 	default:
 		return fmt.Errorf("backend %s send channel full, dropping data for client %s", b.id, msg.ClientID)
 	}
+	select {
+	case <-b.quit:
+		return fmt.Errorf("backend %s is closing", b.id)
+	default:
+	}
+	return nil
 }
 
 func (b *Backend) readPump() {

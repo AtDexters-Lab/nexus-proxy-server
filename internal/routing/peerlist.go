@@ -49,6 +49,13 @@ func (pl *PeerList) Remove(p iface.Peer) {
 	}
 }
 
+// IsEmpty reports whether the peer list has any entries.
+func (pl *PeerList) IsEmpty() bool {
+	pl.mu.RLock()
+	defer pl.mu.RUnlock()
+	return len(pl.peers) == 0
+}
+
 // Select chooses a peer from the list using simple round-robin.
 func (pl *PeerList) Select() (iface.Peer, error) {
 	pl.mu.RLock()
