@@ -1,6 +1,6 @@
 # Nexus TPM Attestation – Implementation Plan
 
-This plan describes the code changes required to bring the Nexus proxy in line with the attestation architecture documented in `docs/tpm-attestation-architecture.md`. Backward compatibility with the legacy shared-secret JWT path is not required; new code can assume every backend participates in the dual-stage flow.
+This plan describes the code changes required to bring the Nexus proxy in line with the attestation architecture documented in `docs/tpm-attestation-architecture.md`. Every backend must participate in the dual-stage flow, but Nexus should continue supporting both local HMAC validation via `backendsJWTSecret` and optional remote verifier integration.
 
 ## Goals
 
@@ -8,16 +8,16 @@ This plan describes the code changes required to bring the Nexus proxy in line w
   1. Handshake token (Stage 0) → Nexus issues a `session_nonce`.
   2. Attested token (Stage 1) → Nexus validates nonce match and unlocks traffic.
 - Support periodic re-attestation driven entirely by token claims (`reauth_interval_seconds`, `reauth_grace_seconds`, etc.).
-- Integrate remote signature validation (HTTP-based verifier) for all tokens.
+- Integrate signature validation helpers that can call the remote verifier when configured or fall back to local HMAC.
 - Surface maintenance-awareness (`authorizer_status_uri`, `maintenance_grace_cap_seconds`) and stagger re-auth retries.
 - Emit structured logs/metrics for handshake success, failures, and maintenance deferrals.
 
 ## High-Level Workstreams
 
 1. **Configuration & bootstrap**  
-   - Add new config entries for the remote verifier URL, request timeouts, and maintenance grace defaults.  
-   - Remove the `backendsJWTSecret` requirement once the remote verifier is mandatory.  
-   - Update `config.example.yaml` and validation logic accordingly.
+   - Add optional config entries for the remote verifier URL, request timeouts, and maintenance grace defaults.  
+   - Keep `backendsJWTSecret` required so deployments can verify tokens locally when no remote verifier is configured.  
+   - Update `config.example.yaml` and validation logic to permit either (or both) verification mechanisms.
 
 2. **Protocol & messaging updates**  
    - Define control frames for `reauth_request` and the Stage 0 → Stage 1 transition. Candidates:
@@ -32,20 +32,21 @@ This plan describes the code changes required to bring the Nexus proxy in line w
      - Await a Stage 1 attested token message; validate via remote verifier and ensure `session_nonce` matches.
    - Only instantiate `Backend` (and register it) after Stage 1 succeeds.
    - Add timeout handling for both stages so stalled connections are closed.
-   - Store per-backend metadata: `reauth_interval`, `reauth_grace`, `maintenance_cap`, `authorizer_status_uri`, `policy_version`, `hostnames`.
+   - Store per-backend attestation state: `reauth_interval`, `reauth_grace`, `maintenance_cap`, `authorizer_status_uri`, `policy_version`, `hostnames`, and any pending `session_nonce` during re-auth.
 
-4. **Remote verifier client**  
-   - Introduce a reusable package (e.g., `internal/auth/validator`) that POSTs tokens to the configured verifier endpoint and returns parsed claims.  
-   - Handle retries/timeouts and map errors to actionable log messages.  
-   - Cache JWKS or rely purely on the remote response, depending on the verifier API.
+4. **Token verification helpers**  
+   - Introduce a reusable package (e.g., `internal/auth/validator`) that can POST tokens to the configured verifier endpoint or validate them locally with `backendsJWTSecret`.  
+   - Handle retries/timeouts for remote verification and map failures to actionable log messages.  
+   - Cache JWKS or reuse remote responses when applicable; otherwise fall back to local HMAC.
 
 5. **Backend lifecycle enhancements (`internal/hub/backend.go`)**  
-   - Add fields/timers to track `nextReauth` and outstanding challenges.  
+   - Add fields/timers to track `nextReauth`, maintenance budgets, and outstanding challenges.  
    - Implement a control loop that, when `nextReauth` elapses:
      - Sends a re-auth request message to the backend with a fresh `session_nonce`.
      - Waits up to `reauth_grace` for a Stage 1 token on the control channel.
      - Drops the backend on timeout or failed validation.
    - Integrate maintenance deferral: when `authorizer_status_uri` is provided, poll it (respecting `maintenance_grace_cap_seconds` and jittered scheduling).
+   - Continue forwarding client traffic during the re-auth grace window; no buffering is required.
 
 6. **Logging & metrics**  
    - Add structured log entries for:
@@ -70,11 +71,11 @@ This plan describes the code changes required to bring the Nexus proxy in line w
 
 | Area | Task |
 |------|------|
-| Config | Extend `internal/config.Config` with `RemoteVerifierURL`, `VerifierTimeout`, `MaintenanceGraceDefault`, etc. Fail validation if URL is empty. |
-| Claims parsing | Define a claims struct (new package) matching the doc (`session_nonce`, `reauth_interval_seconds`, etc.). Include helpers for optional defaults. |
+| Config | Extend `internal/config.Config` with `RemoteVerifierURL`, `VerifierTimeout`, `MaintenanceGraceDefault`, etc. Validation should allow the verifier URL to be empty as long as `backendsJWTSecret` remains set. |
+| Claims parsing | Define a claims struct (new package) matching the doc (`session_nonce`, `reauth_interval_seconds`, etc.). Include helpers for optional defaults and indicate whether validation came from remote or local HMAC. |
 | WebSocket handshake | Implement a mini state machine in `handleBackendConnect` that consumes text frames in order: Stage 0 token → challenge response. |
 | Challenge generation | Add helper to create cryptographically random nonces (32 bytes base64) and prevent reuse within an active session. |
-| Backend struct | Extend `Backend` to keep attestation metadata and timers. Possibly create a new struct (`AttestedBackend`) to wrap these fields. |
+| Backend struct | Extend `Backend` to keep per-session attestation state (current nonce, timers, maintenance counters). Possibly create a helper struct if the data grows. |
 | Re-auth scheduling | Use `time.Timer` or `time.AfterFunc` per backend; ensure timers stop when backend is unregistered. |
 | Maintenance poller | Implement asynchronous polling (with jitter and backoff) of `authorizer_status_uri`, respecting `maintenance_grace_cap_seconds`. |
 | Grace enforcement | On re-auth failure, ensure all client connections are terminated and the backend is unregistered to avoid dangling routes. |
@@ -83,10 +84,10 @@ This plan describes the code changes required to bring the Nexus proxy in line w
 ## Open Questions / Decisions
 
 - **Token transport format**: Stage 0/Stage 1 messages can be plain text JWTs on the WebSocket, but consider wrapping them in JSON (`{ "type": "token", "stage": 0, "jwt": "..." }`) for extensibility.
-- **Remote verifier API contract**: Clarify whether the verifier returns decoded claims, a verified token with embedded claims, or simply a success/failure; adjust client accordingly.
-- **Authorizer health endpoint semantics**: Need a concrete schema (e.g., `{"status":"healthy"}`) and authentication method (mTLS, bearer token, or pinned cert).
-- **State cleanup**: Decide how long to keep attestation metadata after backend disconnects; likely drop immediately.
-- **Backpressure during re-auth**: Currently we plan to let traffic continue; verify no extra buffering is required.
+- **Remote verifier API contract**: Clarify whether the verifier returns decoded claims, a verified token with embedded claims, or simply a success/failure; adjust client accordingly. When no remote verifier is configured, fall back to local HMAC validation using `backendsJWTSecret`.
+- **Authorizer health endpoint semantics**: Treat HTTPS 200 responses as healthy; any non-200 or connection/TLS error triggers maintenance deferral. Additional auth is optional unless operators require it.
+- **State cleanup**: Keep only transient per-backend attestation state (current nonce, timers, maintenance counters) and drop it immediately after disconnect.
+- **Backpressure during re-auth**: Traffic continues during re-auth; confirm timers/grace logic assume no buffering.
 
 ## Suggested Iteration Order
 
@@ -97,5 +98,4 @@ This plan describes the code changes required to bring the Nexus proxy in line w
 5. Logging/metrics polish.  
 6. Tests and docs updates.
 
-Following this plan should transition Nexus to the new attestation model while keeping responsibilities aligned with the architecture document.
-
+Following this plan should transition Nexus to the new attestation model while keeping responsibilities aligned with the architecture document and supporting either remote or local signature validation.
