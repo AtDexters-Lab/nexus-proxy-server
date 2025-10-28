@@ -4,6 +4,7 @@ import (
 	"log"
 	"testing"
 
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/hub"
 )
 
@@ -11,9 +12,11 @@ func TestLoadBalancer(t *testing.T) {
 	lb := hub.NewLoadBalancerPool()
 
 	// Helper to create a Backend
-    newBackend := func(id string, weight int) *hub.Backend {
-        return hub.NewBackend(nil, []string{id}, weight, nil)
-    }
+	cfg := &config.Config{BackendsJWTSecret: "secret"}
+	newBackend := func(host string, weight int) *hub.Backend {
+		meta := &hub.AttestationMetadata{Hostnames: []string{host}, Weight: weight}
+		return hub.NewBackend(nil, meta, cfg, stubValidator{})
+	}
 
 	// Test empty pool
 	if lb.HasBackends() {
@@ -54,7 +57,7 @@ func TestLoadBalancer(t *testing.T) {
 
 	// Test weighted round robin distribution
 	counts := map[string]int{}
-    for i := 0; i < 1000; i++ {
+	for i := 0; i < 1000; i++ {
 		b, err := lb.Select()
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)

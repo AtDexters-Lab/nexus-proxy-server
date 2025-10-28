@@ -11,6 +11,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/auth"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/hub"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/peer"
@@ -96,7 +97,12 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 
-	backendHub := hub.New(cfg, hubTlsConfig)
+	validator, err := auth.NewValidator(cfg)
+	if err != nil {
+		log.Fatalf("FATAL: Failed to initialize token validator: %v", err)
+	}
+
+	backendHub := hub.New(cfg, hubTlsConfig, validator)
 	peerManager := peer.NewManager(cfg, backendHub, hubTlsConfig)
 	clientListener := proxy.NewListener(cfg, backendHub, peerManager, acmeHandler, hubTlsConfig)
 

@@ -15,13 +15,16 @@ type PeerAuthentication struct {
 
 // Config holds the entire application configuration, loaded from a YAML file.
 type Config struct {
-	BackendListenAddress string             `yaml:"backendListenAddress"`
-	PeerListenAddress    string             `yaml:"peerListenAddress"`
-	RelayPorts           []int              `yaml:"relayPorts"`
-	IdleTimeoutSeconds   int                `yaml:"idleTimeoutSeconds"`
-	BackendsJWTSecret    string             `yaml:"backendsJWTSecret"`
-	Peers                []string           `yaml:"peers"`
-	PeerAuthentication   PeerAuthentication `yaml:"peerAuthentication"`
+	BackendListenAddress           string             `yaml:"backendListenAddress"`
+	PeerListenAddress              string             `yaml:"peerListenAddress"`
+	RelayPorts                     []int              `yaml:"relayPorts"`
+	IdleTimeoutSeconds             int                `yaml:"idleTimeoutSeconds"`
+	BackendsJWTSecret              string             `yaml:"backendsJWTSecret"`
+	RemoteVerifierURL              string             `yaml:"remoteVerifierURL"`
+	RemoteVerifierTimeoutSeconds   int                `yaml:"remoteVerifierTimeoutSeconds"`
+	MaintenanceGraceDefaultSeconds int                `yaml:"maintenanceGraceDefaultSeconds"`
+	Peers                          []string           `yaml:"peers"`
+	PeerAuthentication             PeerAuthentication `yaml:"peerAuthentication"`
 
 	// Manual TLS configuration
 	HubTlsCertFile string `yaml:"hubTlsCertFile"`
@@ -37,6 +40,23 @@ func (c *Config) IdleTimeout() time.Duration {
 	return time.Duration(c.IdleTimeoutSeconds) * time.Second
 }
 
+// RemoteVerifierTimeout returns the configured timeout for HTTP calls to the
+// remote verifier, defaulting to 5 seconds when not specified.
+func (c *Config) RemoteVerifierTimeout() time.Duration {
+	if c.RemoteVerifierTimeoutSeconds <= 0 {
+		return 5 * time.Second
+	}
+	return time.Duration(c.RemoteVerifierTimeoutSeconds) * time.Second
+}
+
+// MaintenanceGraceDefault returns the default maintenance deferral window.
+func (c *Config) MaintenanceGraceDefault() time.Duration {
+	if c.MaintenanceGraceDefaultSeconds <= 0 {
+		return 30 * time.Minute
+	}
+	return time.Duration(c.MaintenanceGraceDefaultSeconds) * time.Second
+}
+
 // validate performs comprehensive validation of the loaded configuration.
 func (c *Config) validate() error {
 	if c.BackendListenAddress == "" {
@@ -45,11 +65,17 @@ func (c *Config) validate() error {
 	if len(c.RelayPorts) == 0 {
 		return fmt.Errorf("at least one relayPort must be specified")
 	}
-	if c.BackendsJWTSecret == "" {
-		return fmt.Errorf("backendsJWTSecret must be set")
+	if c.BackendsJWTSecret == "" && c.RemoteVerifierURL == "" {
+		return fmt.Errorf("must configure backendsJWTSecret or remoteVerifierURL")
 	}
 	if c.IdleTimeoutSeconds < 0 {
 		return fmt.Errorf("idleTimeoutSeconds cannot be negative")
+	}
+	if c.RemoteVerifierTimeoutSeconds < 0 {
+		return fmt.Errorf("remoteVerifierTimeoutSeconds cannot be negative")
+	}
+	if c.MaintenanceGraceDefaultSeconds < 0 {
+		return fmt.Errorf("maintenanceGraceDefaultSeconds cannot be negative")
 	}
 
 	// Validate TLS configuration: must be either manual or automatic, but not both.

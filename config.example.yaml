@@ -34,8 +34,20 @@ relayPorts:
 idleTimeoutSeconds: 60
 
 # A secret used to authenticate connections with backends.
-# Backends must present a valid JWT signed with this secret.
+# Backends must present a valid JWT signed with this secret unless you
+# configure a remote verifier (see below).
 backendsJWTSecret: "a-very-strong-jwt-secret-for-the-central-authorizer"
+
+# Optional: HTTP verifier that validates backend tokens so Nexus doesn't need
+# to possess signing keys locally. When omitted, Nexus validates tokens using
+# backendsJWTSecret. If you want Nexus to rely solely on the remote verifier,
+# comment out backendsJWTSecret above.
+# remoteVerifierURL: "https://verifier.example.com/validate"
+# remoteVerifierTimeoutSeconds: 5
+
+# Default maintenance grace window (seconds) when authorizer_status_uri claims
+# are present but do not specify a cap.
+maintenanceGraceDefaultSeconds: 1800
 
 # Peer-to-peer mesh configuration.
 # A map of other Nexus nodes that this node will connect to.
@@ -50,4 +62,3 @@ peerAuthentication:
   # ending in one of these suffixes.
   trustedDomainSuffixes:
     - ".proxy.example.com"
-
