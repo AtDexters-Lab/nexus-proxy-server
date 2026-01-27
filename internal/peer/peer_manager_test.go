@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/bandwidth"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
 	"github.com/google/uuid"
@@ -37,10 +38,12 @@ func (h *stubHub) SelectBackend(string) (iface.Backend, error) {
 	return h.backend, nil
 }
 
+func (h *stubHub) GetBandwidthScheduler() *bandwidth.Scheduler { return nil }
+
 type noopPeer struct{ addr string }
 
 func (p *noopPeer) Addr() string                       { return p.addr }
-func (p *noopPeer) Send([]byte)                        {}
+func (p *noopPeer) Send([]byte) bool                   { return true }
 func (p *noopPeer) StartTunnel(net.Conn, string, bool) {}
 
 func TestHandleTunnelRequestCleansUpOnBackendFailure(t *testing.T) {

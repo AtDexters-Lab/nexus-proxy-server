@@ -9,7 +9,7 @@ import (
 type dummyPeer struct{ addr string }
 
 func (d *dummyPeer) Addr() string                             { return d.addr }
-func (d *dummyPeer) Send([]byte)                              {}
+func (d *dummyPeer) Send([]byte) bool                         { return true }
 func (d *dummyPeer) StartTunnel(_ net.Conn, _ string, _ bool) {}
 
 func TestWildcardRoutingBasic(t *testing.T) {

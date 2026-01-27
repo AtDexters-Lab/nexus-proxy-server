@@ -3,6 +3,7 @@ package iface
 import (
 	"net"
 
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/bandwidth"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
@@ -11,6 +12,7 @@ import (
 type Hub interface {
 	GetLocalRoutes() []string
 	SelectBackend(hostname string) (Backend, error)
+	GetBandwidthScheduler() *bandwidth.Scheduler
 }
 
 // PeerManager is an interface that components use to interact with the peer manager.
@@ -24,7 +26,7 @@ type PeerManager interface {
 // Peer represents a single connection to another Nexus node.
 type Peer interface {
 	Addr() string
-	Send(message []byte)
+	Send(message []byte) bool
 	StartTunnel(conn net.Conn, hostname string, isTLS bool)
 }
 

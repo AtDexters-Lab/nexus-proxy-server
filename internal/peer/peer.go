@@ -25,12 +25,13 @@ const (
 )
 
 type peerImpl struct {
-	addr          string
-	conn          *websocket.Conn
-	config        *config.Config
-	manager       *Manager
-	send          chan []byte
-	activeTunnels sync.Map
+	addr            string
+	conn            *websocket.Conn
+	config          *config.Config
+	manager         *Manager
+	send            chan []byte
+	activeTunnels   sync.Map
+	tunnelHostnames sync.Map // clientID (uuid.UUID) → hostname (string) for bandwidth tracking
 }
 
 // NewPeer creates a new Peer instance.
@@ -125,12 +126,15 @@ func (p *peerImpl) handleConnection(ctx context.Context) {
 }
 
 // Send queues a message to be sent to the peer.
-func (p *peerImpl) Send(message []byte) {
+// Returns true if the message was enqueued, false if it was dropped.
+func (p *peerImpl) Send(message []byte) bool {
 	// A non-blocking send to the channel.
 	select {
 	case p.send <- message:
+		return true
 	default:
 		log.Printf("WARN: [PEER] Send channel for peer %s is full. Dropping message.", p.addr)
+		return false
 	}
 }
 
@@ -185,9 +189,42 @@ func (p *peerImpl) readPump() {
 
 				if rawConn, ok := p.activeTunnels.Load(clientID); ok {
 					if clientConn, ok := rawConn.(net.Conn); ok {
+						// Bandwidth check with retry loop BEFORE writing to client (counted at origin)
+						bandwidthScheduler := p.manager.GetBandwidthScheduler()
+						if bandwidthScheduler != nil {
+							if hostnameRaw, ok := p.tunnelHostnames.Load(clientID); ok {
+								hostname := hostnameRaw.(string)
+								backendID := "tunnel:" + hostname
+							bandwidthLoop:
+								for {
+									// Use full message size (header + payload) for consistent accounting with outbound path
+								allowed, waitTime := bandwidthScheduler.RequestSend(backendID, len(message))
+									if allowed {
+										break
+									}
+									// Wait with shutdown handling
+									select {
+									case <-p.manager.Done():
+										return // Manager shutting down
+									case <-time.After(waitTime):
+										continue bandwidthLoop
+									}
+								}
+							}
+						}
+
 						if _, err := clientConn.Write(payload); err != nil {
 							log.Printf("WARN: [PEER-TUNNEL] Failed to write back to client %s: %v. Closing connection.", clientID, err)
 							clientConn.Close() // This will cause the StartTunnel read loop to exit.
+						} else {
+							// Record sent bytes
+							if bandwidthScheduler != nil {
+								if hostnameRaw, ok := p.tunnelHostnames.Load(clientID); ok {
+									hostname := hostnameRaw.(string)
+									backendID := "tunnel:" + hostname
+									bandwidthScheduler.RecordSent(backendID, len(message))
+								}
+							}
 						}
 					}
 				} else {
@@ -287,7 +324,18 @@ func (p *peerImpl) StartTunnel(conn net.Conn, hostname string, isTLS bool) {
 	p.Send(payload)
 
 	p.activeTunnels.Store(clientID, conn)
+	p.tunnelHostnames.Store(clientID, hostname) // Track hostname for bandwidth accounting
 	defer p.activeTunnels.Delete(clientID)
+	defer p.tunnelHostnames.Delete(clientID)
+
+	// Get bandwidth scheduler for this tunnel and register the synthetic backend
+	// Use RegisterShared for reference counting since multiple tunnels may share the same hostname
+	bandwidthScheduler := p.manager.GetBandwidthScheduler()
+	if bandwidthScheduler != nil {
+		backendID := "tunnel:" + hostname
+		bandwidthScheduler.RegisterShared(backendID)
+		defer bandwidthScheduler.UnregisterShared(backendID)
+	}
 
 	// 2. Start proxying data from the client to the peer (as binary messages).
 	bufPtr := proxy.GetBuffer()
@@ -301,11 +349,43 @@ func (p *peerImpl) StartTunnel(conn net.Conn, hostname string, isTLS bool) {
 			break
 		}
 
+		messageSize := n + 1 + protocol.ClientIDLength // data + header
+
+		// Bandwidth check with retry loop BEFORE sending to peer (counted at origin)
+		if bandwidthScheduler != nil {
+			// For tunneled traffic, we use a synthetic backend ID based on hostname
+			// This ensures fair bandwidth distribution per hostname pool
+			backendID := "tunnel:" + hostname
+			for {
+				allowed, waitTime := bandwidthScheduler.RequestSend(backendID, messageSize)
+				if allowed {
+					break
+				}
+				// Wait with shutdown handling
+				select {
+				case <-p.manager.Done():
+					return // Manager shutting down
+				case <-time.After(waitTime):
+					// Continue to retry
+				}
+			}
+		}
+
 		header := make([]byte, 1+protocol.ClientIDLength)
 		header[0] = protocol.PeerTunnelData
 		copy(header[1:], clientID[:])
 		message := append(header, buf[:n]...)
-		p.Send(message)
+		sent := p.Send(message)
+
+		if bandwidthScheduler != nil {
+			backendID := "tunnel:" + hostname
+			if sent {
+				bandwidthScheduler.RecordSent(backendID, messageSize)
+			} else {
+				// Refund reserved bandwidth since the message was dropped
+				bandwidthScheduler.RefundSend(backendID, messageSize)
+			}
+		}
 	}
 
 	// 3. Send a close message when the client disconnects.

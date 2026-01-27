@@ -93,6 +93,11 @@ func main() {
 	if cfg.IdleTimeout() > 0 {
 		log.Printf("INFO: Client idle timeout is %s", cfg.IdleTimeout())
 	}
+	if cfg.TotalBandwidthMbps > 0 {
+		log.Printf("INFO: Bandwidth management enabled: %d Mbps total (fair distribution via DRR)", cfg.TotalBandwidthMbps)
+	} else {
+		log.Println("INFO: Bandwidth management disabled (unlimited)")
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup

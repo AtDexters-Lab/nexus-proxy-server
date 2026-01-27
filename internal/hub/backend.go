@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/auth"
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/bandwidth"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/protocol"
 	"github.com/google/uuid"
@@ -67,6 +68,10 @@ type Backend struct {
 	pendingNonce  string
 
 	httpClient *http.Client
+
+	// Bandwidth management
+	bandwidthState     *bandwidth.BackendBandwidth
+	bandwidthScheduler *bandwidth.Scheduler
 }
 
 // NewBackend creates a new Backend instance.
@@ -189,14 +194,47 @@ func (b *Backend) SendData(clientID uuid.UUID, data []byte) error {
 	copy(header[1:], clientID[:])
 	message := append(header, data...)
 
+	messageSize := len(message)
+
+	// Bandwidth check with retry loop (if scheduler enabled)
+	if b.bandwidthScheduler != nil {
+		for {
+			allowed, waitTime := b.bandwidthScheduler.RequestSend(b.id, messageSize)
+			if allowed {
+				break
+			}
+			// Block and wait (backpressure to client via TCP flow control)
+			select {
+			case <-b.quit:
+				return fmt.Errorf("backend %s is closing", b.id)
+			case <-time.After(waitTime):
+				// Continue to retry
+			}
+		}
+	}
+
 	outbound := outboundMessage{messageType: websocket.BinaryMessage, data: message}
 	select {
 	case <-b.quit:
+		// Refund reserved bandwidth since the message won't be sent
+		if b.bandwidthScheduler != nil {
+			b.bandwidthScheduler.RefundSend(b.id, messageSize)
+		}
 		return fmt.Errorf("backend %s is closing", b.id)
 	case b.outgoing <- outbound:
 	default:
+		// Refund reserved bandwidth since the message is dropped
+		if b.bandwidthScheduler != nil {
+			b.bandwidthScheduler.RefundSend(b.id, messageSize)
+		}
 		return fmt.Errorf("backend %s send channel full, dropping data for client %s", b.id, clientID)
 	}
+
+	// Record successful send
+	if b.bandwidthScheduler != nil {
+		b.bandwidthScheduler.RecordSent(b.id, messageSize)
+	}
+
 	select {
 	case <-b.quit:
 		return fmt.Errorf("backend %s is closing", b.id)
@@ -294,20 +332,49 @@ func (b *Backend) handleBinaryMessage(message []byte) {
 		copy(clientID[:], payload[:protocol.ClientIDLength])
 		data := payload[protocol.ClientIDLength:]
 
-		if rawConn, ok := b.clients.Load(clientID); ok {
-			if clientConn, ok := rawConn.(net.Conn); ok {
-				if b.config.IdleTimeout() > 0 {
-					_ = clientConn.SetWriteDeadline(time.Now().Add(b.config.IdleTimeout()))
+		// Check client existence first to avoid blocking on bandwidth
+		// for data destined to already-disconnected clients.
+		rawConn, ok := b.clients.Load(clientID)
+		if !ok {
+			return
+		}
+
+		// Bandwidth check with retry loop BEFORE writing to client
+		// Use full message size (header + payload) for consistent accounting with SendData
+		if b.bandwidthScheduler != nil {
+			fullMessageSize := len(payload) + 1 // control byte + full payload including clientID + data
+			for {
+				allowed, waitTime := b.bandwidthScheduler.RequestSend(b.id, fullMessageSize)
+				if allowed {
+					break
 				}
-				if _, err := clientConn.Write(data); err != nil {
-					log.Printf("WARN: Failed to write to client %s: %v. Closing.", clientID, err)
-					_ = clientConn.Close()
+				// Block - this blocks readPump, creating backpressure to backend
+				select {
+				case <-b.quit:
+					return
+				case <-time.After(waitTime):
+					// Refresh read deadline so the pong handler doesn't
+					// time out while we're legitimately waiting for bandwidth.
+					b.conn.SetReadDeadline(time.Now().Add(pongWait))
 				}
+			}
+		}
+
+		if clientConn, ok := rawConn.(net.Conn); ok {
+			if b.config.IdleTimeout() > 0 {
+				_ = clientConn.SetWriteDeadline(time.Now().Add(b.config.IdleTimeout()))
+			}
+			if _, err := clientConn.Write(data); err != nil {
+				log.Printf("WARN: Failed to write to client %s: %v. Closing.", clientID, err)
+				_ = clientConn.Close()
 			} else {
-				log.Printf("ERROR: Client %s is not a net.Conn type in backend %s", clientID, b.id)
+				// Record successful send
+				if b.bandwidthScheduler != nil {
+					b.bandwidthScheduler.RecordSent(b.id, len(payload)+1)
+				}
 			}
 		} else {
-			log.Printf("WARN: Received data for unknown client %s from backend %s. Ignoring.", clientID, b.id)
+			log.Printf("ERROR: Client %s is not a net.Conn type in backend %s", clientID, b.id)
 		}
 	}
 }

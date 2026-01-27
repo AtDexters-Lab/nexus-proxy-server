@@ -62,3 +62,17 @@ peerAuthentication:
   # ending in one of these suffixes.
   trustedDomainSuffixes:
     - ".proxy.example.com"
+
+# Total bandwidth limit for all backends combined, in Mbps.
+# The bandwidth is distributed fairly among all active backends using
+# Deficit Round Robin (DRR) algorithm. This ensures:
+#   - Fair distribution: All active backends receive equal share
+#   - Work-conserving: Unused bandwidth from idle backends is available to active ones
+#   - Instant adaptation: Bandwidth redistribution happens immediately when backends join/leave
+#
+# Examples:
+#   1000  = 1 Gbps total, ~8 Mbps per backend with 125 backends
+#   100   = 100 Mbps total, ~8 Mbps per backend with 12 backends
+#   0     = Unlimited (no bandwidth management, default)
+#
+# totalBandwidthMbps: 1000

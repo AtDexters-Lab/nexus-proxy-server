@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/auth"
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/bandwidth"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
 	hostn "github.com/AtDexters-Lab/nexus-proxy-server/internal/hostnames"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
@@ -30,20 +31,21 @@ const (
 
 // hubImpl manages the lifecycle of backend and peer connections.
 type hubImpl struct {
-	config        *config.Config
-	backendServer *http.Server // Listens for backend connections
-	peerServer    *http.Server // Listens for peer connections (mTLS)
-	upgrader      websocket.Upgrader
-	pools         sync.Map // key: exact hostname (string) -> *LoadBalancerPool
-	wildcardPools sync.Map // key: suffix like ".example.com" -> *LoadBalancerPool
-	peerManager   iface.PeerManager
-	hubTlsConfig  *tls.Config
-	validator     auth.Validator
+	config             *config.Config
+	backendServer      *http.Server // Listens for backend connections
+	peerServer         *http.Server // Listens for peer connections (mTLS)
+	upgrader           websocket.Upgrader
+	pools              sync.Map // key: exact hostname (string) -> *LoadBalancerPool
+	wildcardPools      sync.Map // key: suffix like ".example.com" -> *LoadBalancerPool
+	peerManager        iface.PeerManager
+	hubTlsConfig       *tls.Config
+	validator          auth.Validator
+	bandwidthScheduler *bandwidth.Scheduler
 }
 
 // New creates and returns a new Hub instance.
 func New(cfg *config.Config, tlsConfig *tls.Config, validator auth.Validator) *hubImpl {
-	return &hubImpl{
+	h := &hubImpl{
 		config:       cfg,
 		hubTlsConfig: tlsConfig,
 		validator:    validator,
@@ -51,6 +53,13 @@ func New(cfg *config.Config, tlsConfig *tls.Config, validator auth.Validator) *h
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
 	}
+
+	// Initialize bandwidth scheduler if limit is configured
+	if cfg.TotalBandwidthMbps > 0 {
+		h.bandwidthScheduler = bandwidth.NewScheduler(cfg.TotalBandwidthMbps)
+	}
+
+	return h
 }
 
 // SetPeerManager sets the peer manager for the hub. This is done after
@@ -167,6 +176,11 @@ func (h *hubImpl) Stop() {
 	}()
 
 	wg.Wait()
+
+	// Stop bandwidth scheduler
+	if h.bandwidthScheduler != nil {
+		h.bandwidthScheduler.Stop()
+	}
 }
 
 // SelectBackend finds the load balancer pool for the given hostname.
@@ -452,6 +466,12 @@ func sameStringSets(a, b []string) bool {
 }
 
 func (h *hubImpl) register(b *Backend) {
+	// Register with bandwidth scheduler
+	if h.bandwidthScheduler != nil {
+		b.bandwidthState = h.bandwidthScheduler.Register(b.id)
+		b.bandwidthScheduler = h.bandwidthScheduler
+	}
+
 	for _, hn := range b.hostnames {
 		if suffix, ok := hostn.WildcardSuffix(hn); ok {
 			rawPool, _ := h.wildcardPools.LoadOrStore(suffix, NewLoadBalancerPool())
@@ -469,6 +489,11 @@ func (h *hubImpl) register(b *Backend) {
 }
 
 func (h *hubImpl) unregister(b *Backend) {
+	// Unregister from bandwidth scheduler
+	if h.bandwidthScheduler != nil {
+		h.bandwidthScheduler.Unregister(b.id)
+	}
+
 	b.Close()
 	for _, hn := range b.hostnames {
 		if suffix, ok := hostn.WildcardSuffix(hn); ok {
@@ -514,4 +539,9 @@ func (h *hubImpl) GetLocalRoutes() []string {
 		return true
 	})
 	return hostnames
+}
+
+// GetBandwidthScheduler returns the bandwidth scheduler for peer tunneling.
+func (h *hubImpl) GetBandwidthScheduler() *bandwidth.Scheduler {
+	return h.bandwidthScheduler
 }

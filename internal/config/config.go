@@ -33,6 +33,11 @@ type Config struct {
 	// Automatic TLS configuration via ACME
 	HubPublicHostname string `yaml:"hubPublicHostname"`
 	AcmeCacheDir      string `yaml:"acmeCacheDir"`
+
+	// TotalBandwidthMbps is the total bandwidth limit for the proxy in Mbps.
+	// Set to 0 for unlimited. When set, bandwidth is distributed fairly
+	// among all active backends using Deficit Round Robin.
+	TotalBandwidthMbps int `yaml:"totalBandwidthMbps"`
 }
 
 // IdleTimeout returns the idle timeout as a time.Duration.
@@ -55,6 +60,15 @@ func (c *Config) MaintenanceGraceDefault() time.Duration {
 		return 30 * time.Minute
 	}
 	return time.Duration(c.MaintenanceGraceDefaultSeconds) * time.Second
+}
+
+// TotalBandwidthBytesPerSecond returns the bandwidth limit in bytes/second.
+// Returns 0 if unlimited.
+func (c *Config) TotalBandwidthBytesPerSecond() int64 {
+	if c.TotalBandwidthMbps <= 0 {
+		return 0 // unlimited
+	}
+	return int64(c.TotalBandwidthMbps) * 1_000_000 / 8
 }
 
 // validate performs comprehensive validation of the loaded configuration.
@@ -100,6 +114,11 @@ func (c *Config) validate() error {
 		if len(c.PeerAuthentication.TrustedDomainSuffixes) == 0 {
 			return fmt.Errorf("peerAuthentication.trustedDomainSuffixes must be set if peers are defined")
 		}
+	}
+
+	// Validate bandwidth settings
+	if c.TotalBandwidthMbps < 0 {
+		return fmt.Errorf("totalBandwidthMbps cannot be negative")
 	}
 
 	return nil

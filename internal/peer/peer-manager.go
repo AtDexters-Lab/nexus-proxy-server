@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/bandwidth"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/protocol"
@@ -189,4 +190,20 @@ func (m *Manager) broadcastToPeers(payload []byte) {
 		}
 		return true
 	})
+}
+
+// GetBandwidthScheduler returns the bandwidth scheduler from the hub.
+// Used by peers for bandwidth limiting during tunneling.
+func (m *Manager) GetBandwidthScheduler() *bandwidth.Scheduler {
+	return m.hub.GetBandwidthScheduler()
+}
+
+// Done returns a channel that is closed when the manager is shutting down.
+// Used by peers for graceful shutdown during bandwidth waits.
+func (m *Manager) Done() <-chan struct{} {
+	if m.ctx == nil {
+		// Return a never-closing channel if context not yet initialized
+		return make(chan struct{})
+	}
+	return m.ctx.Done()
 }
