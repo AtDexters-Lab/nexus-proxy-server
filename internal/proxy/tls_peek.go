@@ -13,6 +13,9 @@ import (
 // handshake as soon as the ClientHello (and thus SNI) is available.
 var errAbortHandshake = errors.New("abort tls handshake after clienthello")
 
+// ErrMissingSNI indicates a valid TLS ClientHello without an SNI value.
+var ErrMissingSNI = errors.New("missing sni in clienthello")
+
 // readRecorder wraps a net.Conn and records up to max bytes that are read
 // through it. This is used to capture the exact ClientHello bytes so they can
 // be forwarded to the selected backend before proxying the remainder.
@@ -90,7 +93,7 @@ func PeekSNIAndPrelude(conn net.Conn, timeout time.Duration, maxPrelude int) (st
 	prelude := make([]byte, rc.buf.Len())
 	copy(prelude, rc.buf.Bytes())
 	if sni == "" {
-		return "", prelude, errors.New("missing sni in clienthello")
+		return "", prelude, ErrMissingSNI
 	}
 	return sni, prelude, nil
 }

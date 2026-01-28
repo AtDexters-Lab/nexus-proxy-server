@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,9 @@ type hubImpl struct {
 	upgrader           websocket.Upgrader
 	pools              sync.Map // key: exact hostname (string) -> *LoadBalancerPool
 	wildcardPools      sync.Map // key: suffix like ".example.com" -> *LoadBalancerPool
+	udpFlowIdleByPort  sync.Map // key: int port -> time.Duration
+	udpFlowIdleMu      sync.Mutex
+	udpFlowIdleSources map[int]map[string]time.Duration // key: int port -> backend ID -> time.Duration
 	peerManager        iface.PeerManager
 	hubTlsConfig       *tls.Config
 	validator          auth.Validator
@@ -46,9 +50,10 @@ type hubImpl struct {
 // New creates and returns a new Hub instance.
 func New(cfg *config.Config, tlsConfig *tls.Config, validator auth.Validator) *hubImpl {
 	h := &hubImpl{
-		config:       cfg,
-		hubTlsConfig: tlsConfig,
-		validator:    validator,
+		config:             cfg,
+		hubTlsConfig:       tlsConfig,
+		validator:          validator,
+		udpFlowIdleSources: make(map[int]map[string]time.Duration),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
@@ -198,6 +203,102 @@ func (h *hubImpl) SelectBackend(hostname string) (iface.Backend, error) {
 	return nil, fmt.Errorf("no backend pool available for hostname: %s", hostname)
 }
 
+func (h *hubImpl) UDPFlowIdleTimeout(port int) (time.Duration, bool) {
+	if raw, ok := h.udpFlowIdleByPort.Load(port); ok {
+		if d, ok := raw.(time.Duration); ok {
+			return d, true
+		}
+	}
+	return 0, false
+}
+
+func (h *hubImpl) trackUDPFlowIdleTimeout(backendID string, routes []UDPRoutePolicy) {
+	if len(routes) == 0 {
+		return
+	}
+
+	portsTouched := make(map[int]struct{}, len(routes))
+
+	h.udpFlowIdleMu.Lock()
+	defer h.udpFlowIdleMu.Unlock()
+
+	for _, route := range routes {
+		port := route.Port
+		portSources := h.udpFlowIdleSources[port]
+		if portSources == nil {
+			portSources = make(map[string]time.Duration, 1)
+			h.udpFlowIdleSources[port] = portSources
+		}
+
+		for existingBackendID, existingTimeout := range portSources {
+			if existingBackendID == backendID {
+				continue
+			}
+			if existingTimeout != route.FlowIdleTimeout {
+				log.Printf("WARN: Conflicting UDP flow idle timeouts for port %d: %s from backend %s vs %s from backend %s; using max", port, existingTimeout, existingBackendID, route.FlowIdleTimeout, backendID)
+				break
+			}
+		}
+
+		portSources[backendID] = route.FlowIdleTimeout
+		portsTouched[port] = struct{}{}
+	}
+
+	for port := range portsTouched {
+		h.recomputeUDPFlowIdleTimeoutLocked(port)
+	}
+}
+
+func (h *hubImpl) untrackUDPFlowIdleTimeout(backendID string, routes []UDPRoutePolicy) {
+	if len(routes) == 0 {
+		return
+	}
+
+	portsTouched := make(map[int]struct{}, len(routes))
+
+	h.udpFlowIdleMu.Lock()
+	defer h.udpFlowIdleMu.Unlock()
+
+	for _, route := range routes {
+		port := route.Port
+		portSources := h.udpFlowIdleSources[port]
+		if portSources == nil {
+			continue
+		}
+
+		delete(portSources, backendID)
+		if len(portSources) == 0 {
+			delete(h.udpFlowIdleSources, port)
+		}
+		portsTouched[port] = struct{}{}
+	}
+
+	for port := range portsTouched {
+		h.recomputeUDPFlowIdleTimeoutLocked(port)
+	}
+}
+
+func (h *hubImpl) recomputeUDPFlowIdleTimeoutLocked(port int) {
+	portSources := h.udpFlowIdleSources[port]
+	if len(portSources) == 0 {
+		h.udpFlowIdleByPort.Delete(port)
+		return
+	}
+
+	effective := time.Duration(0)
+	for _, d := range portSources {
+		if d > effective {
+			effective = d
+		}
+	}
+
+	if effective > 0 {
+		h.udpFlowIdleByPort.Store(port, effective)
+		return
+	}
+	h.udpFlowIdleByPort.Delete(port)
+}
+
 // handleBackendConnect handles a connection from a backend service (JWT Auth).
 func (h *hubImpl) handleBackendConnect(w http.ResponseWriter, r *http.Request) {
 	conn, err := h.upgrader.Upgrade(w, r, nil)
@@ -214,7 +315,7 @@ func (h *hubImpl) handleBackendConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("INFO: Backend for hostnames %v authenticated successfully from %s", backend.hostnames, conn.RemoteAddr())
+	log.Printf("INFO: Backend authenticated successfully: hostnames=%v tcp_ports=%v udp_routes=%v from=%s", backend.hostnames, backend.tcpPorts, backend.udpRoutes, conn.RemoteAddr())
 
 	h.register(backend)
 	defer h.unregister(backend)
@@ -247,6 +348,13 @@ type challengeMessage struct {
 	Nonce string `json:"nonce"`
 }
 
+type stage0Info struct {
+	Hostnames []string
+	TCPPorts  []int
+	UDPRoutes []UDPRoutePolicy
+	Weight    int
+}
+
 func (h *hubImpl) performHandshake(conn *websocket.Conn) (*Backend, error) {
 	stage0Token, err := h.readTokenMessage(conn, "stage0")
 	if err != nil {
@@ -260,7 +368,7 @@ func (h *hubImpl) performHandshake(conn *websocket.Conn) (*Backend, error) {
 		return nil, fmt.Errorf("stage0 token validation failed: %w", err)
 	}
 
-	hostnames, weight, err := h.validateStage0Claims(claims0)
+	info0, err := h.validateStage0Claims(claims0)
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +394,7 @@ func (h *hubImpl) performHandshake(conn *websocket.Conn) (*Backend, error) {
 		return nil, fmt.Errorf("stage1 token validation failed: %w", err)
 	}
 
-	meta, err := h.buildMetadataFromClaims(claims1, hostnames, weight, nonce)
+	meta, err := h.buildMetadataFromClaims(claims1, info0, nonce)
 	if err != nil {
 		return nil, err
 	}
@@ -311,13 +419,27 @@ func (h *hubImpl) readTokenMessage(conn *websocket.Conn, stage string) (string, 
 	return string(payload), nil
 }
 
-func (h *hubImpl) validateStage0Claims(claims *auth.Claims) ([]string, int, error) {
-	if len(claims.Hostnames) == 0 {
-		return nil, 0, errors.New("stage0 token missing hostnames")
+func (h *hubImpl) validateStage0Claims(claims *auth.Claims) (*stage0Info, error) {
+	var normalizedHosts []string
+	if len(claims.Hostnames) > 0 {
+		var err error
+		normalizedHosts, err = normalizeHostnames(claims.Hostnames)
+		if err != nil {
+			return nil, err
+		}
 	}
-	normalized, err := normalizeHostnames(claims.Hostnames)
+
+	tcpPorts, err := normalizeTCPPortClaims(h.config, claims.TCPPorts)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
+	}
+	udpRoutes, err := normalizeUDPRouteClaims(h.config, claims.UDPRoutes)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(normalizedHosts) == 0 && len(tcpPorts) == 0 && len(udpRoutes) == 0 {
+		return nil, errors.New("stage0 token missing hostnames and port claims")
 	}
 
 	weight := claims.Weight
@@ -327,40 +449,72 @@ func (h *hubImpl) validateStage0Claims(claims *auth.Claims) ([]string, int, erro
 
 	if claims.HandshakeMaxAgeSeconds != nil && *claims.HandshakeMaxAgeSeconds > 0 {
 		if claims.IssuedAt == nil || claims.IssuedAt.Time.IsZero() {
-			return nil, 0, errors.New("stage0 token missing iat for handshake_max_age_seconds")
+			return nil, errors.New("stage0 token missing iat for handshake_max_age_seconds")
 		}
 		age := time.Since(claims.IssuedAt.Time)
 		if age > time.Duration(*claims.HandshakeMaxAgeSeconds)*time.Second {
-			return nil, 0, fmt.Errorf("stage0 token exceeded handshake_max_age_seconds: age=%s", age)
+			return nil, fmt.Errorf("stage0 token exceeded handshake_max_age_seconds: age=%s", age)
 		}
 	}
 
-	return normalized, weight, nil
+	return &stage0Info{
+		Hostnames: normalizedHosts,
+		TCPPorts:  tcpPorts,
+		UDPRoutes: udpRoutes,
+		Weight:    weight,
+	}, nil
 }
 
-func (h *hubImpl) buildMetadataFromClaims(claims *auth.Claims, expectedHosts []string, expectedWeight int, nonce string) (*AttestationMetadata, error) {
+func (h *hubImpl) buildMetadataFromClaims(claims *auth.Claims, expected *stage0Info, nonce string) (*AttestationMetadata, error) {
 	if claims.SessionNonce != nonce {
 		return nil, fmt.Errorf("session nonce mismatch: expected %s got %s", nonce, claims.SessionNonce)
 	}
 
-	if len(claims.Hostnames) == 0 {
-		return nil, errors.New("attested token missing hostnames")
+	var normalizedHosts []string
+	if len(claims.Hostnames) > 0 {
+		var err error
+		normalizedHosts, err = normalizeHostnames(claims.Hostnames)
+		if err != nil {
+			return nil, err
+		}
 	}
-	normalized, err := normalizeHostnames(claims.Hostnames)
+
+	tcpPorts, err := normalizeTCPPortClaims(h.config, claims.TCPPorts)
 	if err != nil {
 		return nil, err
 	}
-	if !sameStringSets(normalized, expectedHosts) {
-		return nil, errors.New("attested token hostnames differ from handshake token")
+	udpRoutes, err := normalizeUDPRouteClaims(h.config, claims.UDPRoutes)
+	if err != nil {
+		return nil, err
 	}
 
-	weight := expectedWeight
-	if claims.Weight > 0 && claims.Weight != expectedWeight {
+	if len(normalizedHosts) == 0 && len(tcpPorts) == 0 && len(udpRoutes) == 0 {
+		return nil, errors.New("attested token missing hostnames and port claims")
+	}
+
+	if expected == nil {
+		return nil, errors.New("missing handshake expectations")
+	}
+
+	if !sameStringSets(normalizedHosts, expected.Hostnames) {
+		return nil, errors.New("attested token hostnames differ from handshake token")
+	}
+	if !sameIntSets(tcpPorts, expected.TCPPorts) {
+		return nil, errors.New("attested token tcp port claims differ from handshake token")
+	}
+	if !sameUDPRoutes(udpRoutes, expected.UDPRoutes) {
+		return nil, errors.New("attested token udp route claims differ from handshake token")
+	}
+
+	weight := expected.Weight
+	if claims.Weight > 0 && claims.Weight != expected.Weight {
 		return nil, errors.New("attested token weight differs from handshake token")
 	}
 
 	meta := &AttestationMetadata{
-		Hostnames:           append([]string{}, expectedHosts...),
+		Hostnames:           append([]string{}, expected.Hostnames...),
+		TCPPorts:            append([]int{}, expected.TCPPorts...),
+		UDPRoutes:           append([]UDPRoutePolicy{}, expected.UDPRoutes...),
 		Weight:              weight,
 		PolicyVersion:       claims.PolicyVersion,
 		AuthorizerStatusURI: claims.AuthorizerStatusURI,
@@ -419,6 +573,11 @@ func normalizeHostnames(hosts []string) ([]string, error) {
 		if n == "" {
 			continue
 		}
+		// Prevent backends from claiming reserved route-key strings via hostnames.
+		// Route keys share the same namespace as hostnames in h.pools.
+		if strings.HasPrefix(n, "tcp:") || strings.HasPrefix(n, "udp:") {
+			return nil, fmt.Errorf("reserved route key %q cannot be used as a hostname claim", n)
+		}
 		if _, ok := uniq[n]; ok {
 			continue
 		}
@@ -429,6 +588,93 @@ func normalizeHostnames(hosts []string) ([]string, error) {
 		return nil, errors.New("no valid hostnames after normalization")
 	}
 	return normalized, nil
+}
+
+func normalizeTCPPortClaims(cfg *config.Config, ports []int) ([]int, error) {
+	if len(ports) == 0 {
+		return nil, nil
+	}
+	if cfg == nil || len(cfg.AllowedTCPPortClaims) == 0 {
+		return nil, errors.New("tcp port claims are disabled (allowedTCPPortClaims is empty)")
+	}
+	uniq := make(map[int]struct{}, len(ports))
+	out := make([]int, 0, len(ports))
+	for _, port := range ports {
+		if port <= 0 || port > 65535 {
+			return nil, fmt.Errorf("invalid tcp port claim: %d", port)
+		}
+		if !portAllowed(cfg.AllowedTCPPortClaims, port) {
+			return nil, fmt.Errorf("tcp port claim %d is not allowed", port)
+		}
+		if _, ok := uniq[port]; ok {
+			continue
+		}
+		uniq[port] = struct{}{}
+		out = append(out, port)
+	}
+	sort.Ints(out)
+	return out, nil
+}
+
+func normalizeUDPRouteClaims(cfg *config.Config, routes []auth.UDPRouteClaim) ([]UDPRoutePolicy, error) {
+	if len(routes) == 0 {
+		return nil, nil
+	}
+	if cfg == nil || len(cfg.AllowedUDPPortClaims) == 0 {
+		return nil, errors.New("udp port claims are disabled (allowedUDPPortClaims is empty)")
+	}
+
+	minTimeout := cfg.UDPFlowIdleTimeoutMin()
+	maxTimeout := cfg.UDPFlowIdleTimeoutMax()
+	if maxTimeout < minTimeout {
+		return nil, fmt.Errorf("udp flow idle timeout max (%s) cannot be less than min (%s)", maxTimeout, minTimeout)
+	}
+
+	seen := make(map[int]UDPRoutePolicy, len(routes))
+	for _, route := range routes {
+		port := route.Port
+		if port <= 0 || port > 65535 {
+			return nil, fmt.Errorf("invalid udp route port claim: %d", port)
+		}
+		if !portAllowed(cfg.AllowedUDPPortClaims, port) {
+			return nil, fmt.Errorf("udp port claim %d is not allowed", port)
+		}
+
+		timeout := cfg.UDPFlowIdleTimeoutDefault()
+		if route.FlowIdleTimeoutSeconds != nil && *route.FlowIdleTimeoutSeconds > 0 {
+			timeout = time.Duration(*route.FlowIdleTimeoutSeconds) * time.Second
+		}
+		if timeout < minTimeout {
+			timeout = minTimeout
+		}
+		if timeout > maxTimeout {
+			timeout = maxTimeout
+		}
+
+		if existing, ok := seen[port]; ok {
+			if existing.FlowIdleTimeout != timeout {
+				return nil, fmt.Errorf("conflicting udp route policies for port %d", port)
+			}
+			continue
+		}
+		seen[port] = UDPRoutePolicy{Port: port, FlowIdleTimeout: timeout}
+	}
+
+	out := make([]UDPRoutePolicy, 0, len(seen))
+	for _, route := range seen {
+		out = append(out, route)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Port < out[j].Port })
+	return out, nil
+}
+
+func portAllowed(allowlist []int, port int) bool {
+	for _, allowed := range allowlist {
+		if allowed == port {
+			return true
+		}
+	}
+	return false
 }
 
 func validateAuthorizerStatusURI(raw string) error {
@@ -465,6 +711,47 @@ func sameStringSets(a, b []string) bool {
 	return len(counts) == 0
 }
 
+func sameIntSets(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	aSorted := append([]int{}, a...)
+	bSorted := append([]int{}, b...)
+	sort.Ints(aSorted)
+	sort.Ints(bSorted)
+	for i := range aSorted {
+		if aSorted[i] != bSorted[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameUDPRoutes(a, b []UDPRoutePolicy) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	aSorted := append([]UDPRoutePolicy{}, a...)
+	bSorted := append([]UDPRoutePolicy{}, b...)
+	sort.Slice(aSorted, func(i, j int) bool { return aSorted[i].Port < aSorted[j].Port })
+	sort.Slice(bSorted, func(i, j int) bool { return bSorted[i].Port < bSorted[j].Port })
+	for i := range aSorted {
+		if aSorted[i].Port != bSorted[i].Port {
+			return false
+		}
+		if aSorted[i].FlowIdleTimeout != bSorted[i].FlowIdleTimeout {
+			return false
+		}
+	}
+	return true
+}
+
 func (h *hubImpl) register(b *Backend) {
 	// Register with bandwidth scheduler
 	if h.bandwidthScheduler != nil {
@@ -485,6 +772,24 @@ func (h *hubImpl) register(b *Backend) {
 			log.Printf("INFO: Backend %s registered to pool for hostname '%s'", b.id, hn)
 		}
 	}
+
+	for _, port := range b.tcpPorts {
+		routeKey := fmt.Sprintf("tcp:%d", port)
+		rawPool, _ := h.pools.LoadOrStore(routeKey, NewLoadBalancerPool())
+		pool := rawPool.(*LoadBalancerPool)
+		pool.AddBackend(b)
+		log.Printf("INFO: Backend %s registered to port pool '%s'", b.id, routeKey)
+	}
+
+	for _, route := range b.udpRoutes {
+		routeKey := fmt.Sprintf("udp:%d", route.Port)
+		rawPool, _ := h.pools.LoadOrStore(routeKey, NewLoadBalancerPool())
+		pool := rawPool.(*LoadBalancerPool)
+		pool.AddBackend(b)
+		log.Printf("INFO: Backend %s registered to UDP port pool '%s' (flow_idle_timeout=%s)", b.id, routeKey, route.FlowIdleTimeout)
+	}
+	h.trackUDPFlowIdleTimeout(b.id, b.udpRoutes)
+
 	h.updateAndAnnounceRoutes()
 }
 
@@ -510,6 +815,26 @@ func (h *hubImpl) unregister(b *Backend) {
 			}
 		}
 	}
+
+	for _, port := range b.tcpPorts {
+		routeKey := fmt.Sprintf("tcp:%d", port)
+		if rawPool, ok := h.pools.Load(routeKey); ok {
+			pool := rawPool.(*LoadBalancerPool)
+			pool.RemoveBackend(b)
+			log.Printf("INFO: Backend %s unregistered from port pool '%s'", b.id, routeKey)
+		}
+	}
+
+	for _, route := range b.udpRoutes {
+		routeKey := fmt.Sprintf("udp:%d", route.Port)
+		if rawPool, ok := h.pools.Load(routeKey); ok {
+			pool := rawPool.(*LoadBalancerPool)
+			pool.RemoveBackend(b)
+			log.Printf("INFO: Backend %s unregistered from UDP port pool '%s'", b.id, routeKey)
+		}
+	}
+	h.untrackUDPFlowIdleTimeout(b.id, b.udpRoutes)
+
 	h.updateAndAnnounceRoutes()
 }
 

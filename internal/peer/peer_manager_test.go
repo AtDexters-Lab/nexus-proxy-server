@@ -38,6 +38,8 @@ func (h *stubHub) SelectBackend(string) (iface.Backend, error) {
 	return h.backend, nil
 }
 
+func (h *stubHub) UDPFlowIdleTimeout(int) (time.Duration, bool) { return 0, false }
+
 func (h *stubHub) GetBandwidthScheduler() *bandwidth.Scheduler { return nil }
 
 type noopPeer struct{ addr string }

@@ -18,6 +18,7 @@ type Config struct {
 	BackendListenAddress           string             `yaml:"backendListenAddress"`
 	PeerListenAddress              string             `yaml:"peerListenAddress"`
 	RelayPorts                     []int              `yaml:"relayPorts"`
+	UDPRelayPorts                  []int              `yaml:"udpRelayPorts"`
 	IdleTimeoutSeconds             int                `yaml:"idleTimeoutSeconds"`
 	BackendsJWTSecret              string             `yaml:"backendsJWTSecret"`
 	RemoteVerifierURL              string             `yaml:"remoteVerifierURL"`
@@ -38,6 +39,17 @@ type Config struct {
 	// Set to 0 for unlimited. When set, bandwidth is distributed fairly
 	// among all active backends using Deficit Round Robin.
 	TotalBandwidthMbps int `yaml:"totalBandwidthMbps"`
+
+	// Port claim allowlists (security controls). When empty, port claims are disabled.
+	AllowedTCPPortClaims []int `yaml:"allowedTCPPortClaims"`
+	AllowedUDPPortClaims []int `yaml:"allowedUDPPortClaims"`
+
+	// UDP flow table and payload bounds (applies to udpRelayPorts).
+	UDPMaxFlows                      int `yaml:"udpMaxFlows"`
+	UDPMaxDatagramBytes              int `yaml:"udpMaxDatagramBytes"`
+	UDPFlowIdleTimeoutDefaultSeconds int `yaml:"udpFlowIdleTimeoutDefaultSeconds"`
+	UDPFlowIdleTimeoutMinSeconds     int `yaml:"udpFlowIdleTimeoutMinSeconds"`
+	UDPFlowIdleTimeoutMaxSeconds     int `yaml:"udpFlowIdleTimeoutMaxSeconds"`
 }
 
 // IdleTimeout returns the idle timeout as a time.Duration.
@@ -69,6 +81,41 @@ func (c *Config) TotalBandwidthBytesPerSecond() int64 {
 		return 0 // unlimited
 	}
 	return int64(c.TotalBandwidthMbps) * 1_000_000 / 8
+}
+
+func (c *Config) UDPMaxFlowsOrDefault() int {
+	if c.UDPMaxFlows <= 0 {
+		return 200_000
+	}
+	return c.UDPMaxFlows
+}
+
+func (c *Config) UDPMaxDatagramBytesOrDefault() int {
+	if c.UDPMaxDatagramBytes <= 0 {
+		return 2048
+	}
+	return c.UDPMaxDatagramBytes
+}
+
+func (c *Config) UDPFlowIdleTimeoutDefault() time.Duration {
+	if c.UDPFlowIdleTimeoutDefaultSeconds <= 0 {
+		return 30 * time.Second
+	}
+	return time.Duration(c.UDPFlowIdleTimeoutDefaultSeconds) * time.Second
+}
+
+func (c *Config) UDPFlowIdleTimeoutMin() time.Duration {
+	if c.UDPFlowIdleTimeoutMinSeconds <= 0 {
+		return 5 * time.Second
+	}
+	return time.Duration(c.UDPFlowIdleTimeoutMinSeconds) * time.Second
+}
+
+func (c *Config) UDPFlowIdleTimeoutMax() time.Duration {
+	if c.UDPFlowIdleTimeoutMaxSeconds <= 0 {
+		return 5 * time.Minute
+	}
+	return time.Duration(c.UDPFlowIdleTimeoutMaxSeconds) * time.Second
 }
 
 // validate performs comprehensive validation of the loaded configuration.
@@ -119,6 +166,35 @@ func (c *Config) validate() error {
 	// Validate bandwidth settings
 	if c.TotalBandwidthMbps < 0 {
 		return fmt.Errorf("totalBandwidthMbps cannot be negative")
+	}
+
+	if c.UDPMaxFlows < 0 {
+		return fmt.Errorf("udpMaxFlows cannot be negative")
+	}
+	if c.UDPMaxDatagramBytes < 0 {
+		return fmt.Errorf("udpMaxDatagramBytes cannot be negative")
+	}
+	if c.UDPFlowIdleTimeoutDefaultSeconds < 0 {
+		return fmt.Errorf("udpFlowIdleTimeoutDefaultSeconds cannot be negative")
+	}
+	if c.UDPFlowIdleTimeoutMinSeconds < 0 {
+		return fmt.Errorf("udpFlowIdleTimeoutMinSeconds cannot be negative")
+	}
+	if c.UDPFlowIdleTimeoutMaxSeconds < 0 {
+		return fmt.Errorf("udpFlowIdleTimeoutMaxSeconds cannot be negative")
+	}
+
+	// Warn about UDP relay ports without matching allowlist entries.
+	if len(c.UDPRelayPorts) > 0 {
+		allowed := make(map[int]struct{}, len(c.AllowedUDPPortClaims))
+		for _, p := range c.AllowedUDPPortClaims {
+			allowed[p] = struct{}{}
+		}
+		for _, p := range c.UDPRelayPorts {
+			if _, ok := allowed[p]; !ok {
+				fmt.Fprintf(os.Stderr, "WARN: udpRelayPorts contains port %d which is not in allowedUDPPortClaims; no backend will be able to claim it\n", p)
+			}
+		}
 	}
 
 	return nil

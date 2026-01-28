@@ -2,6 +2,13 @@ package protocol
 
 import "github.com/google/uuid"
 
+type Transport string
+
+const (
+	TransportTCP Transport = "tcp"
+	TransportUDP Transport = "udp"
+)
+
 const (
 	// ClientIDLength is the expected length of a client's unique identifier (UUID).
 	ClientIDLength = 16
@@ -30,10 +37,11 @@ const (
 // ControlMessage defines the structure for out-of-band communication
 // between the proxy and the backend.
 type ControlMessage struct {
-	Event    EventType `json:"event"`
-	ClientID uuid.UUID `json:"client_id"`
-	ConnPort int       `json:"conn_port,omitempty"`
-	ClientIP string    `json:"client_ip,omitempty"`
+	Event     EventType `json:"event"`
+	ClientID  uuid.UUID `json:"client_id"`
+	ConnPort  int       `json:"conn_port,omitempty"`
+	ClientIP  string    `json:"client_ip,omitempty"`
+	Transport Transport `json:"transport,omitempty"`
 	// Hostname is the virtual host this client connected for. Included on connect.
 	Hostname string `json:"hostname,omitempty"`
 	// IsTLS indicates whether the original connection was negotiated over TLS.

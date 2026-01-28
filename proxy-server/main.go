@@ -90,6 +90,9 @@ func main() {
 	}
 
 	log.Printf("INFO: Public Ports: %v", cfg.RelayPorts)
+	if len(cfg.UDPRelayPorts) > 0 {
+		log.Printf("INFO: Public UDP Ports: %v", cfg.UDPRelayPorts)
+	}
 	if cfg.IdleTimeout() > 0 {
 		log.Printf("INFO: Client idle timeout is %s", cfg.IdleTimeout())
 	}

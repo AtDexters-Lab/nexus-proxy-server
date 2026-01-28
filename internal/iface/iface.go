@@ -2,6 +2,7 @@ package iface
 
 import (
 	"net"
+	"time"
 
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/bandwidth"
 	"github.com/google/uuid"
@@ -12,6 +13,7 @@ import (
 type Hub interface {
 	GetLocalRoutes() []string
 	SelectBackend(hostname string) (Backend, error)
+	UDPFlowIdleTimeout(port int) (time.Duration, bool)
 	GetBandwidthScheduler() *bandwidth.Scheduler
 }
 
@@ -21,6 +23,7 @@ type PeerManager interface {
 	AnnounceLocalRoutes()
 	GetPeerForHostname(hostname string) (Peer, bool)
 	HandleTunnelRequest(p Peer, hostname string, clientID uuid.UUID, clientIP string, connPort int, isTLS bool)
+	ForwardUDP(routeKey string, dstPort int, pc net.PacketConn, clientAddr *net.UDPAddr, payload []byte) error
 }
 
 // Peer represents a single connection to another Nexus node.

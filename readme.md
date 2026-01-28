@@ -167,6 +167,30 @@ Backends may register wildcard hostnames using a single leftmost label (TLS-styl
 - Matching: `a.example.com` matches; `a.b.example.com` does not. Exact hostnames always take precedence over wildcard.
 - Peers announce wildcard patterns as `*.example.com`; routing tables use the suffix `.example.com` internally.
 
+### Port Claims (TCP/UDP)
+
+Backends may optionally claim whole ports (e.g. an authoritative DNS service on 53) in addition to (or instead of) hostnames.
+
+- Configuration:
+  - Enable UDP listeners with `udpRelayPorts` (e.g. `[53]`).
+  - Allowlist claimable ports with `allowedTCPPortClaims` / `allowedUDPPortClaims` (when empty, port claims are disabled).
+- JWT claims:
+
+```json
+{
+  "tcp_ports": [53],
+  "udp_routes": [{ "port": 53, "flow_idle_timeout_seconds": 60 }]
+}
+```
+
+- Routing semantics:
+  - Hostname routing remains primary.
+  - TCP port-claim routing is attempted only when Nexus cannot determine an SNI/Host header.
+- Backend protocol:
+  - `connect` control messages include `transport: "tcp" | "udp"`.
+  - For UDP, each data frame is one datagram.
+  - For port claims, `hostname` is the internal route key (e.g. `tcp:53`, `udp:53`).
+
 ## Reference Backend Client
 
 A complete, working reference implementation for a backend client that connects to Nexus Proxy can be found here:

@@ -198,7 +198,7 @@ func (p *peerImpl) readPump() {
 							bandwidthLoop:
 								for {
 									// Use full message size (header + payload) for consistent accounting with outbound path
-								allowed, waitTime := bandwidthScheduler.RequestSend(backendID, len(message))
+									allowed, waitTime := bandwidthScheduler.RequestSend(backendID, len(message))
 									if allowed {
 										break
 									}
@@ -228,6 +228,10 @@ func (p *peerImpl) readPump() {
 						}
 					}
 				} else {
+					// Otherwise, it may be an outbound UDP flow. If not, treat as inbound tunnel data.
+					if p.manager.HandleOutboundUDPData(clientID, payload) {
+						continue
+					}
 					// Otherwise, it's for an inbound tunnel. Let the manager handle it.
 					p.manager.HandleTunnelData(clientID, payload)
 				}
@@ -246,6 +250,10 @@ func (p *peerImpl) readPump() {
 						p.activeTunnels.Delete(clientID) // Clean up the map.
 					}
 				} else {
+					// Otherwise, it may be an outbound UDP flow.
+					if p.manager.HandleOutboundUDPClose(clientID) {
+						continue
+					}
 					// Otherwise, it's for an inbound tunnel.
 					p.manager.HandleTunnelClose(clientID)
 				}
@@ -313,12 +321,13 @@ func (p *peerImpl) StartTunnel(conn net.Conn, hostname string, isTLS bool) {
 
 	// 1. Send the tunnel request to the peer (as a JSON text message).
 	req := protocol.PeerMessage{
-		Type:     protocol.PeerTunnelRequest,
-		Hostname: hostname,
-		ClientID: clientID,
-		ConnPort: connPort,
-		ClientIP: clientIp,
-		IsTLS:    isTLS,
+		Type:      protocol.PeerTunnelRequest,
+		Hostname:  hostname,
+		ClientID:  clientID,
+		ConnPort:  connPort,
+		ClientIP:  clientIp,
+		Transport: protocol.TransportTCP,
+		IsTLS:     isTLS,
 	}
 	payload, _ := json.Marshal(req)
 	p.Send(payload)

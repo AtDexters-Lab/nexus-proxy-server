@@ -1,30 +1,29 @@
 package hostnames
 
 import (
-    "testing"
-    "github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/require"
+	"testing"
 )
 
 func TestNormalize(t *testing.T) {
-    require.Equal(t, "example.com", Normalize("Example.COM."))
+	require.Equal(t, "example.com", Normalize("Example.COM."))
 }
 
 func TestWildcardValidationAndSuffix(t *testing.T) {
-    require.True(t, IsWildcard("*.example.com"))
-    require.True(t, IsValidWildcard("*.example.com"))
-    require.False(t, IsValidWildcard("*.com"))
-    require.False(t, IsValidWildcard("example.com"))
-    sfx, ok := WildcardSuffix("*.Example.COM")
-    require.True(t, ok)
-    require.Equal(t, ".example.com", sfx)
+	require.True(t, IsWildcard("*.example.com"))
+	require.True(t, IsValidWildcard("*.example.com"))
+	require.False(t, IsValidWildcard("*.com"))
+	require.False(t, IsValidWildcard("example.com"))
+	sfx, ok := WildcardSuffix("*.Example.COM")
+	require.True(t, ok)
+	require.Equal(t, ".example.com", sfx)
 }
 
 func TestFirstDotSuffix(t *testing.T) {
-    sfx, ok := FirstDotSuffix("a.example.com")
-    require.True(t, ok)
-    require.Equal(t, ".example.com", sfx)
+	sfx, ok := FirstDotSuffix("a.example.com")
+	require.True(t, ok)
+	require.Equal(t, ".example.com", sfx)
 
-    _, ok = FirstDotSuffix("localhost")
-    require.False(t, ok)
+	_, ok = FirstDotSuffix("localhost")
+	require.False(t, ok)
 }
-

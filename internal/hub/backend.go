@@ -45,6 +45,8 @@ type Backend struct {
 	validator auth.Validator
 
 	hostnames     []string
+	tcpPorts      []int
+	udpRoutes     []UDPRoutePolicy
 	weight        int
 	policyVersion string
 
@@ -89,6 +91,8 @@ func NewBackend(conn *websocket.Conn, meta *AttestationMetadata, cfg *config.Con
 		config:              cfg,
 		validator:           validator,
 		hostnames:           meta.cloneHostnames(),
+		tcpPorts:            meta.cloneTCPPorts(),
+		udpRoutes:           meta.cloneUDPRoutes(),
 		weight:              meta.Weight,
 		policyVersion:       meta.PolicyVersion,
 		outgoing:            make(chan outboundMessage, 256),
@@ -152,18 +156,25 @@ func (b *Backend) StartPumps() {
 
 func (b *Backend) AddClient(clientConn net.Conn, clientID uuid.UUID, hostname string, isTLS bool) error {
 	var connPort int
-	if tcpAddr, ok := clientConn.LocalAddr().(*net.TCPAddr); ok {
-		connPort = tcpAddr.Port
-	} else {
+	transport := protocol.TransportTCP
+	switch addr := clientConn.LocalAddr().(type) {
+	case *net.TCPAddr:
+		connPort = addr.Port
+		transport = protocol.TransportTCP
+	case *net.UDPAddr:
+		connPort = addr.Port
+		transport = protocol.TransportUDP
+	default:
 		return fmt.Errorf("WARN: Could not determine destination port for client %s", clientID)
 	}
 	msg := protocol.ControlMessage{
-		Event:    protocol.EventConnect,
-		ClientID: clientID,
-		ConnPort: connPort,
-		ClientIP: clientConn.RemoteAddr().String(),
-		Hostname: hostname,
-		IsTLS:    isTLS,
+		Event:     protocol.EventConnect,
+		ClientID:  clientID,
+		ConnPort:  connPort,
+		ClientIP:  clientConn.RemoteAddr().String(),
+		Transport: transport,
+		Hostname:  hostname,
+		IsTLS:     isTLS,
 	}
 
 	if err := b.SendControlMessage(msg); err != nil {
@@ -564,15 +575,36 @@ func (b *Backend) processReauthToken(token, expectedNonce string) error {
 }
 
 func (b *Backend) applyClaims(claims *auth.Claims) error {
-	if len(claims.Hostnames) == 0 {
-		return errors.New("claims missing hostnames")
+	var normalizedHosts []string
+	if len(claims.Hostnames) > 0 {
+		var err error
+		normalizedHosts, err = normalizeHostnames(claims.Hostnames)
+		if err != nil {
+			return err
+		}
 	}
-	normalized, err := normalizeHostnames(claims.Hostnames)
+
+	tcpPorts, err := normalizeTCPPortClaims(b.config, claims.TCPPorts)
 	if err != nil {
 		return err
 	}
-	if !sameStringSets(normalized, b.hostnames) {
+	udpRoutes, err := normalizeUDPRouteClaims(b.config, claims.UDPRoutes)
+	if err != nil {
+		return err
+	}
+
+	if len(normalizedHosts) == 0 && len(tcpPorts) == 0 && len(udpRoutes) == 0 {
+		return errors.New("claims missing hostnames and port claims")
+	}
+
+	if !sameStringSets(normalizedHosts, b.hostnames) {
 		return errors.New("hostnames in token differ from registered set")
+	}
+	if !sameIntSets(tcpPorts, b.tcpPorts) {
+		return errors.New("tcp port claims in token differ from registered set")
+	}
+	if !sameUDPRoutes(udpRoutes, b.udpRoutes) {
+		return errors.New("udp route claims in token differ from registered set")
 	}
 
 	if claims.Weight != 0 && claims.Weight != b.weight {

@@ -29,9 +29,31 @@ relayPorts:
   - 443
   - 80
 
+# UDP ports to listen on for public client traffic (optional).
+# These are treated as L4 UDP and routed via UDP port claims.
+# udpRelayPorts:
+#   - 53
+
 # Time in seconds that a client connection can be idle before being closed.
 # Set to 0 to disable idle timeouts.
 idleTimeoutSeconds: 60
+
+# --- Port Claims (TCP/UDP) ---
+# Backends may optionally "claim" whole ports (e.g. 53) via JWT claims.
+# For safety, claims are only accepted for ports explicitly allowlisted here.
+# When empty/omitted, port claims are disabled.
+#
+# allowedTCPPortClaims:
+#   - 53
+# allowedUDPPortClaims:
+#   - 53
+#
+# UDP flow table bounds (applies only when udpRelayPorts is set):
+# udpMaxFlows: 200000
+# udpMaxDatagramBytes: 2048
+# udpFlowIdleTimeoutDefaultSeconds: 30
+# udpFlowIdleTimeoutMinSeconds: 5
+# udpFlowIdleTimeoutMaxSeconds: 300
 
 # A secret used to authenticate connections with backends.
 # Backends must present a valid JWT signed with this secret unless you

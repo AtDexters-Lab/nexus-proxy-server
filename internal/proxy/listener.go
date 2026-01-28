@@ -25,6 +25,7 @@ type Listener struct {
 	acmeTLS     *tls.Config  // TLS config to satisfy TLS-ALPN-01 on :443
 	wg          sync.WaitGroup
 	listeners   []net.Listener
+	udpConns    []net.PacketConn
 	mu          sync.Mutex
 }
 
@@ -37,6 +38,7 @@ func NewListener(cfg *config.Config, hub iface.Hub, pm iface.PeerManager, acme h
 		acmeHandler: acme,
 		acmeTLS:     acmeTLS,
 		listeners:   make([]net.Listener, 0, len(cfg.RelayPorts)),
+		udpConns:    make([]net.PacketConn, 0, len(cfg.UDPRelayPorts)),
 	}
 }
 
@@ -45,6 +47,10 @@ func (l *Listener) Run() {
 	for _, port := range l.config.RelayPorts {
 		l.wg.Add(1)
 		go l.listenOnPort(port)
+	}
+	for _, port := range l.config.UDPRelayPorts {
+		l.wg.Add(1)
+		go l.listenOnUDPPort(port)
 	}
 	l.wg.Wait()
 	log.Println("INFO: All public listeners have stopped.")
@@ -56,7 +62,10 @@ func (l *Listener) Stop() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for _, listener := range l.listeners {
-		listener.Close()
+		_ = listener.Close()
+	}
+	for _, pc := range l.udpConns {
+		_ = pc.Close()
 	}
 }
 
@@ -86,7 +95,7 @@ func (l *Listener) listenOnPort(port int) {
 }
 
 func (l *Listener) handleConnection(conn net.Conn) {
-	var hostname string
+	var routeKey string
 	var prelude []byte
 	var isTLS bool
 
@@ -97,8 +106,9 @@ func (l *Listener) handleConnection(conn net.Conn) {
 
 	// Try TLS SNI first using a robust aborted handshake.
 	sni, tlsPrelude, tlsErr := PeekSNIAndPrelude(conn, 5*time.Second, 32<<10)
+	tlsDetected := errors.Is(tlsErr, ErrMissingSNI)
 	if tlsErr == nil && sni != "" {
-		hostname = hn.Normalize(sni)
+		routeKey = hn.Normalize(sni)
 		prelude = tlsPrelude
 		isTLS = true
 	} else {
@@ -109,22 +119,22 @@ func (l *Listener) handleConnection(conn net.Conn) {
 		// Fallback to HTTP Host sniffing on plaintext.
 		host, path, httpPrelude, httpErr := PeekHTTPHostAndPrelude(conn, 5*time.Second, 64<<10)
 		if httpErr == nil && host != "" {
-			hostname = host
+			routeKey = host
 			prelude = httpPrelude
 			isTLS = false
 			// Check if it's for our ACME HTTP-01 challenge.
 			hubHostNorm := hn.Normalize(l.config.HubPublicHostname)
-			if l.acmeHandler != nil && hostname == hubHostNorm && localPort == 80 && strings.HasPrefix(path, "/.well-known/acme-challenge/") {
-				log.Printf("INFO: Intercepting HTTP request for proxy's own hostname '%s' on :80 to handle ACME challenge", hostname)
+			if l.acmeHandler != nil && routeKey == hubHostNorm && localPort == 80 && strings.HasPrefix(path, "/.well-known/acme-challenge/") {
+				log.Printf("INFO: Intercepting HTTP request for proxy's own hostname '%s' on :80 to handle ACME challenge", routeKey)
 				simpleHttpServer := &http.Server{Handler: l.acmeHandler, ReadHeaderTimeout: 5 * time.Second}
 				// Reinsert the bytes we consumed into the stream for the HTTP server.
 				connWithPrelude := WithPrelude(conn, prelude)
 				err := simpleHttpServer.Serve(NewSingleConnListener(connWithPrelude))
-				log.Printf("INFO: ACME HTTP handler finished for '%s' on :80: %v", hostname, err)
+				log.Printf("INFO: ACME HTTP handler finished for '%s' on :80: %v", routeKey, err)
 				return
 			}
 		} else {
-			// Neither TLS nor HTTP
+			// Neither TLS (with SNI) nor HTTP (with Host). Attempt a TCP port-claim route.
 			if len(httpPrelude) > 0 {
 				previewLen := len(httpPrelude)
 				if previewLen > 24 {
@@ -134,36 +144,40 @@ func (l *Listener) handleConnection(conn net.Conn) {
 			}
 			if errors.Is(httpErr, ErrHTTPPreludeTooLarge) {
 				log.Printf("WARN: HTTP prelude exceeded limit for %s on :%d; dropping connection", conn.RemoteAddr(), localPort)
+				_ = conn.Close()
+				return
 			}
-			log.Printf("WARN: Could not determine hostname for %s on :%d: tlsErr=%v httpErr=%v. Closing connection.", conn.RemoteAddr(), localPort, tlsErr, httpErr)
-			conn.Close()
-			return
+
+			routeKey = "tcp:" + strconv.Itoa(localPort)
+			prelude = httpPrelude
+			isTLS = tlsDetected
+			log.Printf("INFO: No SNI/Host for %s on :%d; attempting port-claim route '%s' (TLS detected: %v)", conn.RemoteAddr(), localPort, routeKey, tlsDetected)
 		}
 	}
 
-	log.Printf("INFO: Identified request for hostname '%s' from %s on :%d (TLS: %v)", hostname, conn.RemoteAddr(), localPort, isTLS)
+	log.Printf("INFO: Identified request for route '%s' from %s on :%d (TLS: %v)", routeKey, conn.RemoteAddr(), localPort, isTLS)
 
 	// First, try to find a local backend.
-	backend, err := l.hub.SelectBackend(hostname)
+	backend, err := l.hub.SelectBackend(routeKey)
 	if err == nil {
 		// Forward the prelude first, then stream the rest.
-		client := NewClientWithPrelude(conn, backend, l.config, hostname, prelude, isTLS)
-		log.Printf("INFO: [LOCAL] Routing client %s [%s] for hostname '%s' to backend %s", conn.RemoteAddr(), client.id, hostname, backend.ID())
+		client := NewClientWithPrelude(conn, backend, l.config, routeKey, prelude, isTLS)
+		log.Printf("INFO: [LOCAL] Routing client %s [%s] for route '%s' to backend %s", conn.RemoteAddr(), client.id, routeKey, backend.ID())
 		client.Start()
 		return
 	}
 
 	// If no local backend, check peers and initiate a tunnel.
 	if l.peerManager != nil {
-		if remotePeer, ok := l.peerManager.GetPeerForHostname(hostname); ok {
-			log.Printf("INFO: [TUNNEL] No local backend for '%s'. Tunneling to peer %s", hostname, remotePeer.Addr())
+		if remotePeer, ok := l.peerManager.GetPeerForHostname(routeKey); ok {
+			log.Printf("INFO: [TUNNEL] No local backend for '%s'. Tunneling to peer %s", routeKey, remotePeer.Addr())
 			// Ensure the tunneled peer sees the bytes we consumed during sniffing.
 			connWithPrelude := WithPrelude(conn, prelude)
-			remotePeer.StartTunnel(connWithPrelude, hostname, isTLS)
+			remotePeer.StartTunnel(connWithPrelude, routeKey, isTLS)
 			return
 		}
 	}
 
-	log.Printf("WARN: No local or remote backend available for hostname '%s' for client %s", hostname, conn.RemoteAddr())
-	conn.Close()
+	log.Printf("WARN: No local or remote backend available for route '%s' for client %s", routeKey, conn.RemoteAddr())
+	_ = conn.Close()
 }
