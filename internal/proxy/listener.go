@@ -160,8 +160,9 @@ func (l *Listener) handleConnection(conn net.Conn) {
 	// First, try to find a local backend.
 	backend, err := l.hub.SelectBackend(routeKey)
 	if err == nil {
-		// Forward the prelude first, then stream the rest.
-		client := NewClientWithPrelude(conn, backend, l.config, routeKey, prelude, isTLS)
+		// Wrap in PausableConn for flow control support
+		pausableConn := NewPausableConn(conn)
+		client := NewClientWithPrelude(pausableConn, backend, l.config, routeKey, prelude, isTLS)
 		log.Printf("INFO: [LOCAL] Routing client %s [%s] for route '%s' to backend %s", conn.RemoteAddr(), client.id, routeKey, backend.ID())
 		client.Start()
 		return

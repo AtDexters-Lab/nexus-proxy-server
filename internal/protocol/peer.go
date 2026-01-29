@@ -4,8 +4,10 @@ import "github.com/google/uuid"
 
 // Control bytes for peer binary messages for tunneled data.
 const (
-	PeerTunnelData  byte = 0x11
-	PeerTunnelClose byte = 0x12
+	PeerTunnelData   byte = 0x11
+	PeerTunnelClose  byte = 0x12
+	PeerTunnelPause  byte = 0x13 // Propagate pause to tunnel origin
+	PeerTunnelResume byte = 0x14 // Propagate resume to tunnel origin
 )
 
 // PeerMessageType defines the type of a JSON control message sent between peers.

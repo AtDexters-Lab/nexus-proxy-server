@@ -32,6 +32,10 @@ const (
 	EventPingClient EventType = "ping_client"
 	// EventPongClient is sent from the proxy to a backend in response to a ping.
 	EventPongClient EventType = "pong_client"
+	// EventPauseStream is sent from a backend to pause reading from a client.
+	EventPauseStream EventType = "pause_stream"
+	// EventResumeStream is sent from a backend to resume reading from a client.
+	EventResumeStream EventType = "resume_stream"
 )
 
 // ControlMessage defines the structure for out-of-band communication

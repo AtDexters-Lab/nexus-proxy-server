@@ -426,8 +426,36 @@ func (b *Backend) handleControlMessage(msg protocol.ControlMessage) {
 				_ = conn.Close()
 			}
 		}
+	case protocol.EventPauseStream:
+		b.handlePauseStream(msg.ClientID)
+	case protocol.EventResumeStream:
+		b.handleResumeStream(msg.ClientID)
 	default:
 		log.Printf("WARN: Unknown control event '%s' from backend %s", msg.Event, b.id)
+	}
+}
+
+func (b *Backend) handlePauseStream(clientID uuid.UUID) {
+	rawConn, ok := b.clients.Load(clientID)
+	if !ok {
+		log.Printf("WARN: pause_stream for unknown client %s on backend %s (ignored)", clientID, b.id)
+		return
+	}
+	if pausable, ok := rawConn.(interface{ Pause() }); ok {
+		pausable.Pause()
+		log.Printf("DEBUG: Paused stream for client %s on backend %s", clientID, b.id)
+	}
+}
+
+func (b *Backend) handleResumeStream(clientID uuid.UUID) {
+	rawConn, ok := b.clients.Load(clientID)
+	if !ok {
+		log.Printf("WARN: resume_stream for unknown client %s on backend %s (ignored)", clientID, b.id)
+		return
+	}
+	if pausable, ok := rawConn.(interface{ Resume() }); ok {
+		pausable.Resume()
+		log.Printf("DEBUG: Resumed stream for client %s on backend %s", clientID, b.id)
 	}
 }
 

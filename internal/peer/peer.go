@@ -258,6 +258,36 @@ func (p *peerImpl) readPump() {
 					p.manager.HandleTunnelClose(clientID)
 				}
 
+			case protocol.PeerTunnelPause:
+				if len(message) < 1+protocol.ClientIDLength {
+					continue
+				}
+				var clientID uuid.UUID
+				copy(clientID[:], message[1:1+protocol.ClientIDLength])
+				if rawConn, ok := p.activeTunnels.Load(clientID); ok {
+					if pausable, ok := rawConn.(interface{ Pause() }); ok {
+						pausable.Pause()
+						log.Printf("DEBUG: [PEER] Paused tunnel for client %s from %s", clientID, p.addr)
+					}
+				} else {
+					log.Printf("WARN: [PEER] pause_tunnel for unknown client %s (ignored)", clientID)
+				}
+
+			case protocol.PeerTunnelResume:
+				if len(message) < 1+protocol.ClientIDLength {
+					continue
+				}
+				var clientID uuid.UUID
+				copy(clientID[:], message[1:1+protocol.ClientIDLength])
+				if rawConn, ok := p.activeTunnels.Load(clientID); ok {
+					if pausable, ok := rawConn.(interface{ Resume() }); ok {
+						pausable.Resume()
+						log.Printf("DEBUG: [PEER] Resumed tunnel for client %s from %s", clientID, p.addr)
+					}
+				} else {
+					log.Printf("WARN: [PEER] resume_tunnel for unknown client %s (ignored)", clientID)
+				}
+
 			default:
 				log.Printf("WARN: [PEER] Received unknown binary control byte from %s", p.addr)
 			}
@@ -332,7 +362,9 @@ func (p *peerImpl) StartTunnel(conn net.Conn, hostname string, isTLS bool) {
 	payload, _ := json.Marshal(req)
 	p.Send(payload)
 
-	p.activeTunnels.Store(clientID, conn)
+	// Wrap in PausableConn for flow control
+	pausableConn := proxy.NewPausableConn(conn)
+	p.activeTunnels.Store(clientID, pausableConn)
 	p.tunnelHostnames.Store(clientID, hostname) // Track hostname for bandwidth accounting
 	defer p.activeTunnels.Delete(clientID)
 	defer p.tunnelHostnames.Delete(clientID)
@@ -352,7 +384,7 @@ func (p *peerImpl) StartTunnel(conn net.Conn, hostname string, isTLS bool) {
 	buf := *bufPtr
 
 	for {
-		n, err := conn.Read(buf)
+		n, err := pausableConn.Read(buf)
 		if err != nil {
 			// Connection closed or error from client side.
 			break
