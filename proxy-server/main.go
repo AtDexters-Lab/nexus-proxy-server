@@ -16,6 +16,7 @@ import (
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/hub"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/peer"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/proxy"
+	"github.com/AtDexters-Lab/nexus-proxy-server/internal/registration"
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -110,6 +111,14 @@ func main() {
 		log.Fatalf("FATAL: Failed to initialize token validator: %v", err)
 	}
 
+	var registrationClient *registration.Client
+	if cfg.RegistrationEnabled() {
+		registrationClient, err = registration.NewClient(cfg, hubTlsConfig)
+		if err != nil {
+			log.Fatalf("FATAL: Failed to initialize registration client: %v", err)
+		}
+	}
+
 	backendHub := hub.New(cfg, hubTlsConfig, validator)
 	peerManager := peer.NewManager(cfg, backendHub, hubTlsConfig)
 	clientListener := proxy.NewListener(cfg, backendHub, peerManager, acmeHandler, hubTlsConfig)
@@ -134,6 +143,14 @@ func main() {
 		peerManager.Run(ctx)
 	}()
 
+	if registrationClient != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			registrationClient.Run(ctx)
+		}()
+	}
+
 	// --- 3. Graceful Shutdown ---
 	shutdownChan := make(chan os.Signal, 1)
 	signal.Notify(shutdownChan, syscall.SIGINT, syscall.SIGTERM)
@@ -146,7 +163,12 @@ func main() {
 	// --- 4. Cleanup ---
 	log.Println("INFO: Initiating graceful shutdown...")
 
-	// Stop the peer manager first to prevent new tunneled connections.
+	// Stop registration first so orchestrator begins inactivity countdown while we drain.
+	if registrationClient != nil {
+		registrationClient.Stop()
+	}
+
+	// Stop the peer manager to prevent new tunneled connections.
 	peerManager.Stop()
 
 	// Then, stop the public-facing listeners.

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"time"
 
@@ -43,6 +44,11 @@ type Config struct {
 	// Port claim allowlists (security controls). When empty, port claims are disabled.
 	AllowedTCPPortClaims []int `yaml:"allowedTCPPortClaims"`
 	AllowedUDPPortClaims []int `yaml:"allowedUDPPortClaims"`
+
+	// Orchestrator registration (optional — omit to run without DNS orchestration)
+	RegistrationURL        string `yaml:"registrationURL"`
+	RegistrationCACertFile string `yaml:"registrationCACertFile"` // CA to verify orchestrator's server cert (system pool if empty)
+	Region                 string `yaml:"region"`                 // sent in registration body
 
 	// UDP flow table and payload bounds (applies to udpRelayPorts).
 	UDPMaxFlows                      int `yaml:"udpMaxFlows"`
@@ -118,6 +124,11 @@ func (c *Config) UDPFlowIdleTimeoutMax() time.Duration {
 	return time.Duration(c.UDPFlowIdleTimeoutMaxSeconds) * time.Second
 }
 
+// RegistrationEnabled returns true if orchestrator registration is configured.
+func (c *Config) RegistrationEnabled() bool {
+	return c.RegistrationURL != ""
+}
+
 // validate performs comprehensive validation of the loaded configuration.
 func (c *Config) validate() error {
 	if c.BackendListenAddress == "" {
@@ -137,6 +148,20 @@ func (c *Config) validate() error {
 	}
 	if c.MaintenanceGraceDefaultSeconds < 0 {
 		return fmt.Errorf("maintenanceGraceDefaultSeconds cannot be negative")
+	}
+
+	// Validate registration URL scheme and host if set.
+	if c.RegistrationURL != "" {
+		u, err := url.Parse(c.RegistrationURL)
+		if err != nil {
+			return fmt.Errorf("registrationURL is not a valid URL: %w", err)
+		}
+		if u.Scheme != "https" {
+			return fmt.Errorf("registrationURL must use https scheme, got %q", u.Scheme)
+		}
+		if u.Host == "" {
+			return fmt.Errorf("registrationURL must include a host")
+		}
 	}
 
 	// Validate TLS configuration: must be either manual or automatic, but not both.
