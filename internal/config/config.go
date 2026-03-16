@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"time"
@@ -209,18 +210,37 @@ func (c *Config) validate() error {
 		return fmt.Errorf("udpFlowIdleTimeoutMaxSeconds cannot be negative")
 	}
 
-	// Warn about UDP relay ports without matching allowlist entries.
-	if len(c.UDPRelayPorts) > 0 {
-		allowed := make(map[int]struct{}, len(c.AllowedUDPPortClaims))
-		for _, p := range c.AllowedUDPPortClaims {
-			allowed[p] = struct{}{}
+	// warnPortMismatch warns about ports present in one config list but absent from another.
+	warnPortMismatch := func(ports, against []int, portsKey, againstKey, reason string) {
+		if len(ports) == 0 {
+			return
 		}
-		for _, p := range c.UDPRelayPorts {
-			if _, ok := allowed[p]; !ok {
-				fmt.Fprintf(os.Stderr, "WARN: udpRelayPorts contains port %d which is not in allowedUDPPortClaims; no backend will be able to claim it\n", p)
+		set := make(map[int]struct{}, len(against))
+		for _, p := range against {
+			set[p] = struct{}{}
+		}
+		seen := make(map[int]struct{}, len(ports))
+		for _, p := range ports {
+			if _, dup := seen[p]; dup {
+				continue
+			}
+			seen[p] = struct{}{}
+			if _, ok := set[p]; !ok {
+				log.Printf("WARN: %s contains port %d but %s does not; %s", portsKey, p, againstKey, reason)
 			}
 		}
 	}
+
+	// Warn when claimable ports have no matching relay listener (dead routes).
+	warnPortMismatch(c.AllowedTCPPortClaims, c.RelayPorts, "allowedTCPPortClaims", "relayPorts",
+		"backends can claim it but no listener exists to serve traffic")
+	warnPortMismatch(c.AllowedUDPPortClaims, c.UDPRelayPorts, "allowedUDPPortClaims", "udpRelayPorts",
+		"backends can claim it but no listener exists to serve traffic")
+
+	// Reverse check: warn about UDP relay ports no backend can claim.
+	// TCP relay ports are not checked because they also serve hostname-based routing.
+	warnPortMismatch(c.UDPRelayPorts, c.AllowedUDPPortClaims, "udpRelayPorts", "allowedUDPPortClaims",
+		"no backend will be able to claim it")
 
 	return nil
 }
