@@ -85,6 +85,16 @@ peerAuthentication:
   trustedDomainSuffixes:
     - ".proxy.example.com"
 
+# --- Orchestrator Registration (Optional) ---
+# When configured, Nexus periodically registers with an orchestrator (e.g. Namek)
+# via mTLS so it can populate DNS records routing device traffic to this relay.
+# The hub TLS cert is reused for mTLS client auth — no separate cert needed.
+# Omit registrationURL to run without DNS orchestration.
+#
+# registrationURL: "https://namek.example.com/internal/v1/nexus/register"
+# registrationCACertFile: "/path/to/orchestrator-ca.pem"  # CA to verify orchestrator's server cert (system pool if empty)
+# region: "us-west-2"                                      # optional, sent in registration body
+
 # Total bandwidth limit for all backends combined, in Mbps.
 # The bandwidth is distributed fairly among all active backends using
 # Deficit Round Robin (DRR) algorithm. This ensures:
