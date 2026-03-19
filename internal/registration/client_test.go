@@ -115,6 +115,7 @@ func TestRegister_Success(t *testing.T) {
 		var body registerRequest
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
 		assert.Equal(t, "us-west-2", body.Region)
+		assert.Equal(t, 8443, body.BackendPort)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(registerResponse{HeartbeatInterval: 30})
@@ -130,6 +131,7 @@ func TestRegister_Success(t *testing.T) {
 	caFile.Close()
 
 	cfg := &config.Config{
+		BackendListenAddress:   ":8443",
 		RegistrationURL:        server.URL,
 		RegistrationCACertFile: caFile.Name(),
 		Region:                 "us-west-2",
@@ -166,7 +168,7 @@ func TestRegister_PermanentErrors(t *testing.T) {
 			})
 			server := newMTLSTestServer(t, caPool, cert, handler)
 
-			cfg := &config.Config{RegistrationURL: server.URL}
+			cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
 			hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
 			client := newTestClient(t, cfg, hubTlsConfig, caPool)
 
@@ -186,7 +188,7 @@ func TestRegister_RetryableErrors(t *testing.T) {
 		})
 		server := newMTLSTestServer(t, caPool, cert, handler)
 
-		cfg := &config.Config{RegistrationURL: server.URL}
+		cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
 		hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
 		client := newTestClient(t, cfg, hubTlsConfig, caPool)
 
@@ -202,7 +204,7 @@ func TestRegister_RetryableErrors(t *testing.T) {
 		})
 		server := newMTLSTestServer(t, caPool, cert, handler)
 
-		cfg := &config.Config{RegistrationURL: server.URL}
+		cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
 		hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
 		client := newTestClient(t, cfg, hubTlsConfig, caPool)
 
@@ -220,7 +222,7 @@ func TestRegister_RetryableErrors(t *testing.T) {
 		})
 		server := newMTLSTestServer(t, caPool, cert, handler)
 
-		cfg := &config.Config{RegistrationURL: server.URL}
+		cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
 		hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
 		client := newTestClient(t, cfg, hubTlsConfig, caPool)
 
@@ -235,7 +237,7 @@ func TestRegister_RetryableErrors(t *testing.T) {
 		})
 		server := newMTLSTestServer(t, caPool, cert, handler)
 
-		cfg := &config.Config{RegistrationURL: server.URL}
+		cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
 		hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
 		client := newTestClient(t, cfg, hubTlsConfig, caPool)
 
@@ -253,7 +255,7 @@ func TestRegister_HeartbeatClamp(t *testing.T) {
 	})
 	server := newMTLSTestServer(t, caPool, cert, handler)
 
-	cfg := &config.Config{RegistrationURL: server.URL}
+	cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
 	hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
 	client := newTestClient(t, cfg, hubTlsConfig, caPool)
 
@@ -270,12 +272,13 @@ func TestRegister_EmptyRegion(t *testing.T) {
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
 		_, hasRegion := body["region"]
 		assert.False(t, hasRegion, "empty region should be omitted via omitempty")
+		assert.Equal(t, float64(8443), body["backendPort"], "backendPort must always be present")
 
 		json.NewEncoder(w).Encode(registerResponse{HeartbeatInterval: 30})
 	})
 	server := newMTLSTestServer(t, caPool, cert, handler)
 
-	cfg := &config.Config{RegistrationURL: server.URL}
+	cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
 	hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
 	client := newTestClient(t, cfg, hubTlsConfig, caPool)
 
@@ -294,7 +297,7 @@ func TestRunAndStop(t *testing.T) {
 	})
 	server := newMTLSTestServer(t, caPool, cert, handler)
 
-	cfg := &config.Config{RegistrationURL: server.URL}
+	cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
 	hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
 	client := newTestClient(t, cfg, hubTlsConfig, caPool)
 
@@ -318,7 +321,7 @@ func TestRunPermanentError(t *testing.T) {
 	})
 	server := newMTLSTestServer(t, caPool, cert, handler)
 
-	cfg := &config.Config{RegistrationURL: server.URL}
+	cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
 	hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
 	client := newTestClient(t, cfg, hubTlsConfig, caPool)
 
@@ -340,6 +343,7 @@ func TestRunPermanentError(t *testing.T) {
 
 func TestNewClient_InvalidCACert(t *testing.T) {
 	cfg := &config.Config{
+		BackendListenAddress:   ":8443",
 		RegistrationURL:        "https://example.com/register",
 		RegistrationCACertFile: "/nonexistent/ca.pem",
 	}
@@ -348,6 +352,33 @@ func TestNewClient_InvalidCACert(t *testing.T) {
 	_, err := NewClient(cfg, hubTlsConfig)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to read registration CA cert")
+}
+
+func TestNewClient_InvalidBackendPort(t *testing.T) {
+	hubTlsConfig := &tls.Config{}
+
+	tests := []struct {
+		name    string
+		addr    string
+		wantErr string
+	}{
+		{"missing port", "no-port", "failed to parse port"},
+		{"non-numeric port", ":abc", "invalid port"},
+		{"port zero", ":0", "out of valid range"},
+		{"port too large", ":99999", "out of valid range"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{
+				BackendListenAddress: tt.addr,
+				RegistrationURL:     "https://example.com/register",
+			}
+			_, err := NewClient(cfg, hubTlsConfig)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
 }
 
 func TestParseRetryAfter(t *testing.T) {

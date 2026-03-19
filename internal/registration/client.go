@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -27,7 +28,8 @@ const (
 )
 
 type registerRequest struct {
-	Region string `json:"region,omitempty"`
+	Region      string `json:"region,omitempty"`
+	BackendPort int    `json:"backendPort"`
 }
 
 type registerResponse struct {
@@ -38,6 +40,7 @@ type registerResponse struct {
 type Client struct {
 	registrationURL string
 	region          string
+	backendPort     int
 	httpClient      *http.Client
 
 	// internalCtx/cancel provides a cancellation signal owned by this Client.
@@ -75,11 +78,24 @@ func NewClient(cfg *config.Config, hubTlsConfig *tls.Config) (*Client, error) {
 		clientTLS.RootCAs = pool
 	}
 
+	_, portStr, err := net.SplitHostPort(cfg.BackendListenAddress)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse port from backendListenAddress %q: %w", cfg.BackendListenAddress, err)
+	}
+	backendPort, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid port in backendListenAddress %q: %w", cfg.BackendListenAddress, err)
+	}
+	if backendPort < 1 || backendPort > 65535 {
+		return nil, fmt.Errorf("backendPort %d from backendListenAddress %q out of valid range 1-65535", backendPort, cfg.BackendListenAddress)
+	}
+
 	internalCtx, cancel := context.WithCancel(context.Background())
 
 	c := &Client{
 		registrationURL: cfg.RegistrationURL,
 		region:          cfg.Region,
+		backendPort:     backendPort,
 		httpClient: &http.Client{
 			Timeout:   httpTimeout,
 			Transport: &http.Transport{TLSClientConfig: clientTLS},
@@ -90,9 +106,9 @@ func NewClient(cfg *config.Config, hubTlsConfig *tls.Config) (*Client, error) {
 	}
 
 	if cfg.HubPublicHostname != "" {
-		log.Printf("INFO: [REGISTRATION] Client configured: url=%s hostname=%s", c.registrationURL, cfg.HubPublicHostname)
+		log.Printf("INFO: [REGISTRATION] Client configured: url=%s hostname=%s backendPort=%d", c.registrationURL, cfg.HubPublicHostname, backendPort)
 	} else {
-		log.Printf("INFO: [REGISTRATION] Client configured: url=%s cert=%s", c.registrationURL, cfg.HubTlsCertFile)
+		log.Printf("INFO: [REGISTRATION] Client configured: url=%s cert=%s backendPort=%d", c.registrationURL, cfg.HubTlsCertFile, backendPort)
 	}
 	return c, nil
 }
@@ -158,7 +174,7 @@ func (c *Client) Stop() {
 // register performs a single registration attempt. Returns the heartbeat
 // interval on success or a classified error.
 func (c *Client) register(ctx context.Context) (time.Duration, error) {
-	body, _ := json.Marshal(registerRequest{Region: c.region})
+	body, _ := json.Marshal(registerRequest{Region: c.region, BackendPort: c.backendPort})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.registrationURL, bytes.NewReader(body))
 	if err != nil {
 		return 0, fmt.Errorf("build request: %w", err)
