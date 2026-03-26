@@ -77,13 +77,11 @@ type Backend struct {
 }
 
 // NewBackend creates a new Backend instance.
-func NewBackend(conn *websocket.Conn, meta *AttestationMetadata, cfg *config.Config, validator auth.Validator) *Backend {
+func NewBackend(conn *websocket.Conn, meta *AttestationMetadata, cfg *config.Config, validator auth.Validator, httpClient *http.Client) *Backend {
 	maintenanceCap := meta.MaintenanceCap
 	if !meta.HasMaintenanceCap {
 		maintenanceCap = cfg.MaintenanceGraceDefault()
 	}
-
-	httpClient := &http.Client{Timeout: cfg.RemoteVerifierTimeout()}
 
 	b := &Backend{
 		id:                  uuid.New().String(),

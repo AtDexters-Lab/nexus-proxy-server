@@ -65,7 +65,6 @@ backendsJWTSecret: "a-very-strong-jwt-secret-for-the-central-authorizer"
 # backendsJWTSecret. If you want Nexus to rely solely on the remote verifier,
 # comment out backendsJWTSecret above.
 # remoteVerifierURL: "https://verifier.example.com/validate"
-# remoteVerifierTimeoutSeconds: 5
 
 # Default maintenance grace window (seconds) when authorizer_status_uri claims
 # are present but do not specify a cap.
@@ -92,7 +91,6 @@ peerAuthentication:
 # Omit registrationURL to run without DNS orchestration.
 #
 # registrationURL: "https://namek.example.com/internal/v1/nexus/register"
-# registrationCACertFile: "/path/to/orchestrator-ca.pem"  # CA to verify orchestrator's server cert (system pool if empty)
 # region: "us-west-2"                                      # optional, sent in registration body
 
 # Total bandwidth limit for all backends combined, in Mbps.

@@ -35,7 +35,7 @@ func TestBackendStartPumpsTerminatesWhenConnCloses(t *testing.T) {
 	backendConn := <-serverConnCh
 	cfg := &config.Config{BackendsJWTSecret: "secret"}
 	meta := &hub.AttestationMetadata{Hostnames: []string{"example.com"}, Weight: 1}
-	b := hub.NewBackend(backendConn, meta, cfg, stubValidator{})
+	b := hub.NewBackend(backendConn, meta, cfg, stubValidator{}, &http.Client{})
 
 	done := make(chan struct{})
 	go func() {

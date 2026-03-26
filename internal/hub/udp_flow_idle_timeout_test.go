@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"net/http"
 	"testing"
 	"time"
 
@@ -11,7 +12,7 @@ import (
 func TestUDPFlowIdleTimeout_TracksConnectedBackends(t *testing.T) {
 	t.Parallel()
 
-	h := New(&config.Config{}, nil, nil)
+	h := New(&config.Config{}, nil, nil, &http.Client{})
 
 	h.trackUDPFlowIdleTimeout("b1", []UDPRoutePolicy{{Port: 53, FlowIdleTimeout: 10 * time.Second}})
 	d, ok := h.UDPFlowIdleTimeout(53)

@@ -7,10 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
 	"github.com/golang-jwt/jwt/v5"
 )
+
+const remoteVerifierTimeout = 10 * time.Second
 
 // Validator validates backend attestation tokens and returns parsed claims.
 type Validator interface {
@@ -19,7 +22,7 @@ type Validator interface {
 
 // NewValidator returns a Validator that uses a remote verifier when configured
 // and falls back to local HMAC validation with backendsJWTSecret.
-func NewValidator(cfg *config.Config) (Validator, error) {
+func NewValidator(cfg *config.Config, httpClient *http.Client) (Validator, error) {
 	var local Validator
 	if cfg.BackendsJWTSecret != "" {
 		local = &localValidator{secret: []byte(cfg.BackendsJWTSecret)}
@@ -32,11 +35,9 @@ func NewValidator(cfg *config.Config) (Validator, error) {
 		return local, nil
 	}
 
-	timeout := cfg.RemoteVerifierTimeout()
-	client := &http.Client{Timeout: timeout}
 	remote := &remoteValidator{
 		url:      cfg.RemoteVerifierURL,
-		client:   client,
+		client:   httpClient,
 		fallback: local,
 	}
 	return remote, nil
@@ -80,12 +81,15 @@ type remoteResponse struct {
 }
 
 func (v *remoteValidator) Validate(ctx context.Context, token string) (*Claims, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, remoteVerifierTimeout)
+	defer cancel()
+
 	payload, err := json.Marshal(remoteRequest{Token: token})
 	if err != nil {
 		return nil, fmt.Errorf("marshal remote verifier request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, v.url, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, v.url, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("create remote verifier request: %w", err)
 	}

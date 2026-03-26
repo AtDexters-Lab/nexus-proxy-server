@@ -103,23 +103,25 @@ func main() {
 		log.Println("INFO: Bandwidth management disabled (unlimited)")
 	}
 
+	outboundClient := buildOutboundHTTPClient(cfg, hubTlsConfig)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 
-	validator, err := auth.NewValidator(cfg)
+	validator, err := auth.NewValidator(cfg, outboundClient)
 	if err != nil {
 		log.Fatalf("FATAL: Failed to initialize token validator: %v", err)
 	}
 
 	var registrationClient *registration.Client
 	if cfg.RegistrationEnabled() {
-		registrationClient, err = registration.NewClient(cfg, hubTlsConfig)
+		registrationClient, err = registration.NewClient(cfg, outboundClient)
 		if err != nil {
 			log.Fatalf("FATAL: Failed to initialize registration client: %v", err)
 		}
 	}
 
-	backendHub := hub.New(cfg, hubTlsConfig, validator)
+	backendHub := hub.New(cfg, hubTlsConfig, validator, outboundClient)
 	peerManager := peer.NewManager(cfg, backendHub, hubTlsConfig)
 	clientListener := proxy.NewListener(cfg, backendHub, peerManager, acmeHandler, hubTlsConfig)
 
@@ -177,6 +179,10 @@ func main() {
 	// Finally, stop the backend hub.
 	backendHub.Stop()
 
+	// All consumers of outboundClient (registration, hub, validator) are stopped;
+	// safe to clean up idle connections.
+	outboundClient.CloseIdleConnections()
+
 	// Cancel the main context to signal all other goroutines.
 	cancel()
 
@@ -184,4 +190,26 @@ func main() {
 	wg.Wait()
 
 	log.Println("INFO: Shutdown complete. Goodbye.")
+}
+
+// buildOutboundHTTPClient creates an HTTP client that presents the hub TLS
+// certificate as client identity for mTLS, using the system cert pool for
+// server verification. No client-level timeout is set; consumers apply
+// per-request context timeouts.
+func buildOutboundHTTPClient(cfg *config.Config, hubTlsConfig *tls.Config) *http.Client {
+	clientTLS := &tls.Config{}
+	if cfg.HubPublicHostname != "" && hubTlsConfig.GetCertificate != nil {
+		hostname := cfg.HubPublicHostname
+		clientTLS.GetClientCertificate = func(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return hubTlsConfig.GetCertificate(&tls.ClientHelloInfo{ServerName: hostname})
+		}
+	} else if len(hubTlsConfig.Certificates) > 0 {
+		clientTLS.Certificates = hubTlsConfig.Certificates
+	}
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy:           http.ProxyFromEnvironment,
+			TLSClientConfig: clientTLS,
+		},
+	}
 }

@@ -3,8 +3,6 @@ package registration
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,7 +10,6 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
-	"os"
 	"strconv"
 	"time"
 
@@ -50,34 +47,9 @@ type Client struct {
 	done        chan struct{}
 }
 
-// NewClient creates a registration client. The hub TLS config is reused for
-// mTLS client authentication, following the same pattern as peer connections.
-func NewClient(cfg *config.Config, hubTlsConfig *tls.Config) (*Client, error) {
-	clientTLS := &tls.Config{}
-
-	// Reuse hub cert for mTLS client auth (same logic as peer.go:52-76).
-	if cfg.HubPublicHostname != "" && hubTlsConfig.GetCertificate != nil {
-		hostname := cfg.HubPublicHostname
-		clientTLS.GetClientCertificate = func(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-			return hubTlsConfig.GetCertificate(&tls.ClientHelloInfo{ServerName: hostname})
-		}
-	} else if len(hubTlsConfig.Certificates) > 0 {
-		clientTLS.Certificates = hubTlsConfig.Certificates
-	}
-
-	// Custom CA for verifying the orchestrator's server cert.
-	if cfg.RegistrationCACertFile != "" {
-		caCert, err := os.ReadFile(cfg.RegistrationCACertFile)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read registration CA cert %s: %w", cfg.RegistrationCACertFile, err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(caCert) {
-			return nil, fmt.Errorf("registration CA cert file contains no valid certificates: %s", cfg.RegistrationCACertFile)
-		}
-		clientTLS.RootCAs = pool
-	}
-
+// NewClient creates a registration client. The provided httpClient should be
+// configured with the hub TLS certificate for mTLS client authentication.
+func NewClient(cfg *config.Config, httpClient *http.Client) (*Client, error) {
 	_, portStr, err := net.SplitHostPort(cfg.BackendListenAddress)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse port from backendListenAddress %q: %w", cfg.BackendListenAddress, err)
@@ -96,20 +68,13 @@ func NewClient(cfg *config.Config, hubTlsConfig *tls.Config) (*Client, error) {
 		registrationURL: cfg.RegistrationURL,
 		region:          cfg.Region,
 		backendPort:     backendPort,
-		httpClient: &http.Client{
-			Timeout:   httpTimeout,
-			Transport: &http.Transport{TLSClientConfig: clientTLS},
-		},
-		internalCtx: internalCtx,
-		cancel:      cancel,
-		done:        make(chan struct{}),
+		httpClient:      httpClient,
+		internalCtx:     internalCtx,
+		cancel:          cancel,
+		done:            make(chan struct{}),
 	}
 
-	if cfg.HubPublicHostname != "" {
-		log.Printf("INFO: [REGISTRATION] Client configured: url=%s hostname=%s backendPort=%d", c.registrationURL, cfg.HubPublicHostname, backendPort)
-	} else {
-		log.Printf("INFO: [REGISTRATION] Client configured: url=%s cert=%s backendPort=%d", c.registrationURL, cfg.HubTlsCertFile, backendPort)
-	}
+	log.Printf("INFO: [REGISTRATION] Client configured: url=%s backendPort=%d", c.registrationURL, backendPort)
 	return c, nil
 }
 
@@ -168,14 +133,16 @@ func (c *Client) Run(parentCtx context.Context) {
 func (c *Client) Stop() {
 	c.cancel()
 	<-c.done
-	c.httpClient.CloseIdleConnections()
 }
 
 // register performs a single registration attempt. Returns the heartbeat
 // interval on success or a classified error.
 func (c *Client) register(ctx context.Context) (time.Duration, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, httpTimeout)
+	defer cancel()
+
 	body, _ := json.Marshal(registerRequest{Region: c.region, BackendPort: c.backendPort})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.registrationURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.registrationURL, bytes.NewReader(body))
 	if err != nil {
 		return 0, fmt.Errorf("build request: %w", err)
 	}

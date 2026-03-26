@@ -2,6 +2,7 @@ package hub_test
 
 import (
 	"log"
+	"net/http"
 	"testing"
 
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
@@ -15,7 +16,7 @@ func TestLoadBalancer(t *testing.T) {
 	cfg := &config.Config{BackendsJWTSecret: "secret"}
 	newBackend := func(host string, weight int) *hub.Backend {
 		meta := &hub.AttestationMetadata{Hostnames: []string{host}, Weight: weight}
-		return hub.NewBackend(nil, meta, cfg, stubValidator{})
+		return hub.NewBackend(nil, meta, cfg, stubValidator{}, &http.Client{})
 	}
 
 	// Test empty pool

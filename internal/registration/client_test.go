@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,8 +23,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// generateSelfSignedCert creates a self-signed CA and leaf cert for testing.
-func generateTestCerts(t *testing.T) (caCertPEM []byte, tlsCert tls.Certificate, caPool *x509.CertPool) {
+// generateTestCerts creates a self-signed CA and leaf cert for testing.
+func generateTestCerts(t *testing.T) (tlsCert tls.Certificate, caPool *x509.CertPool) {
 	t.Helper()
 
 	// Generate CA key and cert.
@@ -44,7 +43,6 @@ func generateTestCerts(t *testing.T) (caCertPEM []byte, tlsCert tls.Certificate,
 	caCertDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
 	require.NoError(t, err)
 
-	caCertPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
 	caCert, err := x509.ParseCertificate(caCertDER)
 	require.NoError(t, err)
 
@@ -76,7 +74,7 @@ func generateTestCerts(t *testing.T) (caCertPEM []byte, tlsCert tls.Certificate,
 	tlsCert, err = tls.X509KeyPair(leafCertPEM, leafKeyPEM)
 	require.NoError(t, err)
 
-	return caCertPEM, tlsCert, caPool
+	return tlsCert, caPool
 }
 
 // newMTLSTestServer creates an httptest server requiring mTLS.
@@ -94,17 +92,24 @@ func newMTLSTestServer(t *testing.T, caPool *x509.CertPool, serverCert tls.Certi
 	return server
 }
 
-// newTestClient creates a Client with the test CA pool injected for server cert verification.
-func newTestClient(t *testing.T, cfg *config.Config, hubTlsConfig *tls.Config, caPool *x509.CertPool) *Client {
+// newTestClient creates a Client with a test HTTP client configured for mTLS.
+func newTestClient(t *testing.T, cfg *config.Config, cert tls.Certificate, caPool *x509.CertPool) *Client {
 	t.Helper()
-	client, err := NewClient(cfg, hubTlsConfig)
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				Certificates: []tls.Certificate{cert},
+				RootCAs:      caPool,
+			},
+		},
+	}
+	client, err := NewClient(cfg, httpClient)
 	require.NoError(t, err)
-	client.httpClient.Transport.(*http.Transport).TLSClientConfig.RootCAs = caPool
 	return client
 }
 
 func TestRegister_Success(t *testing.T) {
-	caCertPEM, cert, caPool := generateTestCerts(t)
+	cert, caPool := generateTestCerts(t)
 
 	var requestCount atomic.Int32
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -123,23 +128,12 @@ func TestRegister_Success(t *testing.T) {
 
 	server := newMTLSTestServer(t, caPool, cert, handler)
 
-	// Write CA cert to temp file.
-	caFile, err := os.CreateTemp(t.TempDir(), "ca-*.pem")
-	require.NoError(t, err)
-	_, err = caFile.Write(caCertPEM)
-	require.NoError(t, err)
-	caFile.Close()
-
 	cfg := &config.Config{
-		BackendListenAddress:   ":8443",
-		RegistrationURL:        server.URL,
-		RegistrationCACertFile: caFile.Name(),
-		Region:                 "us-west-2",
+		BackendListenAddress: ":8443",
+		RegistrationURL:      server.URL,
+		Region:               "us-west-2",
 	}
-	hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
-
-	client, err := NewClient(cfg, hubTlsConfig)
-	require.NoError(t, err)
+	client := newTestClient(t, cfg, cert, caPool)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -151,7 +145,7 @@ func TestRegister_Success(t *testing.T) {
 }
 
 func TestRegister_PermanentErrors(t *testing.T) {
-	_, cert, caPool := generateTestCerts(t)
+	cert, caPool := generateTestCerts(t)
 
 	tests := []struct {
 		name   string
@@ -169,8 +163,7 @@ func TestRegister_PermanentErrors(t *testing.T) {
 			server := newMTLSTestServer(t, caPool, cert, handler)
 
 			cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
-			hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
-			client := newTestClient(t, cfg, hubTlsConfig, caPool)
+			client := newTestClient(t, cfg, cert, caPool)
 
 			_, err := client.register(context.Background())
 			require.Error(t, err)
@@ -180,7 +173,7 @@ func TestRegister_PermanentErrors(t *testing.T) {
 }
 
 func TestRegister_RetryableErrors(t *testing.T) {
-	_, cert, caPool := generateTestCerts(t)
+	cert, caPool := generateTestCerts(t)
 
 	t.Run("500 Internal Server Error", func(t *testing.T) {
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -189,8 +182,7 @@ func TestRegister_RetryableErrors(t *testing.T) {
 		server := newMTLSTestServer(t, caPool, cert, handler)
 
 		cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
-		hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
-		client := newTestClient(t, cfg, hubTlsConfig, caPool)
+		client := newTestClient(t, cfg, cert, caPool)
 
 		_, err := client.register(context.Background())
 		require.Error(t, err)
@@ -205,8 +197,7 @@ func TestRegister_RetryableErrors(t *testing.T) {
 		server := newMTLSTestServer(t, caPool, cert, handler)
 
 		cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
-		hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
-		client := newTestClient(t, cfg, hubTlsConfig, caPool)
+		client := newTestClient(t, cfg, cert, caPool)
 
 		_, err := client.register(context.Background())
 		require.Error(t, err)
@@ -223,8 +214,7 @@ func TestRegister_RetryableErrors(t *testing.T) {
 		server := newMTLSTestServer(t, caPool, cert, handler)
 
 		cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
-		hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
-		client := newTestClient(t, cfg, hubTlsConfig, caPool)
+		client := newTestClient(t, cfg, cert, caPool)
 
 		_, err := client.register(context.Background())
 		require.Error(t, err)
@@ -238,8 +228,7 @@ func TestRegister_RetryableErrors(t *testing.T) {
 		server := newMTLSTestServer(t, caPool, cert, handler)
 
 		cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
-		hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
-		client := newTestClient(t, cfg, hubTlsConfig, caPool)
+		client := newTestClient(t, cfg, cert, caPool)
 
 		_, err := client.register(context.Background())
 		require.Error(t, err)
@@ -248,7 +237,7 @@ func TestRegister_RetryableErrors(t *testing.T) {
 }
 
 func TestRegister_HeartbeatClamp(t *testing.T) {
-	_, cert, caPool := generateTestCerts(t)
+	cert, caPool := generateTestCerts(t)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(registerResponse{HeartbeatInterval: 1})
@@ -256,8 +245,7 @@ func TestRegister_HeartbeatClamp(t *testing.T) {
 	server := newMTLSTestServer(t, caPool, cert, handler)
 
 	cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
-	hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
-	client := newTestClient(t, cfg, hubTlsConfig, caPool)
+	client := newTestClient(t, cfg, cert, caPool)
 
 	interval, err := client.register(context.Background())
 	require.NoError(t, err)
@@ -265,7 +253,7 @@ func TestRegister_HeartbeatClamp(t *testing.T) {
 }
 
 func TestRegister_EmptyRegion(t *testing.T) {
-	_, cert, caPool := generateTestCerts(t)
+	cert, caPool := generateTestCerts(t)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]interface{}
@@ -279,15 +267,14 @@ func TestRegister_EmptyRegion(t *testing.T) {
 	server := newMTLSTestServer(t, caPool, cert, handler)
 
 	cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
-	hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
-	client := newTestClient(t, cfg, hubTlsConfig, caPool)
+	client := newTestClient(t, cfg, cert, caPool)
 
 	_, err := client.register(context.Background())
 	require.NoError(t, err)
 }
 
 func TestRunAndStop(t *testing.T) {
-	_, cert, caPool := generateTestCerts(t)
+	cert, caPool := generateTestCerts(t)
 
 	var heartbeats atomic.Int32
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -298,8 +285,7 @@ func TestRunAndStop(t *testing.T) {
 	server := newMTLSTestServer(t, caPool, cert, handler)
 
 	cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
-	hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
-	client := newTestClient(t, cfg, hubTlsConfig, caPool)
+	client := newTestClient(t, cfg, cert, caPool)
 
 	ctx := context.Background()
 	go client.Run(ctx)
@@ -314,7 +300,7 @@ func TestRunAndStop(t *testing.T) {
 }
 
 func TestRunPermanentError(t *testing.T) {
-	_, cert, caPool := generateTestCerts(t)
+	cert, caPool := generateTestCerts(t)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -322,8 +308,7 @@ func TestRunPermanentError(t *testing.T) {
 	server := newMTLSTestServer(t, caPool, cert, handler)
 
 	cfg := &config.Config{BackendListenAddress: ":8443", RegistrationURL: server.URL}
-	hubTlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
-	client := newTestClient(t, cfg, hubTlsConfig, caPool)
+	client := newTestClient(t, cfg, cert, caPool)
 
 	ctx := context.Background()
 	done := make(chan struct{})
@@ -341,22 +326,7 @@ func TestRunPermanentError(t *testing.T) {
 	}
 }
 
-func TestNewClient_InvalidCACert(t *testing.T) {
-	cfg := &config.Config{
-		BackendListenAddress:   ":8443",
-		RegistrationURL:        "https://example.com/register",
-		RegistrationCACertFile: "/nonexistent/ca.pem",
-	}
-	hubTlsConfig := &tls.Config{}
-
-	_, err := NewClient(cfg, hubTlsConfig)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to read registration CA cert")
-}
-
 func TestNewClient_InvalidBackendPort(t *testing.T) {
-	hubTlsConfig := &tls.Config{}
-
 	tests := []struct {
 		name    string
 		addr    string
@@ -374,7 +344,7 @@ func TestNewClient_InvalidBackendPort(t *testing.T) {
 				BackendListenAddress: tt.addr,
 				RegistrationURL:     "https://example.com/register",
 			}
-			_, err := NewClient(cfg, hubTlsConfig)
+			_, err := NewClient(cfg, &http.Client{})
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.wantErr)
 		})

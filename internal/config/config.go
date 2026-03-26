@@ -24,7 +24,6 @@ type Config struct {
 	IdleTimeoutSeconds             int                `yaml:"idleTimeoutSeconds"`
 	BackendsJWTSecret              string             `yaml:"backendsJWTSecret"`
 	RemoteVerifierURL              string             `yaml:"remoteVerifierURL"`
-	RemoteVerifierTimeoutSeconds   int                `yaml:"remoteVerifierTimeoutSeconds"`
 	MaintenanceGraceDefaultSeconds int                `yaml:"maintenanceGraceDefaultSeconds"`
 	Peers                          []string           `yaml:"peers"`
 	PeerAuthentication             PeerAuthentication `yaml:"peerAuthentication"`
@@ -47,9 +46,8 @@ type Config struct {
 	AllowedUDPPortClaims []int `yaml:"allowedUDPPortClaims"`
 
 	// Orchestrator registration (optional — omit to run without DNS orchestration)
-	RegistrationURL        string `yaml:"registrationURL"`
-	RegistrationCACertFile string `yaml:"registrationCACertFile"` // CA to verify orchestrator's server cert (system pool if empty)
-	Region                 string `yaml:"region"`                 // sent in registration body
+	RegistrationURL string `yaml:"registrationURL"`
+	Region          string `yaml:"region"` // sent in registration body
 
 	// UDP flow table and payload bounds (applies to udpRelayPorts).
 	UDPMaxFlows                      int `yaml:"udpMaxFlows"`
@@ -62,15 +60,6 @@ type Config struct {
 // IdleTimeout returns the idle timeout as a time.Duration.
 func (c *Config) IdleTimeout() time.Duration {
 	return time.Duration(c.IdleTimeoutSeconds) * time.Second
-}
-
-// RemoteVerifierTimeout returns the configured timeout for HTTP calls to the
-// remote verifier, defaulting to 5 seconds when not specified.
-func (c *Config) RemoteVerifierTimeout() time.Duration {
-	if c.RemoteVerifierTimeoutSeconds <= 0 {
-		return 5 * time.Second
-	}
-	return time.Duration(c.RemoteVerifierTimeoutSeconds) * time.Second
 }
 
 // MaintenanceGraceDefault returns the default maintenance deferral window.
@@ -143,9 +132,6 @@ func (c *Config) validate() error {
 	}
 	if c.IdleTimeoutSeconds < 0 {
 		return fmt.Errorf("idleTimeoutSeconds cannot be negative")
-	}
-	if c.RemoteVerifierTimeoutSeconds < 0 {
-		return fmt.Errorf("remoteVerifierTimeoutSeconds cannot be negative")
 	}
 	if c.MaintenanceGraceDefaultSeconds < 0 {
 		return fmt.Errorf("maintenanceGraceDefaultSeconds cannot be negative")

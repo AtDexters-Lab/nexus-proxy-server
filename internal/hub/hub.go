@@ -44,15 +44,17 @@ type hubImpl struct {
 	peerManager        iface.PeerManager
 	hubTlsConfig       *tls.Config
 	validator          auth.Validator
+	outboundClient     *http.Client
 	bandwidthScheduler *bandwidth.Scheduler
 }
 
 // New creates and returns a new Hub instance.
-func New(cfg *config.Config, tlsConfig *tls.Config, validator auth.Validator) *hubImpl {
+func New(cfg *config.Config, tlsConfig *tls.Config, validator auth.Validator, outboundClient *http.Client) *hubImpl {
 	h := &hubImpl{
 		config:             cfg,
 		hubTlsConfig:       tlsConfig,
 		validator:          validator,
+		outboundClient:     outboundClient,
 		udpFlowIdleSources: make(map[int]map[string]time.Duration),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
@@ -399,7 +401,7 @@ func (h *hubImpl) performHandshake(conn *websocket.Conn) (*Backend, error) {
 		return nil, err
 	}
 
-	return NewBackend(conn, meta, h.config, h.validator), nil
+	return NewBackend(conn, meta, h.config, h.validator, h.outboundClient), nil
 }
 
 func (h *hubImpl) readTokenMessage(conn *websocket.Conn, stage string) (string, error) {
