@@ -99,8 +99,13 @@ func (h *hubImpl) Run() {
 		peerMux.HandleFunc("/mesh", h.handlePeerConnect)
 
 		// Clone the base TLS config and add peer-specific mTLS settings.
+		// RequireAnyClientCert demands a client cert but skips Go's built-in
+		// chain + ExtKeyUsage verification — necessary because ACME certs
+		// carry serverAuth only. Chain and domain validation happen in the
+		// VerifyPeerCertificate callback instead.
 		peerTlsConfig := h.hubTlsConfig.Clone()
-		peerTlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+		peerTlsConfig.ClientAuth = tls.RequireAnyClientCert
+		peerTlsConfig.SessionTicketsDisabled = true
 		peerTlsConfig.VerifyPeerCertificate = h.buildVerifyPeerCertificateFunc()
 
 		h.peerServer = &http.Server{
@@ -118,35 +123,56 @@ func (h *hubImpl) Run() {
 	}
 }
 
-// buildVerifyPeerCertificateFunc is a closure that creates the verification function.
-// This function checks if a peer's certificate FQDN belongs to a trusted domain.
+// buildVerifyPeerCertificateFunc returns a callback that verifies the peer's
+// client certificate chain against the system root pool and checks the leaf
+// cert's domain against trustedDomainSuffixes. Because the peer TLS config
+// uses RequireAnyClientCert, Go does not build verifiedChains — the callback
+// must parse rawCerts and verify the chain itself.
 func (h *hubImpl) buildVerifyPeerCertificateFunc() func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-	return func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-		if len(verifiedChains) == 0 || len(verifiedChains[0]) == 0 {
-			return fmt.Errorf("no verified certificate chain presented by peer")
+	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		// Defensive: unreachable with RequireAnyClientCert (Go aborts the
+		// handshake before this callback if no cert is sent), but guards
+		// against future ClientAuth changes.
+		if len(rawCerts) == 0 {
+			return errors.New("peer presented no certificate")
 		}
 
-		// The first certificate in the first verified chain is the client's cert.
-		cert := verifiedChains[0][0]
+		leaf, err := x509.ParseCertificate(rawCerts[0])
+		if err != nil {
+			return fmt.Errorf("failed to parse peer certificate: %w", err)
+		}
 
-		// Check against all trusted domain suffixes
+		intermediates := x509.NewCertPool()
+		for _, raw := range rawCerts[1:] {
+			inter, err := x509.ParseCertificate(raw)
+			if err != nil {
+				return fmt.Errorf("failed to parse intermediate certificate: %w", err)
+			}
+			intermediates.AddCert(inter)
+		}
+
+		// An empty KeyUsages defaults to serverAuth, which matches ACME
+		// certs. This avoids requiring clientAuth, which ACME certs lack.
+		if _, err := leaf.Verify(x509.VerifyOptions{
+			Intermediates: intermediates,
+		}); err != nil {
+			return fmt.Errorf("peer certificate chain verification failed: %w", err)
+		}
+
 		for _, suffix := range h.config.PeerAuthentication.TrustedDomainSuffixes {
-			// Check Subject Alternative Names first (preferred)
-			for _, san := range cert.DNSNames {
+			for _, san := range leaf.DNSNames {
 				if strings.HasSuffix(san, suffix) {
 					log.Printf("INFO: Peer certificate validated via SAN for: %s", san)
-					return nil // Success
+					return nil
 				}
 			}
-			// Fallback to checking Common Name
-			if strings.HasSuffix(cert.Subject.CommonName, suffix) {
-				log.Printf("INFO: Peer certificate validated via CN for: %s", cert.Subject.CommonName)
-				return nil // Success
+			if strings.HasSuffix(leaf.Subject.CommonName, suffix) {
+				log.Printf("INFO: Peer certificate validated via CN for: %s", leaf.Subject.CommonName)
+				return nil
 			}
 		}
 
-		// If no match was found
-		return fmt.Errorf("peer certificate FQDN ('%s' / SANs: %v) is not in any trusted domain", cert.Subject.CommonName, cert.DNSNames)
+		return fmt.Errorf("peer certificate FQDN ('%s' / SANs: %v) is not in any trusted domain", leaf.Subject.CommonName, leaf.DNSNames)
 	}
 }
 
