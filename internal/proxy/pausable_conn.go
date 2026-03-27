@@ -70,3 +70,9 @@ func (pc *PausableConn) Close() error {
 	pc.mu.Unlock()
 	return pc.Conn.Close()
 }
+
+// Unwrap returns the underlying net.Conn for low-level TCP operations
+// such as half-close (CloseWrite).
+func (pc *PausableConn) Unwrap() net.Conn {
+	return pc.Conn
+}

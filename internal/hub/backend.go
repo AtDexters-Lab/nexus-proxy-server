@@ -28,8 +28,9 @@ const (
 	pingPeriod     = (pongWait * 9) / 10
 	maxMessageSize = 32*1024 + protocol.MessageHeaderLength // This must be sent within writeWait
 
-	defaultReauthGrace = 10 * time.Second
-	healthCheckTimeout = 5 * time.Second
+	defaultReauthGrace   = 10 * time.Second
+	healthCheckTimeout   = 5 * time.Second
+	tcpCloseGracePeriod  = 2 * time.Second
 )
 
 type outboundMessage struct {
@@ -122,8 +123,9 @@ func (b *Backend) Close() {
 			_ = b.conn.Close()
 		}
 		b.clients.Range(func(key, value interface{}) bool {
+			b.clients.Delete(key)
 			if clientConn, ok := value.(net.Conn); ok {
-				_ = clientConn.Close()
+				gracefulCloseConn(clientConn, b.quit)
 			}
 			return true
 		})
@@ -417,11 +419,10 @@ func (b *Backend) handleControlMessage(msg protocol.ControlMessage) {
 			log.Printf("INFO: Client %s is no longer active, not sending pong to backend %s", msg.ClientID, b.id)
 		}
 	case protocol.EventDisconnect:
-		if rawConn, ok := b.clients.Load(msg.ClientID); ok {
+		if rawConn, ok := b.clients.LoadAndDelete(msg.ClientID); ok {
 			if conn, ok := rawConn.(net.Conn); ok {
 				log.Printf("INFO: Backend %s reported disconnect for client %s. Closing client connection.", b.id, msg.ClientID)
-				b.clients.Delete(msg.ClientID)
-				_ = conn.Close()
+				gracefulCloseConn(conn, b.quit)
 			}
 		}
 	case protocol.EventPauseStream:
@@ -431,6 +432,32 @@ func (b *Backend) handleControlMessage(msg protocol.ControlMessage) {
 	default:
 		log.Printf("WARN: Unknown control event '%s' from backend %s", msg.Event, b.id)
 	}
+}
+
+// gracefulCloseConn performs a TCP half-close, giving the kernel time to flush
+// the send buffer before tearing down the socket. The quit channel allows
+// Backend.Close() to cancel the delay during shutdown. Falls back to immediate
+// close for non-TCP connections.
+func gracefulCloseConn(conn net.Conn, quit <-chan struct{}) {
+	inner := conn
+	if u, ok := conn.(interface{ Unwrap() net.Conn }); ok {
+		inner = u.Unwrap()
+	}
+
+	if tc, ok := inner.(*net.TCPConn); ok {
+		_ = tc.CloseWrite()
+		// Deferred full close to reclaim the FD and unblock paused readers.
+		go func() {
+			select {
+			case <-time.After(tcpCloseGracePeriod):
+			case <-quit:
+			}
+			_ = conn.Close()
+		}()
+		return
+	}
+
+	_ = conn.Close()
 }
 
 func (b *Backend) handlePauseStream(clientID uuid.UUID) {

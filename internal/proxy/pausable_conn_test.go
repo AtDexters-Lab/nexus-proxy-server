@@ -182,3 +182,13 @@ func TestPausableConnConcurrentPauseResume(t *testing.T) {
 		t.Fatalf("expected 'test', got %q", string(buf[:n]))
 	}
 }
+
+func TestPausableConnUnwrap(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+	pc := NewPausableConn(clientConn)
+	defer pc.Close()
+	if pc.Unwrap() != clientConn {
+		t.Fatal("Unwrap should return the underlying connection")
+	}
+}
