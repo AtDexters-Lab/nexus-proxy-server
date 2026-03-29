@@ -17,6 +17,7 @@ import (
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/peer"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/proxy"
 	"github.com/AtDexters-Lab/nexus-proxy-server/internal/registration"
+	stunserver "github.com/AtDexters-Lab/nexus-proxy-server/internal/stun"
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -97,6 +98,9 @@ func main() {
 	if cfg.IdleTimeout() > 0 {
 		log.Printf("INFO: Client idle timeout is %s", cfg.IdleTimeout())
 	}
+	if cfg.StunEnabled() {
+		log.Printf("INFO: STUN server port: %d", cfg.StunPort)
+	}
 	if cfg.TotalBandwidthMbps > 0 {
 		log.Printf("INFO: Bandwidth management enabled: %d Mbps total (fair distribution via DRR)", cfg.TotalBandwidthMbps)
 	} else {
@@ -126,6 +130,16 @@ func main() {
 	clientListener := proxy.NewListener(cfg, backendHub, peerManager, acmeHandler, hubTlsConfig)
 
 	backendHub.SetPeerManager(peerManager)
+
+	var stunSrv *stunserver.Server
+	if cfg.StunEnabled() {
+		stunSrv = stunserver.New(cfg.StunPort)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			stunSrv.Run()
+		}()
+	}
 
 	wg.Add(1)
 	go func() {
@@ -172,6 +186,11 @@ func main() {
 
 	// Stop the peer manager to prevent new tunneled connections.
 	peerManager.Stop()
+
+	// Stop the optional STUN server (stateless, no drain needed).
+	if stunSrv != nil {
+		stunSrv.Stop()
+	}
 
 	// Then, stop the public-facing listeners.
 	clientListener.Stop()

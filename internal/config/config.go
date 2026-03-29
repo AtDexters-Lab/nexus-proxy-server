@@ -55,6 +55,10 @@ type Config struct {
 	UDPFlowIdleTimeoutDefaultSeconds int `yaml:"udpFlowIdleTimeoutDefaultSeconds"`
 	UDPFlowIdleTimeoutMinSeconds     int `yaml:"udpFlowIdleTimeoutMinSeconds"`
 	UDPFlowIdleTimeoutMaxSeconds     int `yaml:"udpFlowIdleTimeoutMaxSeconds"`
+
+	// STUN server port (optional — omit or set to 0 to disable).
+	// When set, a STUN Binding server listens on this UDP port.
+	StunPort int `yaml:"stunPort"`
 }
 
 // IdleTimeout returns the idle timeout as a time.Duration.
@@ -117,6 +121,11 @@ func (c *Config) UDPFlowIdleTimeoutMax() time.Duration {
 // RegistrationEnabled returns true if orchestrator registration is configured.
 func (c *Config) RegistrationEnabled() bool {
 	return c.RegistrationURL != ""
+}
+
+// StunEnabled returns true if the embedded STUN server is configured.
+func (c *Config) StunEnabled() bool {
+	return c.StunPort > 0
 }
 
 // validate performs comprehensive validation of the loaded configuration.
@@ -194,6 +203,17 @@ func (c *Config) validate() error {
 	}
 	if c.UDPFlowIdleTimeoutMaxSeconds < 0 {
 		return fmt.Errorf("udpFlowIdleTimeoutMaxSeconds cannot be negative")
+	}
+
+	if c.StunPort < 0 || c.StunPort > 65535 {
+		return fmt.Errorf("stunPort must be between 0 and 65535")
+	}
+	if c.StunPort > 0 {
+		for _, p := range c.UDPRelayPorts {
+			if p == c.StunPort {
+				return fmt.Errorf("stunPort %d conflicts with udpRelayPorts — both bind the same UDP socket", c.StunPort)
+			}
+		}
 	}
 
 	// warnPortMismatch warns about ports present in one config list but absent from another.

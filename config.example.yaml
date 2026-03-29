@@ -106,3 +106,14 @@ peerAuthentication:
 #   0     = Unlimited (no bandwidth management, default)
 #
 # totalBandwidthMbps: 1000
+
+# --- STUN Server (Optional) ---
+# Embedded STUN (RFC 5389) Binding server for public-IP discovery
+# and future WebRTC ICE candidate gathering.
+# The server must receive packets directly from clients (not through NAT/LB)
+# to return accurate reflexive addresses.
+# Standard STUN port is 3478. Omit or set to 0 to disable.
+# When configured with orchestrator registration, the STUN port is advertised
+# in the heartbeat so the orchestrator knows which relays offer STUN.
+#
+# stunPort: 3478

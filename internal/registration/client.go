@@ -25,8 +25,15 @@ const (
 )
 
 type registerRequest struct {
-	Region      string `json:"region,omitempty"`
-	BackendPort int    `json:"backendPort"`
+	Region      string    `json:"region,omitempty"`
+	BackendPort int       `json:"backendPort"`
+	Services    *Services `json:"services,omitempty"`
+}
+
+// Services describes optional capabilities of this relay.
+// The orchestrator uses this to know which relays offer specific services.
+type Services struct {
+	StunPort int `json:"stunPort,omitempty"`
 }
 
 type registerResponse struct {
@@ -38,6 +45,7 @@ type Client struct {
 	registrationURL string
 	region          string
 	backendPort     int
+	services        *Services
 	httpClient      *http.Client
 
 	// internalCtx/cancel provides a cancellation signal owned by this Client.
@@ -62,12 +70,18 @@ func NewClient(cfg *config.Config, httpClient *http.Client) (*Client, error) {
 		return nil, fmt.Errorf("backendPort %d from backendListenAddress %q out of valid range 1-65535", backendPort, cfg.BackendListenAddress)
 	}
 
+	var services *Services
+	if cfg.StunEnabled() {
+		services = &Services{StunPort: cfg.StunPort}
+	}
+
 	internalCtx, cancel := context.WithCancel(context.Background())
 
 	c := &Client{
 		registrationURL: cfg.RegistrationURL,
 		region:          cfg.Region,
 		backendPort:     backendPort,
+		services:        services,
 		httpClient:      httpClient,
 		internalCtx:     internalCtx,
 		cancel:          cancel,
@@ -141,7 +155,7 @@ func (c *Client) register(ctx context.Context) (time.Duration, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, httpTimeout)
 	defer cancel()
 
-	body, _ := json.Marshal(registerRequest{Region: c.region, BackendPort: c.backendPort})
+	body, _ := json.Marshal(registerRequest{Region: c.region, BackendPort: c.backendPort, Services: c.services})
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.registrationURL, bytes.NewReader(body))
 	if err != nil {
 		return 0, fmt.Errorf("build request: %w", err)
