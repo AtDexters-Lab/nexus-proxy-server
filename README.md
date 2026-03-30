@@ -1,5 +1,7 @@
 # Nexus Proxy: A Privacy-First Passthrough Proxy
 
+![Stage: Beta](https://img.shields.io/badge/Stage-Beta-blue)
+
 **Nexus Proxy** is a **privacy-first passthrough proxy**, built on the principle of zero-trust networking. It intelligently routes encrypted traffic **without ever terminating the TLS connection**, preserving true end-to-end encryption between your clients and backend services. The data stream remains completely **opaque and private** to Nexus, making it a secure-by-default gateway for your infrastructure.
 
 The core mission of Nexus is to intelligently route client requests to the appropriate backend server cluster based on the requested hostname (FQDN), even when those clusters are spread across the globe. It achieves this while keeping the proxy layer itself completely stateless regarding user sessions, which dramatically simplifies deployment and scaling.
@@ -199,12 +201,16 @@ A complete, working reference implementation for a backend client that connects 
 
 This backend client demonstrates how to handle the WebSocket connection, authentication, and multiplexing protocol required to serve traffic from Nexus.
 
-## The Piccolo Ecosystem: A Perfect Backend for Nexus
+## The Piccolo Ecosystem
 
-Nexus Proxy was designed to be the ideal gateway for personal, self-hosted services that prioritize privacy and data ownership. A perfect reference implementation for a Nexus-compatible backend is the **[Piccolo](https://piccolospace.com/)**.
+| Component | Role |
+|-----------|------|
+| [piccolo-os](https://github.com/AtDexters-Lab/piccolo-os) | OS images, install guides, and project hub |
+| [piccolod](https://github.com/AtDexters-Lab/piccolod) | On-device daemon — portal, app management, encryption |
+| [namek-server](https://github.com/AtDexters-Lab/namek-server) | Orchestrator — device auth, DNS, certificates |
+| [nexus-proxy-server](https://github.com/AtDexters-Lab/nexus-proxy-server) | Edge relay — remote access with device-terminated TLS |
+| [piccolo-store](https://github.com/AtDexters-Lab/piccolo-store) | App catalog — manifests for installable apps |
 
-Piccolo is a palm-sized personal server that gives you global access to your files and applications while ensuring total privacy. It's designed to offer the convenience of cloud services without sacrificing control over your digital life.
+## License
 
-By connecting a Piccolo device as a backend to Nexus, you can securely expose your self-hosted services to the world without compromising your privacy.
-
-Learn more about running your own personal server here: **[Get Piccolo](https://piccolospace.com/getpiccolo/)**
+AGPL-3.0 — see [LICENSE](./LICENSE).
