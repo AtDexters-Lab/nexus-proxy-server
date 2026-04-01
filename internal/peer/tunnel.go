@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/protocol"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
+	"github.com/AtDexters-Lab/nexus-proxy/protocol"
 	"github.com/google/uuid"
 )
 

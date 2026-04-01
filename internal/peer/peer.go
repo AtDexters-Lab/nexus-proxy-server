@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/protocol"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/proxy"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/protocol"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/proxy"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )

@@ -6,6 +6,8 @@
 
 The core mission of Nexus is to intelligently route client requests to the appropriate backend server cluster based on the requested hostname (FQDN), even when those clusters are spread across the globe. It achieves this while keeping the proxy layer itself completely stateless regarding user sessions, which dramatically simplifies deployment and scaling.
 
+This repository contains both the **proxy server** and the **backend client** (library + CLI).
+
 ## Core Philosophy & Key Features
 
 -   **Privacy by Design:** The proxy's primary security feature is that it *cannot* see your data. By passing the encrypted TLS stream through without termination, it guarantees privacy from the proxy layer itself.
@@ -64,7 +66,7 @@ The routing logic is designed to be simple and explicit.
 
 ## Install
 
-### Quick Install (Linux)
+### Quick Install (Linux, Server)
 
 - Requirements:
   - Public ports `80` and `443` reachable from the internet (HTTP-01 ACME).
@@ -74,7 +76,7 @@ The routing logic is designed to be simple and explicit.
 - One-liner installer:
 
 ```
-sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/AtDexters-Lab/nexus-proxy-server/main/scripts/install.sh | bash'
+sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/AtDexters-Lab/nexus-proxy/main/scripts/install.sh | bash'
 ```
 
 - What the script does:
@@ -92,27 +94,35 @@ Example:
 
 ```
 sudo NEXUS_VERSION=v0.1.2 NEXUS_HOST=nexus.example.com NEXUS_SKIP_DNS=skip \
-  bash -c 'curl -fsSL https://raw.githubusercontent.com/AtDexters-Lab/nexus-proxy-server/main/scripts/install.sh | bash'
+  bash -c 'curl -fsSL https://raw.githubusercontent.com/AtDexters-Lab/nexus-proxy/main/scripts/install.sh | bash'
 ```
 
 ### Releases (Binaries)
 
 - We publish Linux binaries for `amd64` and `arm64` on every Git tag `v*`.
-- Artifacts include the server binary and `config.example.yaml`.
+- Artifacts include the server binary, client binary, and their respective config examples.
 - See the GitHub Releases page for download links and `SHA256SUMS`.
 
 ### Build From Source
 
-- Build: `go build -o bin/nexus-proxy-server ./proxy-server`
-- Run (dev): `go run ./proxy-server -config config.example.yaml`
-- Test: `go test ./...`
-- Format: `go fmt ./...`  |  Vet: `go vet ./...`
+```bash
+# Server
+go build -o bin/nexus-proxy-server ./cmd/nexus-proxy-server
+
+# Client
+go build -o bin/nexus-proxy-client ./cmd/nexus-proxy-client
+
+# Test
+go test ./...
+```
 
 ## Configure
 
-Nexus is configured via a `config.yaml` file. See the [example config](config.example.yaml) for all available options.
+### Server
 
-### Hub TLS (Automatic or Manual)
+Nexus is configured via a `config.yaml` file. See the [example config](config/server.example.yaml) for all available options.
+
+#### Hub TLS (Automatic or Manual)
 
 The hub server (for backend and peer connections) requires TLS. You can choose between two modes:
 
@@ -128,9 +138,8 @@ The hub server (for backend and peer connections) requires TLS. You can choose b
     hubTlsCertFile: "/path/to/your/fullchain.pem"
     hubTlsKeyFile: "/path/to/your/privkey.pem"
     ```
-    For local development, you can [generate a self-signed certificate](https://mkcert.dev)
 
-### Managing the Service
+#### Managing the Service
 
 - Check status: `systemctl status nexus-proxy-server`
 - Restart: `sudo systemctl restart nexus-proxy-server`
@@ -150,67 +159,61 @@ Backends authenticate to the Hub using a JWT signed with the shared secret from 
 }
 ```
 
-- Legacy claim (still supported): `hostname` (single FQDN)
-
-```json
-{
-  "hostname": "app.example.com",
-  "weight": 5,
-  "exp": 1735689600
-}
-```
-
 At runtime, the proxy sends a `connect` control message to your backend for each client with the resolved `hostname` field so a multi-tenant backend can route appropriately.
 
-### Wildcard Hostnames (Single-Label)
+#### Wildcard Hostnames (Single-Label)
 
 Backends may register wildcard hostnames using a single leftmost label (TLS-style), e.g. `*.example.com`.
 
 - Matching: `a.example.com` matches; `a.b.example.com` does not. Exact hostnames always take precedence over wildcard.
-- Peers announce wildcard patterns as `*.example.com`; routing tables use the suffix `.example.com` internally.
 
-### Port Claims (TCP/UDP)
+#### Port Claims (TCP/UDP)
 
 Backends may optionally claim whole ports (e.g. an authoritative DNS service on 53) in addition to (or instead of) hostnames.
 
-- Configuration:
-  - Enable UDP listeners with `udpRelayPorts` (e.g. `[53]`).
-  - Allowlist claimable ports with `allowedTCPPortClaims` / `allowedUDPPortClaims` (when empty, port claims are disabled).
-- JWT claims:
+- Enable UDP listeners with `udpRelayPorts` (e.g. `[53]`).
+- Allowlist claimable ports with `allowedTCPPortClaims` / `allowedUDPPortClaims`.
+- JWT claims: `"tcp_ports": [53]`, `"udp_routes": [{"port": 53, "flow_idle_timeout_seconds": 60}]`
 
-```json
-{
-  "tcp_ports": [53],
-  "udp_routes": [{ "port": 53, "flow_idle_timeout_seconds": 60 }]
+### Client Configuration
+
+See the [client example config](config/client.example.yaml) for all available options.
+
+Key config fields:
+
+- `hostnames`: FQDNs or wildcards this backend serves
+- `nexusAddresses`: WebSocket URLs to connect to (e.g., `wss://nexus.example.com:8443/connect`)
+- `attestation`: Either `command` (external) or `hmacSecret`/`hmacSecretFile` (built-in HS256)
+- `portMappings`: Maps Nexus ports to local targets with optional hostname overrides
+- `healthChecks`: Active ping/pong for connection liveness
+
+### Client Library Usage
+
+The client can be used as a Go library for custom integrations:
+
+```go
+import "github.com/AtDexters-Lab/nexus-proxy/client"
+
+router := func(ctx context.Context, req client.ConnectRequest) (net.Conn, error) {
+    if strings.HasSuffix(req.Hostname, ".preview.example.com") {
+        return net.Dial("tcp", "localhost:5080")
+    }
+    return nil, client.ErrNoRoute  // Fall back to YAML config
 }
+c, _ := client.New(cfg, client.WithConnectHandler(router))
+go c.Start(ctx)
 ```
-
-- Routing semantics:
-  - Hostname routing remains primary.
-  - TCP port-claim routing is attempted only when Nexus cannot determine an SNI/Host header.
-- Backend protocol:
-  - `connect` control messages include `transport: "tcp" | "udp"`.
-  - For UDP, each data frame is one datagram.
-  - For port claims, `hostname` is the internal route key (e.g. `tcp:53`, `udp:53`).
-
-## Reference Backend Client
-
-A complete, working reference implementation for a backend client that connects to Nexus Proxy can be found here:
-
--   **[Nexus Proxy Backend Client](https://github.com/AtDexters-Lab/nexus-proxy-backend-client)**
-
-This backend client demonstrates how to handle the WebSocket connection, authentication, and multiplexing protocol required to serve traffic from Nexus.
 
 ## The Piccolo Ecosystem
 
 | Component | Role |
 |-----------|------|
 | [piccolo-os](https://github.com/AtDexters-Lab/piccolo-os) | OS images, install guides, and project hub |
-| [piccolod](https://github.com/AtDexters-Lab/piccolod) | On-device daemon — portal, app management, encryption |
-| [namek-server](https://github.com/AtDexters-Lab/namek-server) | Orchestrator — device auth, DNS, certificates |
-| [nexus-proxy-server](https://github.com/AtDexters-Lab/nexus-proxy-server) | Edge relay — remote access with device-terminated TLS |
-| [piccolo-store](https://github.com/AtDexters-Lab/piccolo-store) | App catalog — manifests for installable apps |
+| [piccolod](https://github.com/AtDexters-Lab/piccolod) | On-device daemon -- portal, app management, encryption |
+| [namek-server](https://github.com/AtDexters-Lab/namek-server) | Orchestrator -- device auth, DNS, certificates |
+| [nexus-proxy](https://github.com/AtDexters-Lab/nexus-proxy) | Edge relay -- remote access with device-terminated TLS |
+| [piccolo-store](https://github.com/AtDexters-Lab/piccolo-store) | App catalog -- manifests for installable apps |
 
 ## License
 
-AGPL-3.0 — see [LICENSE](./LICENSE).
+AGPL-3.0 -- see [LICENSE](./LICENSE).

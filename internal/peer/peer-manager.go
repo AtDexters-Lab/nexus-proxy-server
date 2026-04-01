@@ -13,12 +13,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/bandwidth"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/protocol"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/proxy"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/routing"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/bandwidth"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
+	"github.com/AtDexters-Lab/nexus-proxy/protocol"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/proxy"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/routing"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )

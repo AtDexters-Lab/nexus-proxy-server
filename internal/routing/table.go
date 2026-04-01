@@ -4,8 +4,8 @@ import (
 	"log"
 	"sync"
 
-	hn "github.com/AtDexters-Lab/nexus-proxy-server/internal/hostnames"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
+	hn "github.com/AtDexters-Lab/nexus-proxy/hostnames"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
 )
 
 // Table holds the dynamic routing information for the mesh.

@@ -4,7 +4,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/bandwidth"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/bandwidth"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )

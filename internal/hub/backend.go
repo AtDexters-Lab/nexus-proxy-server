@@ -14,10 +14,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/auth"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/bandwidth"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/protocol"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/auth"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/bandwidth"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/protocol"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
@@ -569,7 +569,7 @@ func (b *Backend) performReauth() error {
 		return fmt.Errorf("generate nonce: %w", err)
 	}
 
-	challenge := challengeMessage{Type: "reauth_challenge", Nonce: nonce}
+	challenge := protocol.ChallengeMessage{Type: protocol.ChallengeReauth, Nonce: nonce}
 	payload, err := json.Marshal(challenge)
 	if err != nil {
 		return fmt.Errorf("marshal reauth challenge: %w", err)

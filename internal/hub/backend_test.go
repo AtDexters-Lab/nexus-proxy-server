@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/hub"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/protocol"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/hub"
+	"github.com/AtDexters-Lab/nexus-proxy/protocol"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/require"
 )

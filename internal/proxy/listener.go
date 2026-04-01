@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
-	hn "github.com/AtDexters-Lab/nexus-proxy-server/internal/hostnames"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	hn "github.com/AtDexters-Lab/nexus-proxy/hostnames"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
 )
 
 // Listener is responsible for accepting incoming connections from end-users.

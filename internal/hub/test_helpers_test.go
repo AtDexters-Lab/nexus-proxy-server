@@ -3,7 +3,7 @@ package hub_test
 import (
 	"context"
 
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/auth"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/auth"
 )
 
 type stubValidator struct {

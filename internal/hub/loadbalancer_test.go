@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/hub"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/hub"
 )
 
 func TestLoadBalancer(t *testing.T) {

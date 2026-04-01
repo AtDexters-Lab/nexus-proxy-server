@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	proxy "github.com/AtDexters-Lab/nexus-proxy-server/internal/proxy"
+	proxy "github.com/AtDexters-Lab/nexus-proxy/internal/proxy"
 	"github.com/stretchr/testify/require"
 )
 

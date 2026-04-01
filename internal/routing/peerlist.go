@@ -5,7 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
 )
 
 // PeerList manages a list of peers for a single hostname and provides

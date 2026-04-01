@@ -24,26 +24,31 @@ jobs:
         with:
           go-version: '1.24.x'
 
-      - name: Build (${{ matrix.arch }})
+      - name: Build binaries (${{ matrix.arch }})
         env:
           CGO_ENABLED: '0'
           GOOS: linux
           GOARCH: ${{ matrix.arch }}
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w" -o dist/nexus-proxy-server ./proxy-server
+          go build -trimpath -ldflags "-s -w" -o dist/nexus-proxy-server ./cmd/nexus-proxy-server
+          go build -trimpath -ldflags "-s -w" -o dist/nexus-proxy-client ./cmd/nexus-proxy-client
 
       - name: Package (${{ matrix.arch }})
         run: |
-          cp config.example.yaml dist/
-          tar -czf dist/nexus-proxy-server_linux_${{ matrix.arch }}.tar.gz -C dist nexus-proxy-server config.example.yaml
-          rm -f dist/config.example.yaml dist/nexus-proxy-server
+          cp config/server.example.yaml dist/
+          tar -czf dist/nexus-proxy-server_linux_${{ matrix.arch }}.tar.gz -C dist nexus-proxy-server server.example.yaml
+          cp config/client.example.yaml dist/
+          tar -czf dist/nexus-proxy-client_linux_${{ matrix.arch }}.tar.gz -C dist nexus-proxy-client client.example.yaml
+          rm -f dist/*.yaml dist/nexus-proxy-server dist/nexus-proxy-client
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.arch }}
-          path: dist/nexus-proxy-server_linux_${{ matrix.arch }}.tar.gz
+          path: |
+            dist/nexus-proxy-server_linux_${{ matrix.arch }}.tar.gz
+            dist/nexus-proxy-client_linux_${{ matrix.arch }}.tar.gz
 
   publish:
     name: publish release
@@ -62,15 +67,15 @@ jobs:
         run: |
           shopt -s globstar
           mkdir -p upload
-          mv dist/**/nexus-proxy-server_linux_*.tar.gz upload/
+          mv dist/**/nexus-proxy-*_linux_*.tar.gz upload/
           cd upload
-          sha256sum nexus-proxy-server_linux_*.tar.gz > SHA256SUMS
+          sha256sum nexus-proxy-*_linux_*.tar.gz > SHA256SUMS
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            upload/nexus-proxy-server_linux_*.tar.gz
+            upload/nexus-proxy-*_linux_*.tar.gz
             upload/SHA256SUMS
           generate_release_notes: true
         env:

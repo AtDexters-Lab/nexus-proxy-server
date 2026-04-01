@@ -1,0 +1,54 @@
+backends:
+  - # A friendly name for this configuration block.
+    name: "edge-apps"
+    # The public-facing hostnames this backend is responsible for.
+    hostnames:
+      - "app.example.com"
+      - "api.example.com"
+      - "*.preview.example.com"
+    # The WebSocket addresses of the Nexus Proxy servers.
+    nexusAddresses:
+      - "wss://nexus-1.example.com/connect"
+      - "wss://nexus-2.example.com/connect"
+    # Optional weight advertised to Nexus for load-balancing decisions (defaults to 1).
+    weight: 2
+    # Command that obtains handshake and attested tokens from your authorizer.
+    attestation:
+      command: "/usr/local/bin/nexus-attestor"
+      args:
+        - "--backend=edge-apps"
+      env:
+        AUTHORIZER_BASE_URL: "https://authorizer.example.com"
+      timeoutSeconds: 20
+      cacheHandshakeSeconds: 30
+    # A map of public-facing relay ports on Nexus to local service targets.
+    portMappings:
+      443:
+        # Default target when no hostname-specific override matches.
+        default: "localhost:8443"
+        hosts:
+          api.example.com: "localhost:9443" # Route API traffic to a separate service.
+          "*.preview.example.com": "localhost:10443" # Wildcard route for single-label subdomains.
+      80:
+        default: "localhost:8080" # Relay HTTP traffic.
+    # Configuration for active client health checks.
+    healthChecks:
+      # Enable active health checks. Recommended.
+      enabled: true
+      # Time in seconds a connection can be idle before a ping is sent.
+      inactivityTimeout: 60
+      # Time in seconds to wait for a pong from the proxy after a ping is sent.
+      pongTimeout: 5
+  - name: "email-server"
+    hostnames:
+      - "imap.example.com"
+    nexusAddresses:
+      - "wss://nexus.example.com/connect"
+    attestation:
+      hmacSecretFile: "/etc/nexus/email-hmac.key"
+      tokenTTLSeconds: 45
+      reauthIntervalSeconds: 900
+      reauthGraceSeconds: 15
+    portMappings:
+      993:
+        default: "localhost:993" # Relay secure IMAP (IMAPS) traffic

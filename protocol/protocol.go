@@ -50,4 +50,36 @@ type ControlMessage struct {
 	Hostname string `json:"hostname,omitempty"`
 	// IsTLS indicates whether the original connection was negotiated over TLS.
 	IsTLS bool `json:"is_tls,omitempty"`
+	// Reason provides context for disconnect or pause events.
+	Reason string `json:"reason,omitempty"`
 }
+
+// ChallengeType identifies a WebSocket text-frame challenge during authentication.
+type ChallengeType string
+
+const (
+	ChallengeHandshake ChallengeType = "handshake_challenge"
+	ChallengeReauth    ChallengeType = "reauth_challenge"
+)
+
+// ChallengeMessage is a JSON text-frame exchanged during the
+// handshake and re-authentication flows.
+type ChallengeMessage struct {
+	Type  ChallengeType `json:"type"`
+	Nonce string        `json:"nonce"`
+}
+
+// DisconnectReason identifies why a backend disconnected a client.
+type DisconnectReason string
+
+const (
+	DisconnectNormal        DisconnectReason = "normal"
+	DisconnectBufferFull    DisconnectReason = "buffer_full"
+	DisconnectDialFailed    DisconnectReason = "dial_failed"
+	DisconnectTimeout       DisconnectReason = "timeout"
+	DisconnectLocalError    DisconnectReason = "local_error"
+	DisconnectShutdown      DisconnectReason = "shutdown"
+	DisconnectSessionEnded  DisconnectReason = "session_ended"
+	DisconnectPauseViolated DisconnectReason = "pause_violated"
+	DisconnectUnknown       DisconnectReason = "unknown"
+)

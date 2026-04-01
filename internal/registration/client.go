@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
 )
 
 const (

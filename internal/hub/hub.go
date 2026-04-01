@@ -17,11 +17,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/auth"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/bandwidth"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
-	hostn "github.com/AtDexters-Lab/nexus-proxy-server/internal/hostnames"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
+	"github.com/AtDexters-Lab/nexus-proxy/protocol"
+
+	"github.com/AtDexters-Lab/nexus-proxy/internal/auth"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/bandwidth"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	hostn "github.com/AtDexters-Lab/nexus-proxy/hostnames"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
 	"github.com/gorilla/websocket"
 )
 
@@ -371,10 +373,6 @@ func (h *hubImpl) handlePeerConnect(w http.ResponseWriter, r *http.Request) {
 	h.peerManager.HandleInboundPeer(conn)
 }
 
-type challengeMessage struct {
-	Type  string `json:"type"`
-	Nonce string `json:"nonce"`
-}
 
 type stage0Info struct {
 	Hostnames []string
@@ -406,7 +404,7 @@ func (h *hubImpl) performHandshake(conn *websocket.Conn) (*Backend, error) {
 		return nil, fmt.Errorf("generate challenge nonce: %w", err)
 	}
 
-	if err := sendChallenge(conn, challengeMessage{Type: "handshake_challenge", Nonce: nonce}); err != nil {
+	if err := sendChallenge(conn, protocol.ChallengeMessage{Type: protocol.ChallengeHandshake, Nonce: nonce}); err != nil {
 		return nil, fmt.Errorf("send challenge: %w", err)
 	}
 
@@ -574,7 +572,7 @@ func (h *hubImpl) buildMetadataFromClaims(claims *auth.Claims, expected *stage0I
 	return meta, nil
 }
 
-func sendChallenge(conn *websocket.Conn, msg challengeMessage) error {
+func sendChallenge(conn *websocket.Conn, msg protocol.ChallengeMessage) error {
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		return err

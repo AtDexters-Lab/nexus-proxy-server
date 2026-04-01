@@ -1,3 +1,8 @@
 .config*
-.gocache
+.gocache/
+.gobuild/
 bin/
+config.yaml
+/nexus-proxy-server
+/nexus-proxy-client
+/nexus-proxy

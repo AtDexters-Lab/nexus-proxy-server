@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/bandwidth"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/bandwidth"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )

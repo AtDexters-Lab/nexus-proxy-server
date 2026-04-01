@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

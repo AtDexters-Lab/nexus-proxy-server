@@ -4,7 +4,7 @@ set -euo pipefail
 # Nexus Proxy Server installer (HTTP-01 ACME ready)
 # Usage: curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/scripts/install.sh | bash
 
-REPO="AtDexters-Lab/nexus-proxy-server"
+REPO="AtDexters-Lab/nexus-proxy"
 BIN_NAME="nexus-proxy-server"
 INSTALL_DIR="/usr/local/bin"
 ETC_DIR="/etc/nexus-proxy-server"

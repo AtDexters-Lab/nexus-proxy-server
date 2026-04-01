@@ -5,7 +5,7 @@ import (
 	"math"
 	"sync"
 
-	"github.com/AtDexters-Lab/nexus-proxy-server/internal/iface"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
 )
 
 // LoadBalancerPool manages a collection of backend instances for a single hostname.

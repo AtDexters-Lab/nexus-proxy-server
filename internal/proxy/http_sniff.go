@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	hn "github.com/AtDexters-Lab/nexus-proxy-server/internal/hostnames"
+	hn "github.com/AtDexters-Lab/nexus-proxy/hostnames"
 )
 
 var (
