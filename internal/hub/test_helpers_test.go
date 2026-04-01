@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/AtDexters-Lab/nexus-proxy/internal/auth"
+	"github.com/AtDexters-Lab/nexus-proxy/protocol"
 )
 
 type stubValidator struct {
@@ -18,5 +19,5 @@ func (s stubValidator) Validate(ctx context.Context, token string) (*auth.Claims
 	if s.claims != nil {
 		return s.claims.Copy(), nil
 	}
-	return (&auth.Claims{Hostnames: []string{"example.com"}}).Copy(), nil
+	return (&auth.Claims{BackendClaims: protocol.BackendClaims{Hostnames: []string{"example.com"}}}).Copy(), nil
 }

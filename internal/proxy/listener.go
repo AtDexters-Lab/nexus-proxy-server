@@ -11,9 +11,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
 	hn "github.com/AtDexters-Lab/nexus-proxy/hostnames"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
 	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
+	"github.com/AtDexters-Lab/nexus-proxy/protocol"
 )
 
 // Listener is responsible for accepting incoming connections from end-users.
@@ -148,7 +149,7 @@ func (l *Listener) handleConnection(conn net.Conn) {
 				return
 			}
 
-			routeKey = "tcp:" + strconv.Itoa(localPort)
+			routeKey = protocol.RouteKey(protocol.TransportTCP, localPort)
 			prelude = httpPrelude
 			isTLS = tlsDetected
 			log.Printf("INFO: No SNI/Host for %s on :%d; attempting port-claim route '%s' (TLS detected: %v)", conn.RemoteAddr(), localPort, routeKey, tlsDetected)

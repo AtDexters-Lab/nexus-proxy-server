@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AtDexters-Lab/nexus-proxy/protocol"
 	"github.com/google/uuid"
 )
 
@@ -201,7 +202,7 @@ func (l *Listener) listenOnUDPPort(port int) {
 
 	log.Printf("INFO: Public UDP listener started on %s", listenAddr)
 
-	routeKey := "udp:" + strconv.Itoa(port)
+	routeKey := protocol.RouteKey(protocol.TransportUDP, port)
 	maxDatagram := l.config.UDPMaxDatagramBytesOrDefault()
 	if maxDatagram > 0 && maxDatagram < 65507 {
 		// Detect oversize packets by reading max+1 bytes.

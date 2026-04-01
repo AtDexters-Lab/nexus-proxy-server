@@ -556,7 +556,7 @@ func (m *Manager) GetPeerForHostname(hostname string) (iface.Peer, bool) {
 // HandleTunnelRequest is called by a peer's read pump when it receives a request to
 // establish a tunnel for a client. It selects a local backend and starts the proxying.
 func (m *Manager) HandleTunnelRequest(p iface.Peer, hostname string, clientID uuid.UUID, clientIP string, connPort int, isTLS bool) {
-	if strings.HasPrefix(hostname, "udp:") {
+	if strings.HasPrefix(hostname, protocol.RouteKeyPrefixUDP) {
 		log.Printf("INFO: [UDP-TUNNEL-IN] Received tunnel request for client %s to route '%s' from peer %s", clientID, hostname, p.Addr())
 		backend, err := m.hub.SelectBackend(hostname)
 		if err != nil {

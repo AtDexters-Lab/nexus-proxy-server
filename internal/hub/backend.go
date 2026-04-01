@@ -17,6 +17,7 @@ import (
 	"github.com/AtDexters-Lab/nexus-proxy/internal/auth"
 	"github.com/AtDexters-Lab/nexus-proxy/internal/bandwidth"
 	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/netutil"
 	"github.com/AtDexters-Lab/nexus-proxy/protocol"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -70,7 +71,8 @@ type Backend struct {
 	reauthPending bool
 	pendingNonce  string
 
-	httpClient *http.Client
+	httpClient   *http.Client
+	healthClient *http.Client
 
 	// Bandwidth management
 	bandwidthState     *bandwidth.BackendBandwidth
@@ -102,6 +104,7 @@ func NewBackend(conn *websocket.Conn, meta *AttestationMetadata, cfg *config.Con
 		maintenanceCap:      maintenanceCap,
 		authorizerStatusURI: meta.AuthorizerStatusURI,
 		httpClient:          httpClient,
+		healthClient:        newSSRFSafeClient(httpClient),
 	}
 
 	if b.reauthInterval > 0 && b.reauthGrace <= 0 {
@@ -118,14 +121,16 @@ func (b *Backend) ID() string {
 func (b *Backend) Close() {
 	b.closeOnce.Do(func() {
 		b.closed.Store(true)
-		close(b.quit)
+		close(b.quit) // stop pumps, reject new sends immediately
 		if b.conn != nil {
 			_ = b.conn.Close()
 		}
+		// never closed — forces gracefulCloseConn to use its full timer grace period
+		noAbort := make(chan struct{})
 		b.clients.Range(func(key, value interface{}) bool {
 			b.clients.Delete(key)
 			if clientConn, ok := value.(net.Conn); ok {
-				gracefulCloseConn(clientConn, b.quit)
+				gracefulCloseConn(clientConn, noAbort)
 			}
 			return true
 		})
@@ -185,8 +190,7 @@ func (b *Backend) AddClient(clientConn net.Conn, clientID uuid.UUID, hostname st
 }
 
 func (b *Backend) RemoveClient(clientID uuid.UUID) {
-	if _, ok := b.clients.Load(clientID); ok {
-		b.clients.Delete(clientID)
+	if _, ok := b.clients.LoadAndDelete(clientID); ok {
 		msg := protocol.ControlMessage{Event: protocol.EventDisconnect, ClientID: clientID}
 		if err := b.SendControlMessage(msg); err != nil {
 			log.Printf("ERROR: Failed to send disconnect message for client %s: %v", clientID, err)
@@ -434,30 +438,11 @@ func (b *Backend) handleControlMessage(msg protocol.ControlMessage) {
 	}
 }
 
-// gracefulCloseConn performs a TCP half-close, giving the kernel time to flush
-// the send buffer before tearing down the socket. The quit channel allows
-// Backend.Close() to cancel the delay during shutdown. Falls back to immediate
-// close for non-TCP connections.
-func gracefulCloseConn(conn net.Conn, quit <-chan struct{}) {
-	inner := conn
-	if u, ok := conn.(interface{ Unwrap() net.Conn }); ok {
-		inner = u.Unwrap()
-	}
-
-	if tc, ok := inner.(*net.TCPConn); ok {
-		_ = tc.CloseWrite()
-		// Deferred full close to reclaim the FD and unblock paused readers.
-		go func() {
-			select {
-			case <-time.After(tcpCloseGracePeriod):
-			case <-quit:
-			}
-			_ = conn.Close()
-		}()
-		return
-	}
-
-	_ = conn.Close()
+// gracefulCloseConn performs a TCP half-close with a grace period. The abort
+// channel skips the grace period when closed; pass a never-closed channel for
+// the full grace period (used in Backend.Close).
+func gracefulCloseConn(conn net.Conn, abort <-chan struct{}) {
+	netutil.GracefulCloseConn(conn, abort, tcpCloseGracePeriod)
 }
 
 func (b *Backend) handlePauseStream(clientID uuid.UUID) {
@@ -709,7 +694,7 @@ func (b *Backend) authorizerHealthy() (bool, error) {
 		return false, err
 	}
 
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.healthClient.Do(req)
 	if err != nil {
 		return false, err
 	}

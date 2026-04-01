@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/protocol"
 	"github.com/golang-jwt/jwt/v5"
 )
 
@@ -54,7 +55,7 @@ func (v *localValidator) Validate(ctx context.Context, token string) (*Claims, e
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return v.secret, nil
-	}, jwt.WithAudience("nexus"), jwt.WithIssuer("authorizer"))
+	}, jwt.WithAudience(protocol.TokenAudience), jwt.WithIssuer(protocol.TokenIssuer))
 	if err != nil {
 		return nil, fmt.Errorf("jwt validation failed: %w", err)
 	}

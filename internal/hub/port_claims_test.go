@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AtDexters-Lab/nexus-proxy/internal/auth"
 	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/protocol"
 	"github.com/stretchr/testify/require"
 )
 
@@ -49,7 +49,7 @@ func TestNormalizeUDPRouteClaims_ClampsTimeout(t *testing.T) {
 		UDPFlowIdleTimeoutMaxSeconds:     300,
 	}
 
-	routes, err := normalizeUDPRouteClaims(cfg, []auth.UDPRouteClaim{
+	routes, err := normalizeUDPRouteClaims(cfg, []protocol.UDPRouteClaim{
 		{Port: 53, FlowIdleTimeoutSeconds: ptrInt(1)},
 	})
 	require.NoError(t, err)
@@ -57,13 +57,13 @@ func TestNormalizeUDPRouteClaims_ClampsTimeout(t *testing.T) {
 	require.Equal(t, 53, routes[0].Port)
 	require.Equal(t, 5*time.Second, routes[0].FlowIdleTimeout)
 
-	routes, err = normalizeUDPRouteClaims(cfg, []auth.UDPRouteClaim{
+	routes, err = normalizeUDPRouteClaims(cfg, []protocol.UDPRouteClaim{
 		{Port: 53, FlowIdleTimeoutSeconds: ptrInt(1000)},
 	})
 	require.NoError(t, err)
 	require.Equal(t, 300*time.Second, routes[0].FlowIdleTimeout)
 
-	routes, err = normalizeUDPRouteClaims(cfg, []auth.UDPRouteClaim{
+	routes, err = normalizeUDPRouteClaims(cfg, []protocol.UDPRouteClaim{
 		{Port: 53},
 	})
 	require.NoError(t, err)
@@ -80,7 +80,7 @@ func TestNormalizeUDPRouteClaims_ConflictingPolicies(t *testing.T) {
 		UDPFlowIdleTimeoutMaxSeconds:     300,
 	}
 
-	_, err := normalizeUDPRouteClaims(cfg, []auth.UDPRouteClaim{
+	_, err := normalizeUDPRouteClaims(cfg, []protocol.UDPRouteClaim{
 		{Port: 53, FlowIdleTimeoutSeconds: ptrInt(10)},
 		{Port: 53, FlowIdleTimeoutSeconds: ptrInt(20)},
 	})

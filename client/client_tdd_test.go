@@ -211,13 +211,8 @@ func TestHandleTextMessageRespondsToReauthChallenge(t *testing.T) {
 func TestSendControlMessageSkipsMarshalErrors(t *testing.T) {
 	c := newTestClient(t)
 
-	originalMarshal := jsonMarshal
-	defer func() {
-		jsonMarshal = originalMarshal
-	}()
-
 	wantErr := "marshal failed"
-	jsonMarshal = func(v interface{}) ([]byte, error) {
+	c.marshalJSON = func(v interface{}) ([]byte, error) {
 		return nil, errors.New(wantErr)
 	}
 
@@ -251,10 +246,12 @@ func TestHandleControlMessageWithTransport(t *testing.T) {
 	}
 
 	var capturedReq ConnectRequest
+	done := make(chan struct{}, 1)
 	c, err := New(cfg,
 		WithTokenProvider(constantProvider{value: "token"}),
 		WithConnectHandler(func(ctx context.Context, req ConnectRequest) (net.Conn, error) {
 			capturedReq = req
+			close(done)
 			return nil, ErrNoRoute
 		}),
 	)
@@ -266,13 +263,15 @@ func TestHandleControlMessageWithTransport(t *testing.T) {
 	c.cancel = cancel
 	defer cancel()
 
-	// Test with UDP transport
 	clientID := uuid.New()
 	payload := fmt.Sprintf(`{"event":"connect","client_id":"%s","conn_port":53,"transport":"udp","hostname":"udp:53"}`, clientID)
 	c.handleControlMessage([]byte(payload))
 
-	// Wait a bit for the goroutine to process
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("connect handler was not called")
+	}
 
 	if capturedReq.Transport != TransportUDP {
 		t.Fatalf("expected transport UDP, got %s", capturedReq.Transport)
@@ -294,10 +293,12 @@ func TestHandleControlMessageDefaultsToTCP(t *testing.T) {
 	}
 
 	var capturedReq ConnectRequest
+	done := make(chan struct{}, 1)
 	c, err := New(cfg,
 		WithTokenProvider(constantProvider{value: "token"}),
 		WithConnectHandler(func(ctx context.Context, req ConnectRequest) (net.Conn, error) {
 			capturedReq = req
+			close(done)
 			return nil, ErrNoRoute
 		}),
 	)
@@ -309,13 +310,15 @@ func TestHandleControlMessageDefaultsToTCP(t *testing.T) {
 	c.cancel = cancel
 	defer cancel()
 
-	// Test without transport field (should default to TCP)
 	clientID := uuid.New()
 	payload := fmt.Sprintf(`{"event":"connect","client_id":"%s","conn_port":80,"hostname":"example.com"}`, clientID)
 	c.handleControlMessage([]byte(payload))
 
-	// Wait a bit for the goroutine to process
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("connect handler was not called")
+	}
 
 	if capturedReq.Transport != TransportTCP {
 		t.Fatalf("expected transport TCP (default), got %s", capturedReq.Transport)
@@ -374,10 +377,12 @@ func TestHandleControlMessageWithUnrecognizedTransport(t *testing.T) {
 	}
 
 	var capturedReq ConnectRequest
+	done := make(chan struct{}, 1)
 	c, err := New(cfg,
 		WithTokenProvider(constantProvider{value: "token"}),
 		WithConnectHandler(func(ctx context.Context, req ConnectRequest) (net.Conn, error) {
 			capturedReq = req
+			close(done)
 			return nil, ErrNoRoute
 		}),
 	)
@@ -389,13 +394,15 @@ func TestHandleControlMessageWithUnrecognizedTransport(t *testing.T) {
 	c.cancel = cancel
 	defer cancel()
 
-	// Test with unrecognized transport - should default to TCP
 	clientID := uuid.New()
 	payload := fmt.Sprintf(`{"event":"connect","client_id":"%s","conn_port":80,"transport":"invalid_transport","hostname":"example.com"}`, clientID)
 	c.handleControlMessage([]byte(payload))
 
-	// Wait for the goroutine to process
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("connect handler was not called")
+	}
 
 	if capturedReq.Transport != TransportTCP {
 		t.Fatalf("expected unrecognized transport to default to TCP, got %s", capturedReq.Transport)

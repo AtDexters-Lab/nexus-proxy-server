@@ -11,17 +11,19 @@ import (
 	"time"
 
 	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
-	"github.com/AtDexters-Lab/nexus-proxy/protocol"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/netutil"
 	"github.com/AtDexters-Lab/nexus-proxy/internal/proxy"
+	"github.com/AtDexters-Lab/nexus-proxy/protocol"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
 const (
-	writeWait      = 10 * time.Second
-	pongWait       = 60 * time.Second
-	pingPeriod     = (pongWait * 9) / 10
-	reconnectDelay = 5 * time.Second
+	writeWait            = 10 * time.Second
+	pongWait             = 60 * time.Second
+	pingPeriod           = (pongWait * 9) / 10
+	reconnectDelay       = 5 * time.Second
+	tcpCloseGracePeriod  = 2 * time.Second
 )
 
 type peerImpl struct {
@@ -215,7 +217,7 @@ func (p *peerImpl) readPump() {
 
 						if _, err := clientConn.Write(payload); err != nil {
 							log.Printf("WARN: [PEER-TUNNEL] Failed to write back to client %s: %v. Closing connection.", clientID, err)
-							clientConn.Close() // This will cause the StartTunnel read loop to exit.
+							netutil.GracefulCloseConn(clientConn, p.manager.Done(), tcpCloseGracePeriod)
 						} else {
 							// Record sent bytes
 							if bandwidthScheduler != nil {
@@ -246,8 +248,8 @@ func (p *peerImpl) readPump() {
 				if rawConn, ok := p.activeTunnels.Load(clientID); ok {
 					if clientConn, ok := rawConn.(net.Conn); ok {
 						log.Printf("INFO: [PEER-TUNNEL] Peer signaled close for our outbound tunnel %s. Closing client connection.", clientID)
-						clientConn.Close()
-						p.activeTunnels.Delete(clientID) // Clean up the map.
+						clientConn.Close() // Immediate close — peer explicitly signaled tunnel end.
+						p.activeTunnels.Delete(clientID)
 					}
 				} else {
 					// Otherwise, it may be an outbound UDP flow.
@@ -335,7 +337,7 @@ func (p *peerImpl) writePump(ctx context.Context) {
 
 // StartTunnel initiates the tunneling of a client connection to target peer.
 func (p *peerImpl) StartTunnel(conn net.Conn, hostname string, isTLS bool) {
-	defer conn.Close()
+	defer netutil.GracefulCloseConn(conn, p.manager.Done(), tcpCloseGracePeriod)
 
 	clientID := uuid.New()
 

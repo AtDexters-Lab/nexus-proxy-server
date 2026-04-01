@@ -315,7 +315,7 @@ func LoadConfig(path string) (*Config, error) {
 		seen := make(map[string]struct{}, len(b.Hostnames))
 		for _, rawHost := range b.Hostnames {
 			// Reject hostnames that look like route keys
-			if strings.HasPrefix(rawHost, "tcp:") || strings.HasPrefix(rawHost, "udp:") {
+			if strings.HasPrefix(rawHost, protocol.RouteKeyPrefixTCP) || strings.HasPrefix(rawHost, protocol.RouteKeyPrefixUDP) {
 				return nil, fmt.Errorf("backend '%s': invalid hostname '%s' (cannot use route key format)", b.Name, rawHost)
 			}
 			host := normalizeHostname(rawHost)

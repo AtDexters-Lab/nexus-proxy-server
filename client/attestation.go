@@ -8,8 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/AtDexters-Lab/nexus-proxy/protocol"
 	"github.com/golang-jwt/jwt/v5"
 )
 
@@ -74,7 +76,8 @@ type AttestationOptions struct {
 // CommandTokenProvider implements TokenProvider by invoking an external command.
 type CommandTokenProvider struct {
 	cfg            AttestationOptions
-	handshakeCache tokenCache
+	mu             sync.Mutex
+	handshakeCache map[string]tokenCache
 }
 
 // tokenCache stores a cached token until its expiry.
@@ -108,6 +111,14 @@ func (tc *tokenCache) set(tok Token, ttl time.Duration) {
 		tc.expiry = time.Now().Add(ttl)
 		return
 	}
+	// Use the earlier of the configured cache TTL and the token's own expiry.
+	if ttl > 0 {
+		cacheDeadline := time.Now().Add(ttl)
+		if cacheDeadline.Before(tok.Expiry) {
+			tc.expiry = cacheDeadline
+			return
+		}
+	}
 	tc.expiry = tok.Expiry
 }
 
@@ -119,15 +130,19 @@ func NewCommandTokenProvider(cfg AttestationOptions) (*CommandTokenProvider, err
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 15 * time.Second
 	}
-	return &CommandTokenProvider{cfg: cfg}, nil
+	return &CommandTokenProvider{cfg: cfg, handshakeCache: make(map[string]tokenCache)}, nil
 }
 
 // IssueToken invokes the configured command to retrieve an attestation token.
 func (c *CommandTokenProvider) IssueToken(ctx context.Context, req TokenRequest) (Token, error) {
 	if req.Stage == StageHandshake && c.cfg.CacheHandshake > 0 {
-		if tok, ok := c.handshakeCache.get(time.Now()); ok {
+		c.mu.Lock()
+		tc := c.handshakeCache[req.BackendName]
+		if tok, ok := tc.get(time.Now()); ok {
+			c.mu.Unlock()
 			return tok, nil
 		}
+		c.mu.Unlock()
 	}
 
 	cmdCtx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
@@ -163,7 +178,11 @@ func (c *CommandTokenProvider) IssueToken(ctx context.Context, req TokenRequest)
 	}
 
 	if req.Stage == StageHandshake && c.cfg.CacheHandshake > 0 && tok.Value != "" {
-		c.handshakeCache.set(tok, c.cfg.CacheHandshake)
+		c.mu.Lock()
+		tc := c.handshakeCache[req.BackendName]
+		tc.set(tok, c.cfg.CacheHandshake)
+		c.handshakeCache[req.BackendName] = tc
+		c.mu.Unlock()
 	}
 
 	return tok, nil
@@ -313,11 +332,11 @@ func (h *HMACTokenProvider) IssueToken(ctx context.Context, req TokenRequest) (T
 	exp := now.Add(ttl)
 
 	claims := attestationClaims{
-		Weight: h.weight,
+		BackendClaims: protocol.BackendClaims{Weight: h.weight},
 		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:    "authorizer",
+			Issuer:    protocol.TokenIssuer,
 			Subject:   h.backendName,
-			Audience:  jwt.ClaimStrings{"nexus"},
+			Audience:  jwt.ClaimStrings{protocol.TokenAudience},
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(exp),
 		},
@@ -335,9 +354,9 @@ func (h *HMACTokenProvider) IssueToken(ctx context.Context, req TokenRequest) (T
 
 	// Only include UDP routes if present
 	if len(h.udpRoutes) > 0 {
-		claims.UDPRoutes = make([]udpRouteClaim, len(h.udpRoutes))
+		claims.UDPRoutes = make([]protocol.UDPRouteClaim, len(h.udpRoutes))
 		for i, r := range h.udpRoutes {
-			claims.UDPRoutes[i] = udpRouteClaim{Port: r.Port}
+			claims.UDPRoutes[i] = protocol.UDPRouteClaim{Port: r.Port}
 			if r.FlowIdleTimeoutSeconds != nil {
 				timeout := *r.FlowIdleTimeoutSeconds
 				claims.UDPRoutes[i].FlowIdleTimeoutSeconds = &timeout
@@ -390,21 +409,6 @@ func optionalInt(val int) *int {
 }
 
 type attestationClaims struct {
-	Hostnames                  []string        `json:"hostnames,omitempty"`
-	TCPPorts                   []int           `json:"tcp_ports,omitempty"`
-	UDPRoutes                  []udpRouteClaim `json:"udp_routes,omitempty"`
-	Weight                     int             `json:"weight"`
-	SessionNonce               string          `json:"session_nonce,omitempty"`
-	HandshakeMaxAgeSeconds     *int            `json:"handshake_max_age_seconds,omitempty"`
-	ReauthIntervalSeconds      *int            `json:"reauth_interval_seconds,omitempty"`
-	ReauthGraceSeconds         *int            `json:"reauth_grace_seconds,omitempty"`
-	MaintenanceGraceCapSeconds *int            `json:"maintenance_grace_cap_seconds,omitempty"`
-	AuthorizerStatusURI        string          `json:"authorizer_status_uri,omitempty"`
-	PolicyVersion              string          `json:"policy_version,omitempty"`
+	protocol.BackendClaims
 	jwt.RegisteredClaims
-}
-
-type udpRouteClaim struct {
-	Port                   int  `json:"port"`
-	FlowIdleTimeoutSeconds *int `json:"flow_idle_timeout_seconds,omitempty"`
 }

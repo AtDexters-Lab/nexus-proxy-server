@@ -601,7 +601,7 @@ func normalizeHostnames(hosts []string) ([]string, error) {
 		}
 		// Prevent backends from claiming reserved route-key strings via hostnames.
 		// Route keys share the same namespace as hostnames in h.pools.
-		if strings.HasPrefix(n, "tcp:") || strings.HasPrefix(n, "udp:") {
+		if strings.HasPrefix(n, protocol.RouteKeyPrefixTCP) || strings.HasPrefix(n, protocol.RouteKeyPrefixUDP) {
 			return nil, fmt.Errorf("reserved route key %q cannot be used as a hostname claim", n)
 		}
 		if _, ok := uniq[n]; ok {
@@ -642,7 +642,7 @@ func normalizeTCPPortClaims(cfg *config.Config, ports []int) ([]int, error) {
 	return out, nil
 }
 
-func normalizeUDPRouteClaims(cfg *config.Config, routes []auth.UDPRouteClaim) ([]UDPRoutePolicy, error) {
+func normalizeUDPRouteClaims(cfg *config.Config, routes []protocol.UDPRouteClaim) ([]UDPRoutePolicy, error) {
 	if len(routes) == 0 {
 		return nil, nil
 	}
@@ -800,7 +800,7 @@ func (h *hubImpl) register(b *Backend) {
 	}
 
 	for _, port := range b.tcpPorts {
-		routeKey := fmt.Sprintf("tcp:%d", port)
+		routeKey := protocol.RouteKey(protocol.TransportTCP, port)
 		rawPool, _ := h.pools.LoadOrStore(routeKey, NewLoadBalancerPool())
 		pool := rawPool.(*LoadBalancerPool)
 		pool.AddBackend(b)
@@ -808,7 +808,7 @@ func (h *hubImpl) register(b *Backend) {
 	}
 
 	for _, route := range b.udpRoutes {
-		routeKey := fmt.Sprintf("udp:%d", route.Port)
+		routeKey := protocol.RouteKey(protocol.TransportUDP, route.Port)
 		rawPool, _ := h.pools.LoadOrStore(routeKey, NewLoadBalancerPool())
 		pool := rawPool.(*LoadBalancerPool)
 		pool.AddBackend(b)
@@ -843,7 +843,7 @@ func (h *hubImpl) unregister(b *Backend) {
 	}
 
 	for _, port := range b.tcpPorts {
-		routeKey := fmt.Sprintf("tcp:%d", port)
+		routeKey := protocol.RouteKey(protocol.TransportTCP, port)
 		if rawPool, ok := h.pools.Load(routeKey); ok {
 			pool := rawPool.(*LoadBalancerPool)
 			pool.RemoveBackend(b)
@@ -852,7 +852,7 @@ func (h *hubImpl) unregister(b *Backend) {
 	}
 
 	for _, route := range b.udpRoutes {
-		routeKey := fmt.Sprintf("udp:%d", route.Port)
+		routeKey := protocol.RouteKey(protocol.TransportUDP, route.Port)
 		if rawPool, ok := h.pools.Load(routeKey); ok {
 			pool := rawPool.(*LoadBalancerPool)
 			pool.RemoveBackend(b)

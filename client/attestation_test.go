@@ -308,3 +308,29 @@ func TestCopyUDPRoutesDeepCopy(t *testing.T) {
 		t.Fatalf("copy shares same pointer as original")
 	}
 }
+
+func TestTokenCacheRespectsShortTTL(t *testing.T) {
+	var tc tokenCache
+	farFuture := time.Now().Add(1 * time.Hour)
+	tok := Token{Value: "test", Expiry: farFuture}
+
+	// TTL (5s) is much shorter than token expiry (1h) — cache should use TTL
+	tc.set(tok, 5*time.Second)
+
+	if tc.expiry.After(time.Now().Add(10 * time.Second)) {
+		t.Fatalf("cache expiry %v should be ~5s from now, not at token expiry %v", tc.expiry, farFuture)
+	}
+}
+
+func TestTokenCacheUsesTokenExpiryWhenShorter(t *testing.T) {
+	var tc tokenCache
+	shortExpiry := time.Now().Add(3 * time.Second)
+	tok := Token{Value: "test", Expiry: shortExpiry}
+
+	// TTL (1h) is much longer than token expiry (3s) — cache should use token expiry
+	tc.set(tok, 1*time.Hour)
+
+	if tc.expiry.After(time.Now().Add(10 * time.Second)) {
+		t.Fatalf("cache expiry %v should be near token expiry %v, not 1h from now", tc.expiry, shortExpiry)
+	}
+}

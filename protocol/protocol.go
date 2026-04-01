@@ -1,6 +1,10 @@
 package protocol
 
-import "github.com/google/uuid"
+import (
+	"strconv"
+
+	"github.com/google/uuid"
+)
 
 type Transport string
 
@@ -8,6 +12,26 @@ const (
 	TransportTCP Transport = "tcp"
 	TransportUDP Transport = "udp"
 )
+
+const (
+	TokenIssuer   = "authorizer"
+	TokenAudience = "nexus"
+)
+
+const (
+	RouteKeyPrefixTCP = "tcp:"
+	RouteKeyPrefixUDP = "udp:"
+)
+
+// RouteKey returns the route key for a port-claimed transport and port.
+func RouteKey(transport Transport, port int) string {
+	switch transport {
+	case TransportUDP:
+		return RouteKeyPrefixUDP + strconv.Itoa(port)
+	default:
+		return RouteKeyPrefixTCP + strconv.Itoa(port)
+	}
+}
 
 const (
 	// ClientIDLength is the expected length of a client's unique identifier (UUID).
@@ -67,6 +91,29 @@ const (
 type ChallengeMessage struct {
 	Type  ChallengeType `json:"type"`
 	Nonce string        `json:"nonce"`
+}
+
+// BackendClaims represents the custom attestation fields shared by both the
+// client (token producer) and the server (token consumer). Each side embeds
+// this struct alongside jwt.RegisteredClaims locally.
+type BackendClaims struct {
+	Hostnames                  []string        `json:"hostnames,omitempty"`
+	TCPPorts                   []int           `json:"tcp_ports,omitempty"`
+	UDPRoutes                  []UDPRouteClaim `json:"udp_routes,omitempty"`
+	Weight                     int             `json:"weight"`
+	SessionNonce               string          `json:"session_nonce,omitempty"`
+	HandshakeMaxAgeSeconds     *int            `json:"handshake_max_age_seconds,omitempty"`
+	ReauthIntervalSeconds      *int            `json:"reauth_interval_seconds,omitempty"`
+	ReauthGraceSeconds         *int            `json:"reauth_grace_seconds,omitempty"`
+	MaintenanceGraceCapSeconds *int            `json:"maintenance_grace_cap_seconds,omitempty"`
+	AuthorizerStatusURI        string          `json:"authorizer_status_uri,omitempty"`
+	PolicyVersion              string          `json:"policy_version,omitempty"`
+}
+
+// UDPRouteClaim represents a UDP route within attestation claims.
+type UDPRouteClaim struct {
+	Port                   int  `json:"port"`
+	FlowIdleTimeoutSeconds *int `json:"flow_idle_timeout_seconds,omitempty"`
 }
 
 // DisconnectReason identifies why a backend disconnected a client.

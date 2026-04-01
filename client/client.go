@@ -23,7 +23,6 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var jsonMarshal = json.Marshal
 
 // jitterRand is a local random source seeded with crypto/rand for unpredictable backoff jitter.
 // This prevents synchronized reconnection patterns across multiple client instances.
@@ -440,6 +439,7 @@ type ClientBackendConfig struct {
 // Client manages the full lifecycle for one configured backend service.
 type Client struct {
 	config      ClientBackendConfig
+	marshalJSON func(interface{}) ([]byte, error)
 	ws          *websocket.Conn
 	wsMu        sync.Mutex
 	localConns  sync.Map
@@ -508,6 +508,7 @@ func New(cfg ClientBackendConfig, opts ...Option) (*Client, error) {
 
 	c := &Client{
 		config:      cfg,
+		marshalJSON: json.Marshal,
 		controlSend: make(chan outboundMessage, controlQueueSize),
 		dataReady:   make(chan uuid.UUID, 256), // Buffer: 256
 		eventCh:     make(chan Event, eventBufferSize),
@@ -967,13 +968,24 @@ func (c *Client) connectAndAuthenticate() error {
 // closeAllLocalConns closes all active local connections.
 // Called on WS session end since connections cannot be resumed across sessions.
 func (c *Client) closeAllLocalConns() {
+	var wg sync.WaitGroup
 	c.localConns.Range(func(key, value interface{}) bool {
 		if conn, ok := value.(*clientConn); ok {
-			// Use transitionToClosed to ensure stats are updated and events emitted
-			c.transitionToClosed(conn, DisconnectSessionEnded)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				c.transitionToClosed(conn, DisconnectSessionEnded)
+			}()
 		}
 		return true
 	})
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(connectionDrainTimeout + 2*time.Second):
+		log.Printf("WARN: [%s] closeAllLocalConns timed out, some connections may not have drained", c.config.Name)
+	}
 }
 
 func (c *Client) cleanup() {
@@ -1713,7 +1725,7 @@ func (c *Client) sendControlMessage(event protocol.EventType, clientID uuid.UUID
 		ClientID: clientID,
 	}
 
-	payload, err := jsonMarshal(msg)
+	payload, err := c.marshalJSON(msg)
 	if err != nil {
 		log.Printf("ERROR: [%s] Failed to marshal control message '%s' for client %s: %v", c.config.Name, event, clientID, err)
 		return err
@@ -1746,7 +1758,7 @@ func (c *Client) sendDisconnectMessage(clientID uuid.UUID, reason DisconnectReas
 		Reason:   string(reason),
 	}
 
-	payload, err := jsonMarshal(msg)
+	payload, err := c.marshalJSON(msg)
 	if err != nil {
 		log.Printf("ERROR: [%s] Failed to marshal disconnect for client %s: %v", c.config.Name, clientID, err)
 		return err
