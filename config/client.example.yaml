@@ -49,6 +49,17 @@ backends:
       tokenTTLSeconds: 45
       reauthIntervalSeconds: 900
       reauthGraceSeconds: 15
+      # Enable outbound connections so this backend can send email via
+      # the proxy's static IP. The proxy must also have allowOutbound: true.
+      outboundAllowed: true
+      allowedOutboundPorts:
+        - 25
+        - 465
+        - 587
     portMappings:
       993:
         default: "localhost:993" # Relay secure IMAP (IMAPS) traffic
+    # Local SOCKS5 proxy for outbound connections. Applications on this host
+    # can route traffic through the proxy by connecting to this address.
+    # Example: curl --socks5 127.0.0.1:1080 https://example.com
+    socks5ListenAddr: "127.0.0.1:1080"

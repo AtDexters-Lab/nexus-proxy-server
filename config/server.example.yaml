@@ -107,6 +107,34 @@ peerAuthentication:
 #
 # totalBandwidthMbps: 1000
 
+# --- Outbound Proxy (Optional) ---
+# When enabled, backends with matching JWT claims can request the proxy to
+# open outbound TCP connections on their behalf, giving them a stable egress IP
+# (e.g., for SMTP relay, webhook delivery, or API calls from a known IP).
+#
+# allowOutbound: true
+#
+# Server-level port allowlist for outbound connections. When non-empty, only
+# these destination ports are allowed (in addition to per-backend JWT claims).
+# When empty/omitted, all ports are allowed for backends that have outbound enabled.
+# allowedOutboundPorts:
+#   - 25
+#   - 465
+#   - 587
+#   - 443
+#
+# Maximum concurrent outbound connections per backend. Defaults to 100.
+# Set to -1 for no limit.
+# maxOutboundConnsPerBackend: 100
+#
+# Timeout in seconds for outbound TCP dials. Defaults to 10.
+# outboundDialTimeoutSeconds: 10
+#
+# Idle timeout in seconds for established outbound connections.
+# Set to 0 (default) for no deadline — connections rely on remote close or
+# WebSocket disconnect. Separate from the inbound idleTimeoutSeconds.
+# outboundIdleTimeoutSeconds: 0
+
 # --- STUN Server (Optional) ---
 # Embedded STUN (RFC 5389) Binding server for public-IP discovery
 # and future WebRTC ICE candidate gathering.
