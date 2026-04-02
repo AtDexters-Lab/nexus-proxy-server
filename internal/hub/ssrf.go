@@ -9,8 +9,17 @@ import (
 	"time"
 )
 
+// Additional non-routable or internal ranges not covered by net.IP.IsPrivate.
+var (
+	// CGNAT / Shared Address Space (RFC 6598) — used by cloud VPCs for
+	// internal services, NAT gateways, and service mesh endpoints.
+	cgnatBlock = net.IPNet{IP: net.IP{100, 64, 0, 0}, Mask: net.CIDRMask(10, 32)}
+	// Benchmarking (RFC 2544) — reserved for network testing.
+	benchBlock = net.IPNet{IP: net.IP{198, 18, 0, 0}, Mask: net.CIDRMask(15, 32)}
+)
+
 // rejectPrivateIP returns an error if the IP is a private, loopback,
-// link-local, unspecified, or cloud metadata address.
+// link-local, unspecified, CGNAT, benchmarking, or cloud metadata address.
 func rejectPrivateIP(ip net.IP) error {
 	// Unmap IPv6-mapped IPv4 (e.g., ::ffff:127.0.0.1 → 127.0.0.1)
 	if mapped := ip.To4(); mapped != nil {
@@ -19,6 +28,9 @@ func rejectPrivateIP(ip net.IP) error {
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
 		return fmt.Errorf("IP %s is not allowed (private/loopback/link-local)", ip)
+	}
+	if cgnatBlock.Contains(ip) || benchBlock.Contains(ip) {
+		return fmt.Errorf("IP %s is not allowed (CGNAT/benchmarking range)", ip)
 	}
 	// Block cloud metadata endpoint
 	if ip.Equal(net.IPv4(169, 254, 169, 254)) {

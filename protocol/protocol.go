@@ -60,6 +60,12 @@ const (
 	EventPauseStream EventType = "pause_stream"
 	// EventResumeStream is sent from a backend to resume reading from a client.
 	EventResumeStream EventType = "resume_stream"
+	// EventOutboundConnect is sent from a backend to request the proxy to
+	// open an outbound TCP connection to an external target on its behalf.
+	EventOutboundConnect EventType = "outbound_connect"
+	// EventOutboundResult is sent from the proxy back to the backend with
+	// the result of an outbound connection request.
+	EventOutboundResult EventType = "outbound_result"
 )
 
 // ControlMessage defines the structure for out-of-band communication
@@ -76,6 +82,12 @@ type ControlMessage struct {
 	IsTLS bool `json:"is_tls,omitempty"`
 	// Reason provides context for disconnect or pause events.
 	Reason string `json:"reason,omitempty"`
+	// TargetAddr is the host:port that the backend wants to connect to
+	// (used with EventOutboundConnect).
+	TargetAddr string `json:"target_addr,omitempty"`
+	// Success indicates whether the outbound connection was established
+	// (used with EventOutboundResult).
+	Success bool `json:"success,omitempty"`
 }
 
 // ChallengeType identifies a WebSocket text-frame challenge during authentication.
@@ -108,6 +120,8 @@ type BackendClaims struct {
 	MaintenanceGraceCapSeconds *int            `json:"maintenance_grace_cap_seconds,omitempty"`
 	AuthorizerStatusURI        string          `json:"authorizer_status_uri,omitempty"`
 	PolicyVersion              string          `json:"policy_version,omitempty"`
+	OutboundAllowed            bool            `json:"outbound_allowed,omitempty"`
+	AllowedOutboundPorts       []int           `json:"allowed_outbound_ports,omitempty"`
 }
 
 // UDPRouteClaim represents a UDP route within attestation claims.

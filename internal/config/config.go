@@ -59,6 +59,15 @@ type Config struct {
 	// STUN server port (optional — omit or set to 0 to disable).
 	// When set, a STUN Binding server listens on this UDP port.
 	StunPort int `yaml:"stunPort"`
+
+	// Outbound proxy settings. When AllowOutbound is true, backends with
+	// matching JWT claims can request the proxy to open outbound TCP
+	// connections on their behalf (giving them a static egress IP).
+	AllowOutbound              bool  `yaml:"allowOutbound"`
+	AllowedOutboundPorts       []int `yaml:"allowedOutboundPorts"`       // server-level port gate; empty = all when allowed
+	MaxOutboundConnsPerBackend int   `yaml:"maxOutboundConnsPerBackend"` // 0 → default 100; -1 = no limit
+	OutboundDialTimeoutSeconds int   `yaml:"outboundDialTimeoutSeconds"` // default 10
+	OutboundIdleTimeoutSeconds int   `yaml:"outboundIdleTimeoutSeconds"` // 0 = no deadline
 }
 
 // IdleTimeout returns the idle timeout as a time.Duration.
@@ -126,6 +135,32 @@ func (c *Config) RegistrationEnabled() bool {
 // StunEnabled returns true if the embedded STUN server is configured.
 func (c *Config) StunEnabled() bool {
 	return c.StunPort > 0
+}
+
+// MaxOutboundConns returns the per-backend outbound connection limit.
+// Returns -1 for no limit.
+func (c *Config) MaxOutboundConns() int {
+	if c.MaxOutboundConnsPerBackend == 0 {
+		return 100
+	}
+	return c.MaxOutboundConnsPerBackend
+}
+
+// OutboundDialTimeout returns the timeout for outbound TCP dials.
+func (c *Config) OutboundDialTimeout() time.Duration {
+	if c.OutboundDialTimeoutSeconds <= 0 {
+		return 10 * time.Second
+	}
+	return time.Duration(c.OutboundDialTimeoutSeconds) * time.Second
+}
+
+// OutboundIdleTimeout returns the idle timeout for established outbound connections.
+// Returns 0 for no deadline (rely on remote close or WS disconnect).
+func (c *Config) OutboundIdleTimeout() time.Duration {
+	if c.OutboundIdleTimeoutSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(c.OutboundIdleTimeoutSeconds) * time.Second
 }
 
 // validate performs comprehensive validation of the loaded configuration.
@@ -214,6 +249,25 @@ func (c *Config) validate() error {
 				return fmt.Errorf("stunPort %d conflicts with udpRelayPorts — both bind the same UDP socket", c.StunPort)
 			}
 		}
+	}
+
+	// Validate outbound proxy settings.
+	if c.MaxOutboundConnsPerBackend < -1 {
+		return fmt.Errorf("maxOutboundConnsPerBackend must be >= -1")
+	}
+	if c.OutboundDialTimeoutSeconds < 0 {
+		return fmt.Errorf("outboundDialTimeoutSeconds cannot be negative")
+	}
+	if c.OutboundIdleTimeoutSeconds < 0 {
+		return fmt.Errorf("outboundIdleTimeoutSeconds cannot be negative")
+	}
+	for _, p := range c.AllowedOutboundPorts {
+		if p < 1 || p > 65535 {
+			return fmt.Errorf("allowedOutboundPorts contains invalid port %d", p)
+		}
+	}
+	if c.AllowOutbound && c.MaxOutboundConns() == -1 {
+		log.Printf("WARN: outbound connections enabled with no per-backend limit (maxOutboundConnsPerBackend=-1)")
 	}
 
 	// warnPortMismatch warns about ports present in one config list but absent from another.

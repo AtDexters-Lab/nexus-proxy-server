@@ -424,16 +424,17 @@ func (c *Client) drainConnection(conn *clientConn) {
 }
 
 type ClientBackendConfig struct {
-	Name         string
-	Hostnames    []string
-	TCPPorts     []int
-	UDPRoutes    []UDPRouteConfig
-	NexusAddress string
-	Weight       int
-	Attestation  AttestationOptions
-	PortMappings map[int]PortMapping
-	HealthChecks HealthCheckConfig
-	FlowControl  FlowControlConfig
+	Name             string
+	Hostnames        []string
+	TCPPorts         []int
+	UDPRoutes        []UDPRouteConfig
+	NexusAddress     string
+	Weight           int
+	Attestation      AttestationOptions
+	PortMappings     map[int]PortMapping
+	HealthChecks     HealthCheckConfig
+	FlowControl      FlowControlConfig
+	Socks5ListenAddr string
 }
 
 // Client manages the full lifecycle for one configured backend service.
@@ -469,6 +470,10 @@ type Client struct {
 	statsCacheMu   sync.RWMutex
 	statsCache     Stats
 	statsCacheTime time.Time
+
+	// Outbound proxy (SOCKS5)
+	socks5Listener  net.Listener
+	outboundPending sync.Map // uuid.UUID → chan error
 }
 
 // New creates a new Client instance for a specific backend configuration.
@@ -712,6 +717,8 @@ func (c *Client) Start(ctx context.Context) {
 		c.healthCheckPump()
 	}()
 
+	c.startSocks5Listener()
+
 	// Start the network state watcher for fast recovery (Linux only, best-effort)
 	networkWakeup := c.watchNetworkState()
 
@@ -744,6 +751,7 @@ func (c *Client) Start(ctx context.Context) {
 			c.wg.Wait() // Wait for pumps to exit, indicating a disconnection.
 			c.clearSendQueues()
 			c.closeAllLocalConns() // Close all local connections; they can't be resumed across sessions
+			c.drainOutboundPending()
 
 			// Fix [P2]: Ensure we clear any stranded queues from the map to prevent memory leaks across sessions
 			c.connQueues.Range(func(key, value interface{}) bool {
@@ -850,6 +858,9 @@ func (c *Client) Stop() {
 	}
 
 forceClose:
+	if c.socks5Listener != nil {
+		_ = c.socks5Listener.Close()
+	}
 	if c.cancel != nil {
 		c.cancel()
 	}
@@ -897,13 +908,15 @@ func (c *Client) issueToken(ctx context.Context, stage TokenStage, nonce string)
 	}
 
 	req := TokenRequest{
-		Stage:        stage,
-		SessionNonce: nonce,
-		BackendName:  c.config.Name,
-		Hostnames:    append([]string(nil), c.config.Hostnames...),
-		TCPPorts:     append([]int(nil), c.config.TCPPorts...),
-		UDPRoutes:    CopyUDPRoutes(c.config.UDPRoutes),
-		Weight:       c.config.Weight,
+		Stage:                stage,
+		SessionNonce:         nonce,
+		BackendName:          c.config.Name,
+		Hostnames:            append([]string(nil), c.config.Hostnames...),
+		TCPPorts:             append([]int(nil), c.config.TCPPorts...),
+		UDPRoutes:            CopyUDPRoutes(c.config.UDPRoutes),
+		Weight:               c.config.Weight,
+		OutboundAllowed:      c.config.Attestation.OutboundAllowed,
+		AllowedOutboundPorts: append([]int(nil), c.config.Attestation.AllowedOutboundPorts...),
 	}
 
 	token, err := provider.IssueToken(ctx, req)
@@ -1128,6 +1141,20 @@ func (c *Client) handleControlMessage(payload []byte) {
 				conn.cancelPongTimer() // Cancel the pong timeout timer
 				conn.pingSent.Store(false)
 				conn.lastActivity.Store(time.Now().Unix())
+			}
+		}
+
+	case protocol.EventOutboundResult:
+		if val, ok := c.outboundPending.LoadAndDelete(msg.ClientID); ok {
+			ch := val.(chan error)
+			if msg.Success {
+				ch <- nil
+			} else {
+				reason := msg.Reason
+				if reason == "" {
+					reason = "outbound connection failed"
+				}
+				ch <- fmt.Errorf("%s", reason)
 			}
 		}
 	}
@@ -2120,4 +2147,201 @@ func (c *Client) handleReauthChallenge(nonce string) error {
 
 	c.emit(Event{Type: EventReauthCompleted})
 	return nil
+}
+
+// --- Outbound proxy (SOCKS5) ---
+
+const outboundConnectTimeout = 15 * time.Second
+
+// startSocks5Listener starts the SOCKS5 listener if configured. It is
+// non-fatal if the listener fails to bind.
+func (c *Client) startSocks5Listener() {
+	addr := c.config.Socks5ListenAddr
+	if addr == "" {
+		return
+	}
+
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		log.Printf("ERROR: [%s] Invalid socks5ListenAddr %q: %v", c.config.Name, addr, err)
+		return
+	}
+	if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() {
+		log.Printf("WARN: [%s] SOCKS5 listener bound to non-loopback address %s — unauthenticated access from the network", c.config.Name, addr)
+	}
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("ERROR: [%s] Failed to start SOCKS5 listener on %s: %v", c.config.Name, addr, err)
+		return
+	}
+	c.socks5Listener = ln
+	log.Printf("INFO: [%s] SOCKS5 outbound proxy listening on %s", c.config.Name, addr)
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				select {
+				case <-c.ctx.Done():
+					return
+				default:
+				}
+				if !errors.Is(err, net.ErrClosed) {
+					log.Printf("WARN: [%s] SOCKS5 accept error: %v", c.config.Name, err)
+				}
+				return
+			}
+			go c.handleSocks5Conn(conn)
+		}
+	}()
+}
+
+// handleSocks5Conn processes a single SOCKS5 CONNECT request.
+// On success, conn ownership transfers to the bidirectional relay goroutines.
+// On failure, conn is closed explicitly in each error path.
+func (c *Client) handleSocks5Conn(conn net.Conn) {
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	if err := socks5Handshake(conn); err != nil {
+		log.Printf("WARN: [%s] SOCKS5 handshake failed: %v", c.config.Name, err)
+		_ = conn.Close()
+		return
+	}
+
+	host, port, err := socks5ReadConnect(conn)
+	if err != nil {
+		log.Printf("WARN: [%s] SOCKS5 connect request failed: %v", c.config.Name, err)
+		_ = conn.Close()
+		return
+	}
+	targetAddr := socks5TargetAddr(host, port)
+
+	// Clear the deadline set for the handshake.
+	_ = conn.SetDeadline(time.Time{})
+
+	if !c.connected.Load() {
+		log.Printf("WARN: [%s] SOCKS5 outbound to %s rejected: not connected to proxy", c.config.Name, targetAddr)
+		_ = socks5SendReply(conn, socks5RepGeneralFailure)
+		_ = conn.Close()
+		return
+	}
+
+	clientID := uuid.New()
+
+	// Create pending clientConn to buffer any early data from the proxy.
+	pendingClient := &clientConn{
+		id:      clientID,
+		conn:    conn,
+		quit:    make(chan struct{}),
+		drained: make(chan struct{}),
+		writeCh: make(chan []byte, localConnWriteBuffer),
+		flow: flowControl{
+			lowWaterMark:  c.config.FlowControl.LowWaterMark,
+			highWaterMark: c.config.FlowControl.HighWaterMark,
+			maxBuffer:     c.config.FlowControl.MaxBuffer,
+		},
+	}
+	pendingClient.state.Store(uint32(ConnStatePending))
+	pendingClient.lastActivity.Store(time.Now().Unix())
+	c.localConns.Store(clientID, pendingClient)
+	c.getOrCreateQueue(clientID)
+
+	c.stats.pendingConns.Add(1)
+	c.stats.totalConns.Add(1)
+	c.emit(Event{
+		Type:     EventConnectionOpened,
+		ClientID: clientID.String(),
+	})
+
+	// Register a channel for the proxy's result.
+	resultCh := make(chan error, 1)
+	c.outboundPending.Store(clientID, resultCh)
+
+	fail := func(reason DisconnectReason, rep byte) {
+		c.outboundPending.Delete(clientID)
+		// Send the SOCKS5 error reply before closing so the client gets
+		// a proper RFC 1928 response instead of EOF/reset.
+		_ = socks5SendReply(conn, rep)
+		c.transitionToClosed(pendingClient, reason)
+	}
+
+	// Send the outbound connect request.
+	msg := protocol.ControlMessage{
+		Event:      protocol.EventOutboundConnect,
+		ClientID:   clientID,
+		TargetAddr: targetAddr,
+	}
+	payload, err := c.marshalJSON(msg)
+	if err != nil {
+		log.Printf("ERROR: [%s] Failed to marshal outbound connect for %s: %v", c.config.Name, targetAddr, err)
+		fail(DisconnectDialFailed, socks5RepGeneralFailure)
+		return
+	}
+	header := []byte{protocol.ControlByteControl}
+	outbound := outboundMessage{
+		messageType: websocket.BinaryMessage,
+		payload:     append(header, payload...),
+	}
+	if err := c.enqueueControl(outbound); err != nil {
+		log.Printf("WARN: [%s] Failed to enqueue outbound connect for %s: %v", c.config.Name, targetAddr, err)
+		fail(DisconnectDialFailed, socks5RepGeneralFailure)
+		return
+	}
+
+	// Wait for the proxy's result.
+	timer := time.NewTimer(outboundConnectTimeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-resultCh:
+		if err != nil {
+			log.Printf("WARN: [%s] Outbound connect to %s failed: %v", c.config.Name, targetAddr, err)
+			fail(DisconnectDialFailed, socks5RepConnRefused)
+			return
+		}
+	case <-timer.C:
+		log.Printf("WARN: [%s] Outbound connect to %s timed out", c.config.Name, targetAddr)
+		fail(DisconnectTimeout, socks5RepGeneralFailure)
+		return
+	case <-c.ctx.Done():
+		fail(DisconnectShutdown, socks5RepGeneralFailure)
+		return
+	}
+
+	// Success — send SOCKS5 reply and start bidirectional relay.
+	if err := socks5SendReply(conn, socks5RepSuccess); err != nil {
+		log.Printf("WARN: [%s] Failed to send SOCKS5 success reply for %s: %v", c.config.Name, targetAddr, err)
+		fail(DisconnectLocalError, socks5RepGeneralFailure)
+		return
+	}
+
+	log.Printf("INFO: [%s] SOCKS5 outbound connection %s to %s established", c.config.Name, clientID, targetAddr)
+
+	// Transition to active and start the relay goroutines (same as inbound).
+	if !pendingClient.transition(ConnStatePending, ConnStateActive) {
+		// Concurrent session teardown already moved to ConnStateClosed
+		// via transitionToClosed, which handled stats, safeClose, and cleanup.
+		return
+	}
+	c.stats.pendingConns.Add(-1)
+	c.stats.activeConns.Add(1)
+
+	go c.writeToLocal(pendingClient)
+	go c.copyLocalToNexus(pendingClient)
+}
+
+// drainOutboundPending unblocks all goroutines waiting for outbound results
+// by sending errors to their channels. Called on session teardown.
+func (c *Client) drainOutboundPending() {
+	c.outboundPending.Range(func(key, value interface{}) bool {
+		c.outboundPending.Delete(key)
+		if ch, ok := value.(chan error); ok {
+			select {
+			case ch <- fmt.Errorf("session disconnected"):
+			default:
+			}
+		}
+		return true
+	})
 }

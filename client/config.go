@@ -75,20 +75,23 @@ type AttestationConfig struct {
 	MaintenanceGraceCapSeconds int               `yaml:"maintenanceGraceCapSeconds"`
 	AuthorizerStatusURI        string            `yaml:"authorizerStatusUri"`
 	PolicyVersion              string            `yaml:"policyVersion"`
+	OutboundAllowed            bool              `yaml:"outboundAllowed"`
+	AllowedOutboundPorts       []int             `yaml:"allowedOutboundPorts"`
 }
 
 type BackendConfig struct {
-	Name           string              `yaml:"name"`
-	Hostname       string              `yaml:"hostname"`
-	Hostnames      []string            `yaml:"hostnames"`
-	TCPPorts       []int               `yaml:"tcpPorts,omitempty"`
-	UDPRoutes      []UDPRouteConfig    `yaml:"udpRoutes,omitempty"`
-	NexusAddresses []string            `yaml:"nexusAddresses"`
-	Weight         int                 `yaml:"weight"`
-	Attestation    AttestationConfig   `yaml:"attestation"`
-	PortMappings   map[int]PortMapping `yaml:"portMappings"`
-	HealthChecks   HealthCheckConfig   `yaml:"healthChecks"`
-	FlowControl    FlowControlConfig   `yaml:"flowControl"`
+	Name             string              `yaml:"name"`
+	Hostname         string              `yaml:"hostname"`
+	Hostnames        []string            `yaml:"hostnames"`
+	TCPPorts         []int               `yaml:"tcpPorts,omitempty"`
+	UDPRoutes        []UDPRouteConfig    `yaml:"udpRoutes,omitempty"`
+	NexusAddresses   []string            `yaml:"nexusAddresses"`
+	Weight           int                 `yaml:"weight"`
+	Attestation      AttestationConfig   `yaml:"attestation"`
+	PortMappings     map[int]PortMapping `yaml:"portMappings"`
+	HealthChecks     HealthCheckConfig   `yaml:"healthChecks"`
+	FlowControl      FlowControlConfig   `yaml:"flowControl"`
+	Socks5ListenAddr string              `yaml:"socks5ListenAddr,omitempty"`
 }
 
 // ToClientConfig converts a BackendConfig (YAML-parsed) into a
@@ -117,10 +120,13 @@ func (b BackendConfig) ToClientConfig(nexusAddr string) ClientBackendConfig {
 			MaintenanceGraceCapSeconds: b.Attestation.MaintenanceGraceCapSeconds,
 			AuthorizerStatusURI:        b.Attestation.AuthorizerStatusURI,
 			PolicyVersion:              b.Attestation.PolicyVersion,
+			OutboundAllowed:            b.Attestation.OutboundAllowed,
+			AllowedOutboundPorts:       append([]int(nil), b.Attestation.AllowedOutboundPorts...),
 		},
-		PortMappings: b.PortMappings,
-		HealthChecks: b.HealthChecks,
-		FlowControl:  b.FlowControl,
+		PortMappings:     b.PortMappings,
+		HealthChecks:     b.HealthChecks,
+		FlowControl:      b.FlowControl,
+		Socks5ListenAddr: b.Socks5ListenAddr,
 	}
 }
 

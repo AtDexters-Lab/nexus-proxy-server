@@ -29,6 +29,8 @@ const (
 	attestEnvWeight               = "NEXUS_WEIGHT"
 	attestEnvTCPPorts             = "NEXUS_TCP_PORTS"
 	attestEnvUDPRoutes            = "NEXUS_UDP_ROUTES"
+	attestEnvOutboundAllowed      = "NEXUS_OUTBOUND_ALLOWED"
+	attestEnvAllowedOutboundPorts = "NEXUS_ALLOWED_OUTBOUND_PORTS"
 )
 
 // Token encapsulates the token value and an optional expiry.
@@ -41,13 +43,15 @@ type Token struct {
 // Note: TCPPorts and UDPRoutes are used by CommandTokenProvider (passed as env vars)
 // but HMACTokenProvider uses its own stored config values for these fields.
 type TokenRequest struct {
-	Stage        TokenStage
-	SessionNonce string
-	BackendName  string
-	Hostnames    []string
-	TCPPorts     []int
-	UDPRoutes    []UDPRouteConfig
-	Weight       int
+	Stage                TokenStage
+	SessionNonce         string
+	BackendName          string
+	Hostnames            []string
+	TCPPorts             []int
+	UDPRoutes            []UDPRouteConfig
+	Weight               int
+	OutboundAllowed      bool
+	AllowedOutboundPorts []int
 }
 
 // TokenProvider issues attestation tokens for a given request.
@@ -71,6 +75,8 @@ type AttestationOptions struct {
 	MaintenanceGraceCapSeconds int
 	AuthorizerStatusURI        string
 	PolicyVersion              string
+	OutboundAllowed            bool
+	AllowedOutboundPorts       []int
 }
 
 // CommandTokenProvider implements TokenProvider by invoking an external command.
@@ -157,6 +163,8 @@ func (c *CommandTokenProvider) IssueToken(ctx context.Context, req TokenRequest)
 		fmt.Sprintf("%s=%d", attestEnvWeight, req.Weight),
 		fmt.Sprintf("%s=%s", attestEnvTCPPorts, formatTCPPorts(req.TCPPorts)),
 		fmt.Sprintf("%s=%s", attestEnvUDPRoutes, formatUDPRoutes(req.UDPRoutes)),
+		fmt.Sprintf("%s=%t", attestEnvOutboundAllowed, req.OutboundAllowed),
+		fmt.Sprintf("%s=%s", attestEnvAllowedOutboundPorts, formatTCPPorts(req.AllowedOutboundPorts)),
 	)
 	if req.Stage != StageHandshake {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", attestEnvNonce, req.SessionNonce))
@@ -384,6 +392,12 @@ func (h *HMACTokenProvider) IssueToken(ctx context.Context, req TokenRequest) (T
 	}
 	if h.opts.PolicyVersion != "" {
 		claims.PolicyVersion = h.opts.PolicyVersion
+	}
+	if h.opts.OutboundAllowed {
+		claims.OutboundAllowed = true
+		if len(h.opts.AllowedOutboundPorts) > 0 {
+			claims.AllowedOutboundPorts = append([]int(nil), h.opts.AllowedOutboundPorts...)
+		}
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)

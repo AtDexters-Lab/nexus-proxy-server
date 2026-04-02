@@ -18,8 +18,10 @@ type AttestationMetadata struct {
 	ReauthGrace         time.Duration
 	MaintenanceCap      time.Duration
 	HasMaintenanceCap   bool
-	AuthorizerStatusURI string
-	PolicyVersion       string
+	AuthorizerStatusURI  string
+	PolicyVersion        string
+	OutboundAllowed      bool
+	AllowedOutboundPorts []int
 }
 
 func (m *AttestationMetadata) cloneHostnames() []string {
@@ -46,5 +48,14 @@ func (m *AttestationMetadata) cloneUDPRoutes() []UDPRoutePolicy {
 	}
 	dup := make([]UDPRoutePolicy, len(m.UDPRoutes))
 	copy(dup, m.UDPRoutes)
+	return dup
+}
+
+func (m *AttestationMetadata) cloneAllowedOutboundPorts() []int {
+	if m == nil || len(m.AllowedOutboundPorts) == 0 {
+		return nil
+	}
+	dup := make([]int, len(m.AllowedOutboundPorts))
+	copy(dup, m.AllowedOutboundPorts)
 	return dup
 }

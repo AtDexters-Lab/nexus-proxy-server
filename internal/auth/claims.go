@@ -28,5 +28,8 @@ func (c *Claims) Copy() *Claims {
 	if len(c.UDPRoutes) > 0 {
 		cp.UDPRoutes = append([]protocol.UDPRouteClaim{}, c.UDPRoutes...)
 	}
+	if len(c.AllowedOutboundPorts) > 0 {
+		cp.AllowedOutboundPorts = append([]int{}, c.AllowedOutboundPorts...)
+	}
 	return &cp
 }

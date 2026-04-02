@@ -15,6 +15,10 @@ func TestRejectPrivateIP(t *testing.T) {
 		"::1",
 		"fe80::1",
 		"0.0.0.0",
+		"100.64.0.1",   // CGNAT (RFC 6598)
+		"100.127.255.1", // CGNAT upper range
+		"198.18.0.1",   // Benchmarking (RFC 2544)
+		"198.19.255.1", // Benchmarking upper range
 	}
 	for _, s := range rejected {
 		ip := net.ParseIP(s)

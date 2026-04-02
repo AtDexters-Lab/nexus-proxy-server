@@ -375,10 +375,12 @@ func (h *hubImpl) handlePeerConnect(w http.ResponseWriter, r *http.Request) {
 
 
 type stage0Info struct {
-	Hostnames []string
-	TCPPorts  []int
-	UDPRoutes []UDPRoutePolicy
-	Weight    int
+	Hostnames            []string
+	TCPPorts             []int
+	UDPRoutes            []UDPRoutePolicy
+	Weight               int
+	OutboundAllowed      bool
+	AllowedOutboundPorts []int
 }
 
 func (h *hubImpl) performHandshake(conn *websocket.Conn) (*Backend, error) {
@@ -468,6 +470,11 @@ func (h *hubImpl) validateStage0Claims(claims *auth.Claims) (*stage0Info, error)
 		return nil, errors.New("stage0 token missing hostnames and port claims")
 	}
 
+	outboundPorts, err := normalizeOutboundPortClaims(h.config, claims.OutboundAllowed, claims.AllowedOutboundPorts)
+	if err != nil {
+		return nil, err
+	}
+
 	weight := claims.Weight
 	if weight <= 0 {
 		weight = 1
@@ -484,10 +491,12 @@ func (h *hubImpl) validateStage0Claims(claims *auth.Claims) (*stage0Info, error)
 	}
 
 	return &stage0Info{
-		Hostnames: normalizedHosts,
-		TCPPorts:  tcpPorts,
-		UDPRoutes: udpRoutes,
-		Weight:    weight,
+		Hostnames:            normalizedHosts,
+		TCPPorts:             tcpPorts,
+		UDPRoutes:            udpRoutes,
+		Weight:               weight,
+		OutboundAllowed:      claims.OutboundAllowed,
+		AllowedOutboundPorts: outboundPorts,
 	}, nil
 }
 
@@ -531,6 +540,16 @@ func (h *hubImpl) buildMetadataFromClaims(claims *auth.Claims, expected *stage0I
 	if !sameUDPRoutes(udpRoutes, expected.UDPRoutes) {
 		return nil, errors.New("attested token udp route claims differ from handshake token")
 	}
+	if claims.OutboundAllowed != expected.OutboundAllowed {
+		return nil, errors.New("attested token outbound_allowed differs from handshake token")
+	}
+	outboundPorts, err := normalizeOutboundPortClaims(h.config, claims.OutboundAllowed, claims.AllowedOutboundPorts)
+	if err != nil {
+		return nil, err
+	}
+	if !sameIntSets(outboundPorts, expected.AllowedOutboundPorts) {
+		return nil, errors.New("attested token outbound port claims differ from handshake token")
+	}
 
 	weight := expected.Weight
 	if claims.Weight > 0 && claims.Weight != expected.Weight {
@@ -538,12 +557,14 @@ func (h *hubImpl) buildMetadataFromClaims(claims *auth.Claims, expected *stage0I
 	}
 
 	meta := &AttestationMetadata{
-		Hostnames:           append([]string{}, expected.Hostnames...),
-		TCPPorts:            append([]int{}, expected.TCPPorts...),
-		UDPRoutes:           append([]UDPRoutePolicy{}, expected.UDPRoutes...),
-		Weight:              weight,
-		PolicyVersion:       claims.PolicyVersion,
-		AuthorizerStatusURI: claims.AuthorizerStatusURI,
+		Hostnames:            append([]string{}, expected.Hostnames...),
+		TCPPorts:             append([]int{}, expected.TCPPorts...),
+		UDPRoutes:            append([]UDPRoutePolicy{}, expected.UDPRoutes...),
+		Weight:               weight,
+		PolicyVersion:        claims.PolicyVersion,
+		AuthorizerStatusURI:  claims.AuthorizerStatusURI,
+		OutboundAllowed:      expected.OutboundAllowed,
+		AllowedOutboundPorts: append([]int{}, expected.AllowedOutboundPorts...),
 	}
 
 	if claims.ReauthIntervalSeconds != nil && *claims.ReauthIntervalSeconds > 0 {
@@ -691,6 +712,38 @@ func normalizeUDPRouteClaims(cfg *config.Config, routes []protocol.UDPRouteClaim
 		out = append(out, route)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Port < out[j].Port })
+	return out, nil
+}
+
+func normalizeOutboundPortClaims(cfg *config.Config, outboundAllowed bool, ports []int) ([]int, error) {
+	if !outboundAllowed {
+		if len(ports) > 0 {
+			return nil, errors.New("allowed_outbound_ports set but outbound_allowed is false")
+		}
+		return nil, nil
+	}
+	if !cfg.AllowOutbound {
+		return nil, errors.New("backend claims outbound_allowed but server has allowOutbound disabled")
+	}
+	if len(ports) == 0 {
+		return nil, nil
+	}
+	uniq := make(map[int]struct{}, len(ports))
+	out := make([]int, 0, len(ports))
+	for _, port := range ports {
+		if port <= 0 || port > 65535 {
+			return nil, fmt.Errorf("invalid outbound port claim: %d", port)
+		}
+		if len(cfg.AllowedOutboundPorts) > 0 && !portAllowed(cfg.AllowedOutboundPorts, port) {
+			return nil, fmt.Errorf("outbound port claim %d is not allowed by server config", port)
+		}
+		if _, ok := uniq[port]; ok {
+			continue
+		}
+		uniq[port] = struct{}{}
+		out = append(out, port)
+	}
+	sort.Ints(out)
 	return out, nil
 }
 

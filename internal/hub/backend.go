@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/AtDexters-Lab/nexus-proxy/internal/bandwidth"
 	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
 	"github.com/AtDexters-Lab/nexus-proxy/internal/netutil"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/proxy"
 	"github.com/AtDexters-Lab/nexus-proxy/protocol"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -74,6 +76,14 @@ type Backend struct {
 	httpClient   *http.Client
 	healthClient *http.Client
 
+	// Outbound proxy
+	outboundAllowed      bool
+	allowedOutboundPorts []int
+	outboundIDs          sync.Map     // uuid.UUID → struct{}: tracks outbound clientIDs
+	outboundConnCount    atomic.Int64 // established outbound connections
+	inFlightDials        atomic.Int64 // pending dial attempts
+	maxOutboundConns     int          // -1 = no limit
+
 	// Bandwidth management
 	bandwidthState     *bandwidth.BackendBandwidth
 	bandwidthScheduler *bandwidth.Scheduler
@@ -103,8 +113,11 @@ func NewBackend(conn *websocket.Conn, meta *AttestationMetadata, cfg *config.Con
 		reauthGrace:         meta.ReauthGrace,
 		maintenanceCap:      maintenanceCap,
 		authorizerStatusURI: meta.AuthorizerStatusURI,
-		httpClient:          httpClient,
-		healthClient:        newSSRFSafeClient(httpClient),
+		httpClient:           httpClient,
+		healthClient:         newSSRFSafeClient(httpClient),
+		outboundAllowed:      meta.OutboundAllowed,
+		allowedOutboundPorts: meta.cloneAllowedOutboundPorts(),
+		maxOutboundConns:     cfg.MaxOutboundConns(),
 	}
 
 	if b.reauthInterval > 0 && b.reauthGrace <= 0 {
@@ -134,6 +147,12 @@ func (b *Backend) Close() {
 			}
 			return true
 		})
+		// Drain outbound tracking state.
+		b.outboundIDs.Range(func(key, _ interface{}) bool {
+			b.outboundIDs.Delete(key)
+			return true
+		})
+		b.outboundConnCount.Store(0)
 	})
 }
 
@@ -191,6 +210,7 @@ func (b *Backend) AddClient(clientConn net.Conn, clientID uuid.UUID, hostname st
 
 func (b *Backend) RemoveClient(clientID uuid.UUID) {
 	if _, ok := b.clients.LoadAndDelete(clientID); ok {
+		b.releaseOutboundSlot(clientID)
 		msg := protocol.ControlMessage{Event: protocol.EventDisconnect, ClientID: clientID}
 		if err := b.SendControlMessage(msg); err != nil {
 			log.Printf("ERROR: Failed to send disconnect message for client %s: %v", clientID, err)
@@ -198,6 +218,31 @@ func (b *Backend) RemoveClient(clientID uuid.UUID) {
 			log.Printf("INFO: Client %s disconnected from backend %s", clientID, b.id)
 		}
 	}
+}
+
+// releaseOutboundSlot decrements the outbound connection count if clientID
+// was an outbound connection. Safe to call for inbound connections (no-op).
+func (b *Backend) releaseOutboundSlot(clientID uuid.UUID) {
+	if _, ok := b.outboundIDs.LoadAndDelete(clientID); ok {
+		b.outboundConnCount.Add(-1)
+	}
+}
+
+// AddOutboundClient stores a proxy-dialed outbound connection in the clients
+// map. Unlike AddClient, it does not send EventConnect (the backend initiated
+// the request and already knows about the connection).
+func (b *Backend) AddOutboundClient(conn net.Conn, clientID uuid.UUID) error {
+	if b.closed.Load() {
+		return fmt.Errorf("backend %s is closing", b.id)
+	}
+	wrapped := proxy.NewPausableConn(conn)
+	if _, loaded := b.clients.LoadOrStore(clientID, wrapped); loaded {
+		_ = conn.Close()
+		return fmt.Errorf("client ID %s already exists", clientID)
+	}
+	b.outboundIDs.Store(clientID, struct{}{})
+	b.outboundConnCount.Add(1)
+	return nil
 }
 
 func (b *Backend) SendData(clientID uuid.UUID, data []byte) error {
@@ -376,8 +421,21 @@ func (b *Backend) handleBinaryMessage(message []byte) {
 		}
 
 		if clientConn, ok := rawConn.(net.Conn); ok {
-			if b.config.IdleTimeout() > 0 {
-				_ = clientConn.SetWriteDeadline(time.Now().Add(b.config.IdleTimeout()))
+			// Use outbound idle timeout for outbound connections,
+			// inbound idle timeout for regular client connections.
+			// Short-circuit the map lookup when outbound is not enabled.
+			var writeTimeout time.Duration
+			if b.outboundAllowed {
+				if _, isOutbound := b.outboundIDs.Load(clientID); isOutbound {
+					writeTimeout = b.config.OutboundIdleTimeout()
+				} else {
+					writeTimeout = b.config.IdleTimeout()
+				}
+			} else {
+				writeTimeout = b.config.IdleTimeout()
+			}
+			if writeTimeout > 0 {
+				_ = clientConn.SetWriteDeadline(time.Now().Add(writeTimeout))
 			}
 			if _, err := clientConn.Write(data); err != nil {
 				log.Printf("WARN: Failed to write to client %s: %v. Closing.", clientID, err)
@@ -424,11 +482,14 @@ func (b *Backend) handleControlMessage(msg protocol.ControlMessage) {
 		}
 	case protocol.EventDisconnect:
 		if rawConn, ok := b.clients.LoadAndDelete(msg.ClientID); ok {
+			b.releaseOutboundSlot(msg.ClientID)
 			if conn, ok := rawConn.(net.Conn); ok {
 				log.Printf("INFO: Backend %s reported disconnect for client %s. Closing client connection.", b.id, msg.ClientID)
 				gracefulCloseConn(conn, b.quit)
 			}
 		}
+	case protocol.EventOutboundConnect:
+		b.handleOutboundConnect(msg)
 	case protocol.EventPauseStream:
 		b.handlePauseStream(msg.ClientID)
 	case protocol.EventResumeStream:
@@ -466,6 +527,167 @@ func (b *Backend) handleResumeStream(clientID uuid.UUID) {
 	if pausable, ok := rawConn.(interface{ Resume() }); ok {
 		pausable.Resume()
 		log.Printf("DEBUG: Resumed stream for client %s on backend %s", clientID, b.id)
+	}
+}
+
+// maxTargetAddrLen limits the length of outbound target addresses.
+const maxTargetAddrLen = 260
+
+// handleOutboundConnect processes an outbound connection request from a backend.
+// Validation and the dial are handled here; the dial runs in a goroutine to
+// avoid blocking the readPump. The readPump is single-goroutined, so this
+// method is never called concurrently for the same backend.
+func (b *Backend) handleOutboundConnect(msg protocol.ControlMessage) {
+	sendFailure := func(reason string) {
+		result := protocol.ControlMessage{
+			Event:    protocol.EventOutboundResult,
+			ClientID: msg.ClientID,
+			Success:  false,
+			Reason:   reason,
+		}
+		if err := b.SendControlMessage(result); err != nil {
+			log.Printf("ERROR: Failed to send outbound failure result to backend %s: %v", b.id, err)
+		}
+	}
+
+	if !b.config.AllowOutbound {
+		sendFailure("outbound connections disabled on this proxy")
+		return
+	}
+	if !b.outboundAllowed {
+		sendFailure("outbound connections not allowed for this backend")
+		return
+	}
+
+	// Validate target address.
+	addr := msg.TargetAddr
+	if len(addr) > maxTargetAddrLen {
+		sendFailure("target address too long")
+		return
+	}
+	for _, c := range addr {
+		if c < 0x20 || c == 0x7f {
+			sendFailure("target address contains control characters")
+			return
+		}
+	}
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil || host == "" || portStr == "" {
+		sendFailure("invalid target address")
+		return
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		sendFailure("invalid target port")
+		return
+	}
+
+	// Check port allowlists (server-level then backend-level).
+	if len(b.config.AllowedOutboundPorts) > 0 && !portAllowed(b.config.AllowedOutboundPorts, port) {
+		sendFailure(fmt.Sprintf("outbound port %d not allowed by server", port))
+		return
+	}
+	if len(b.allowedOutboundPorts) > 0 && !portAllowed(b.allowedOutboundPorts, port) {
+		sendFailure(fmt.Sprintf("outbound port %d not allowed for this backend", port))
+		return
+	}
+
+	// Check combined limit (established + in-flight).
+	if b.maxOutboundConns >= 0 {
+		if b.outboundConnCount.Load()+b.inFlightDials.Load() >= int64(b.maxOutboundConns) {
+			sendFailure("outbound connection limit exceeded")
+			return
+		}
+	}
+
+	if msg.ClientID == uuid.Nil {
+		sendFailure("missing client ID")
+		return
+	}
+
+	// Reserve an in-flight slot before spawning the goroutine.
+	b.inFlightDials.Add(1)
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), b.config.OutboundDialTimeout())
+		defer cancel()
+
+		// Cancel the dial if the backend disconnects.
+		go func() {
+			select {
+			case <-b.quit:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+
+		conn, err := ssrfSafeDialContext(ctx, "tcp", addr)
+		// Dial phase complete — release the in-flight slot regardless of outcome.
+		// Must happen before readOutboundConn to avoid double-counting established
+		// connections (outboundConnCount already tracks them).
+		b.inFlightDials.Add(-1)
+		if err != nil {
+			log.Printf("WARN: Outbound dial to %s for backend %s failed: %v", addr, b.id, err)
+			sendFailure("dial failed")
+			return
+		}
+
+		if err := b.AddOutboundClient(conn, msg.ClientID); err != nil {
+			_ = conn.Close()
+			sendFailure(fmt.Sprintf("registration failed: %v", err))
+			return
+		}
+
+		result := protocol.ControlMessage{
+			Event:    protocol.EventOutboundResult,
+			ClientID: msg.ClientID,
+			Success:  true,
+		}
+		if err := b.SendControlMessage(result); err != nil {
+			log.Printf("WARN: Failed to send outbound success result for %s, cleaning up: %v", msg.ClientID, err)
+			b.RemoveClient(msg.ClientID)
+			return
+		}
+
+		// Retrieve the PausableConn wrapper stored by AddOutboundClient so that
+		// reads go through the pausable layer and pause/resume actually works.
+		rawWrapped, ok := b.clients.Load(msg.ClientID)
+		if !ok {
+			return
+		}
+		wrappedConn, ok := rawWrapped.(net.Conn)
+		if !ok {
+			return
+		}
+
+		log.Printf("INFO: Outbound connection %s established to %s for backend %s", msg.ClientID, addr, b.id)
+		b.readOutboundConn(msg.ClientID, wrappedConn)
+	}()
+}
+
+// readOutboundConn reads data from a proxy-dialed outbound TCP connection
+// and relays it to the backend over the WebSocket.
+func (b *Backend) readOutboundConn(clientID uuid.UUID, conn net.Conn) {
+	defer b.RemoveClient(clientID)
+
+	bufPtr := proxy.GetBuffer()
+	defer proxy.PutBuffer(bufPtr)
+	buf := *bufPtr
+
+	idleTimeout := b.config.OutboundIdleTimeout()
+	for {
+		if idleTimeout > 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(idleTimeout))
+		}
+		n, err := conn.Read(buf)
+		if n > 0 {
+			if sendErr := b.SendData(clientID, buf[:n]); sendErr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
 	}
 }
 
@@ -643,6 +865,16 @@ func (b *Backend) applyClaims(claims *auth.Claims) error {
 	}
 	if !sameUDPRoutes(udpRoutes, b.udpRoutes) {
 		return errors.New("udp route claims in token differ from registered set")
+	}
+	if claims.OutboundAllowed != b.outboundAllowed {
+		return errors.New("outbound_allowed in token differs from registered value")
+	}
+	outboundPorts, err := normalizeOutboundPortClaims(b.config, claims.OutboundAllowed, claims.AllowedOutboundPorts)
+	if err != nil {
+		return err
+	}
+	if !sameIntSets(outboundPorts, b.allowedOutboundPorts) {
+		return errors.New("outbound port claims in token differ from registered set")
 	}
 
 	if claims.Weight != 0 && claims.Weight != b.weight {

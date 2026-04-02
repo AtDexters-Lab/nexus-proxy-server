@@ -29,7 +29,14 @@ func main() {
 	var clients []*client.Client
 
 	for _, backendCfg := range cfg.Backends {
-		for _, nexusAddr := range backendCfg.NexusAddresses {
+		for i, nexusAddr := range backendCfg.NexusAddresses {
+			clientCfg := backendCfg.ToClientConfig(nexusAddr)
+			// Only the first client per backend binds the SOCKS5 listener;
+			// additional nexus connections share the same backend and would
+			// conflict on the same port.
+			if i > 0 {
+				clientCfg.Socks5ListenAddr = ""
+			}
 			wg.Add(1)
 			go func(cfg client.ClientBackendConfig) {
 				defer wg.Done()
@@ -42,7 +49,7 @@ func main() {
 				clients = append(clients, c)
 				mu.Unlock()
 				c.Start(ctx)
-			}(backendCfg.ToClientConfig(nexusAddr))
+			}(clientCfg)
 		}
 	}
 
