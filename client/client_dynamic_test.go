@@ -60,7 +60,7 @@ func TestClientWithCustomConnectHandler(t *testing.T) {
 		Event:    protocol.EventConnect,
 		ClientID: uuid.New(),
 		ConnPort: 80,
-		ClientIP: "203.0.113.10",
+		ClientIP: "203.0.113.10:54321",
 		Hostname: "Hello.EXAMPLE.com",
 		IsTLS:    true,
 	}

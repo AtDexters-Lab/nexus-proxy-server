@@ -55,7 +55,7 @@ func (p *mockPeer) setSendSuccess(success bool) {
 func TestTunneledConnPauseSuccess(t *testing.T) {
 	peer := newMockPeer(true)
 	clientID := uuid.New()
-	tc := NewTunneledConn(clientID, peer, "192.168.1.1", 8080)
+	tc := NewTunneledConn(clientID, peer, "192.168.1.1:8080", 8080)
 	defer tc.Close()
 
 	// Pause should succeed and update local state
@@ -72,7 +72,7 @@ func TestTunneledConnPauseSuccess(t *testing.T) {
 func TestTunneledConnPauseFailsWhenSendQueueFull(t *testing.T) {
 	peer := newMockPeer(false) // Send will fail
 	clientID := uuid.New()
-	tc := NewTunneledConn(clientID, peer, "192.168.1.1", 8080)
+	tc := NewTunneledConn(clientID, peer, "192.168.1.1:8080", 8080)
 	defer tc.Close()
 
 	// Pause should fail and NOT update local state
@@ -89,7 +89,7 @@ func TestTunneledConnPauseFailsWhenSendQueueFull(t *testing.T) {
 func TestTunneledConnResumeSuccess(t *testing.T) {
 	peer := newMockPeer(true)
 	clientID := uuid.New()
-	tc := NewTunneledConn(clientID, peer, "192.168.1.1", 8080)
+	tc := NewTunneledConn(clientID, peer, "192.168.1.1:8080", 8080)
 	defer tc.Close()
 
 	// First pause
@@ -112,7 +112,7 @@ func TestTunneledConnResumeSuccess(t *testing.T) {
 func TestTunneledConnResumeFailsWhenSendQueueFull(t *testing.T) {
 	peer := newMockPeer(true)
 	clientID := uuid.New()
-	tc := NewTunneledConn(clientID, peer, "192.168.1.1", 8080)
+	tc := NewTunneledConn(clientID, peer, "192.168.1.1:8080", 8080)
 	defer tc.Close()
 
 	// First pause successfully
@@ -138,7 +138,7 @@ func TestTunneledConnResumeFailsWhenSendQueueFull(t *testing.T) {
 func TestTunneledConnPauseIdempotent(t *testing.T) {
 	peer := newMockPeer(true)
 	clientID := uuid.New()
-	tc := NewTunneledConn(clientID, peer, "192.168.1.1", 8080)
+	tc := NewTunneledConn(clientID, peer, "192.168.1.1:8080", 8080)
 	defer tc.Close()
 
 	// Multiple pauses should be idempotent
@@ -158,7 +158,7 @@ func TestTunneledConnPauseIdempotent(t *testing.T) {
 func TestTunneledConnResumeIdempotent(t *testing.T) {
 	peer := newMockPeer(true)
 	clientID := uuid.New()
-	tc := NewTunneledConn(clientID, peer, "192.168.1.1", 8080)
+	tc := NewTunneledConn(clientID, peer, "192.168.1.1:8080", 8080)
 	defer tc.Close()
 
 	// Resume when not paused should be no-op
@@ -177,7 +177,7 @@ func TestTunneledConnResumeIdempotent(t *testing.T) {
 func TestTunneledConnPauseAfterClose(t *testing.T) {
 	peer := newMockPeer(true)
 	clientID := uuid.New()
-	tc := NewTunneledConn(clientID, peer, "192.168.1.1", 8080)
+	tc := NewTunneledConn(clientID, peer, "192.168.1.1:8080", 8080)
 
 	tc.Close()
 	sendCallsAfterClose := peer.getSendCalls()
@@ -197,7 +197,7 @@ func TestTunneledConnPauseAfterClose(t *testing.T) {
 func TestTunneledConnResumeAfterClose(t *testing.T) {
 	peer := newMockPeer(true)
 	clientID := uuid.New()
-	tc := NewTunneledConn(clientID, peer, "192.168.1.1", 8080)
+	tc := NewTunneledConn(clientID, peer, "192.168.1.1:8080", 8080)
 
 	// Pause first
 	tc.Pause()
@@ -219,7 +219,7 @@ func TestTunneledConnResumeAfterClose(t *testing.T) {
 func TestTunneledConnReadDoesNotBlockWhenPaused(t *testing.T) {
 	peer := newMockPeer(true)
 	clientID := uuid.New()
-	tc := NewTunneledConn(clientID, peer, "192.168.1.1", 8080)
+	tc := NewTunneledConn(clientID, peer, "192.168.1.1:8080", 8080)
 	defer tc.Close()
 
 	// Pause the connection
@@ -268,7 +268,7 @@ func TestTunneledConnReadDoesNotBlockWhenPaused(t *testing.T) {
 func TestTunneledConnConcurrentPauseResume(t *testing.T) {
 	peer := newMockPeer(true)
 	clientID := uuid.New()
-	tc := NewTunneledConn(clientID, peer, "192.168.1.1", 8080)
+	tc := NewTunneledConn(clientID, peer, "192.168.1.1:8080", 8080)
 	defer tc.Close()
 
 	// Rapid concurrent pause/resume calls should not cause races
@@ -315,7 +315,7 @@ func TestTunneledConnConcurrentPauseResume(t *testing.T) {
 func TestTunneledConnWriteToPipeNeverBlocksReadPump(t *testing.T) {
 	peer := newMockPeer(true)
 	clientID := uuid.New()
-	tc := NewTunneledConn(clientID, peer, "192.168.1.1", 8080)
+	tc := NewTunneledConn(clientID, peer, "192.168.1.1:8080", 8080)
 	defer tc.Close()
 
 	// Simulate a slow reader by pausing before reading
@@ -350,5 +350,33 @@ func TestTunneledConnWriteToPipeNeverBlocksReadPump(t *testing.T) {
 		// Good
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Read blocked unexpectedly")
+	}
+}
+
+func TestTunneledConnRemoteAddr(t *testing.T) {
+	peer := newMockPeer(true)
+
+	tests := []struct {
+		name     string
+		clientIp string
+		want     string
+	}{
+		{"IPv4 with port", "203.0.113.45:54321", "203.0.113.45:54321"},
+		{"IPv6 with port", "[::1]:54321", "[::1]:54321"},
+		{"bare IPv4 no port", "192.168.1.1", "192.168.1.1:0"},
+		{"malformed string", "garbage", ":0"},
+		{"empty string", "", ":0"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := NewTunneledConn(uuid.New(), peer, tt.clientIp, 443)
+			defer tc.Close()
+
+			got := tc.RemoteAddr().String()
+			if got != tt.want {
+				t.Errorf("RemoteAddr().String() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

@@ -20,12 +20,12 @@ var ErrPeerSendFailed = errors.New("peer send queue full")
 // TunneledConn implements the net.Conn interface for a client connection
 // that is being tunneled from another peer.
 type TunneledConn struct {
-	clientID uuid.UUID
-	clientIp string
-	connPort int
-	peer     iface.Peer     // The peer that this connection is tunneled through.
-	pipe     *io.PipeReader // The read end of the pipe that receives data from the peer's read pump.
-	pipeW    *io.PipeWriter // The write end of the pipe that sends data to the peer's read pump.
+	clientID   uuid.UUID
+	remoteAddr *net.TCPAddr // parsed eagerly at construction; never nil
+	connPort   int
+	peer       iface.Peer     // The peer that this connection is tunneled through.
+	pipe       *io.PipeReader // The read end of the pipe that receives data from the peer's read pump.
+	pipeW      *io.PipeWriter // The write end of the pipe that sends data to the peer's read pump.
 
 	// Pause/resume support - tracks state for origin peer coordination.
 	// IMPORTANT: Read() does NOT block locally when paused. The actual TCP
@@ -37,16 +37,39 @@ type TunneledConn struct {
 }
 
 // NewTunneledConn creates a new virtual connection for a tunneled client.
+// clientIp is parsed eagerly into a *net.TCPAddr using numeric-only parsing
+// (no DNS resolution). If parsing fails, a warning is logged and a zero-value
+// fallback is stored.
 func NewTunneledConn(clientID uuid.UUID, peer iface.Peer, clientIp string, connPort int) *TunneledConn {
+	addr := parseTCPAddr(clientIp)
+	if addr.IP == nil || addr.IP.IsUnspecified() {
+		log.Printf("WARN: [TUNNEL] Failed to parse client address %q for client %s", clientIp, clientID)
+	}
 	pr, pw := io.Pipe()
 	return &TunneledConn{
-		clientID: clientID,
-		clientIp: clientIp,
-		connPort: connPort,
-		peer:     peer,
-		pipe:     pr,
-		pipeW:    pw,
+		clientID:   clientID,
+		remoteAddr: addr,
+		connPort:   connPort,
+		peer:       peer,
+		pipe:       pr,
+		pipeW:      pw,
 	}
+}
+
+// parseTCPAddr parses an "ip:port" string into a *net.TCPAddr using only
+// numeric parsing (net.ParseIP) — never triggers DNS resolution.
+func parseTCPAddr(hostPort string) *net.TCPAddr {
+	host, portStr, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		// Bare IP without port — try direct parse
+		if ip := net.ParseIP(hostPort); ip != nil {
+			return &net.TCPAddr{IP: ip}
+		}
+		return &net.TCPAddr{}
+	}
+	ip := net.ParseIP(host)
+	port, _ := strconv.Atoi(portStr)
+	return &net.TCPAddr{IP: ip, Port: port}
 }
 
 // Read reads from the pipe. This method does NOT block when paused because:
@@ -151,14 +174,7 @@ func (c *TunneledConn) LocalAddr() net.Addr {
 	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: c.connPort}
 }
 func (c *TunneledConn) RemoteAddr() net.Addr {
-	// clientIp is in "ip:port" format from conn.RemoteAddr().String()
-	host, portStr, err := net.SplitHostPort(c.clientIp)
-	if err != nil {
-		// Fallback: try parsing as bare IP (shouldn't happen in practice)
-		return &net.TCPAddr{IP: net.ParseIP(c.clientIp), Port: 0}
-	}
-	port, _ := strconv.Atoi(portStr)
-	return &net.TCPAddr{IP: net.ParseIP(host), Port: port}
+	return c.remoteAddr
 }
 func (c *TunneledConn) SetDeadline(t time.Time) error      { return nil }
 func (c *TunneledConn) SetReadDeadline(t time.Time) error  { return nil }

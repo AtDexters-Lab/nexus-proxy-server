@@ -1078,6 +1078,9 @@ func (c *Client) handleControlMessage(payload []byte) {
 		}
 		log.Printf("INFO: [%s] Received 'connect' for ClientID %s on port %d (hostname: %s, transport: %s, tls:%v).", c.config.Name, msg.ClientID, msg.ConnPort, normalizedHost, transport, msg.IsTLS)
 
+		if msg.ClientIP == "" {
+			log.Printf("WARN: [%s] EventConnect for client %s has empty client_ip", c.config.Name, msg.ClientID)
+		}
 		req := ConnectRequest{
 			BackendName:      c.config.Name,
 			ClientID:         msg.ClientID,

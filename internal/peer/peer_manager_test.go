@@ -57,7 +57,7 @@ func TestHandleTunnelRequestCleansUpOnBackendFailure(t *testing.T) {
 	p := &noopPeer{addr: "peer-1"}
 	clientID := uuid.New()
 
-	mgr.HandleTunnelRequest(p, "example.com", clientID, "203.0.113.10", 443, true)
+	mgr.HandleTunnelRequest(p, "example.com", clientID, "203.0.113.10:443", 443, true)
 
 	require.Eventually(t, func() bool {
 		_, ok := mgr.tunnels.Load(clientID)

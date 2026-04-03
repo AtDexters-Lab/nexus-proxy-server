@@ -191,11 +191,16 @@ func (b *Backend) AddClient(clientConn net.Conn, clientID uuid.UUID, hostname st
 	default:
 		return fmt.Errorf("WARN: Could not determine destination port for client %s", clientID)
 	}
+	remoteAddr := clientConn.RemoteAddr()
+	clientIP := remoteAddr.String()
+	if addr, ok := remoteAddr.(*net.TCPAddr); ok && (addr.IP == nil || addr.IP.IsUnspecified()) {
+		log.Printf("WARN: Client %s has empty/unspecified remote address: %s", clientID, clientIP)
+	}
 	msg := protocol.ControlMessage{
 		Event:     protocol.EventConnect,
 		ClientID:  clientID,
 		ConnPort:  connPort,
-		ClientIP:  clientConn.RemoteAddr().String(),
+		ClientIP:  clientIP,
 		Transport: transport,
 		Hostname:  hostname,
 		IsTLS:     isTLS,
