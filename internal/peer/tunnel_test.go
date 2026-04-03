@@ -380,3 +380,37 @@ func TestTunneledConnRemoteAddr(t *testing.T) {
 		})
 	}
 }
+
+func TestParseUDPAddr(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string // expected String() output, or "" if nil expected
+	}{
+		{"IPv4 with port", "192.168.1.1:8080", "192.168.1.1:8080"},
+		{"IPv6 with port", "[::1]:8080", "[::1]:8080"},
+		{"bare IPv4 no port", "10.0.0.1", "10.0.0.1:0"},
+		{"hostname must not resolve", "hostname:80", ""},
+		{"empty string", "", ""},
+		{"malformed", "garbage", ""},
+		{"hostname:port ParseIP fails", "notanip:1234", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseUDPAddr(tt.input)
+			if tt.want == "" {
+				if got != nil {
+					t.Errorf("parseUDPAddr(%q) = %v, want nil", tt.input, got)
+				}
+			} else {
+				if got == nil {
+					t.Fatalf("parseUDPAddr(%q) = nil, want %q", tt.input, tt.want)
+				}
+				if got.String() != tt.want {
+					t.Errorf("parseUDPAddr(%q).String() = %q, want %q", tt.input, got.String(), tt.want)
+				}
+			}
+		})
+	}
+}

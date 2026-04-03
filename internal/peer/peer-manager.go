@@ -564,9 +564,9 @@ func (m *Manager) HandleTunnelRequest(p iface.Peer, hostname string, clientID uu
 			return
 		}
 
-		remoteAddr, err := net.ResolveUDPAddr("udp", clientIP)
-		if err != nil {
-			log.Printf("WARN: [UDP-TUNNEL-IN] Could not parse client address '%s' for client %s: %v", clientIP, clientID, err)
+		remoteAddr := parseUDPAddr(clientIP)
+		if remoteAddr == nil {
+			log.Printf("WARN: [UDP-TUNNEL-IN] Could not parse client address '%s' for client %s", clientIP, clientID)
 			return
 		}
 

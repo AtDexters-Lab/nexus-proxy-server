@@ -68,8 +68,30 @@ func parseTCPAddr(hostPort string) *net.TCPAddr {
 		return &net.TCPAddr{}
 	}
 	ip := net.ParseIP(host)
+	if ip == nil {
+		return &net.TCPAddr{}
+	}
 	port, _ := strconv.Atoi(portStr)
 	return &net.TCPAddr{IP: ip, Port: port}
+}
+
+// parseUDPAddr parses an "ip:port" string into a *net.UDPAddr using only
+// numeric parsing (net.ParseIP) — never triggers DNS resolution.
+// Returns nil if the input cannot be parsed.
+func parseUDPAddr(hostPort string) *net.UDPAddr {
+	host, portStr, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		if ip := net.ParseIP(hostPort); ip != nil {
+			return &net.UDPAddr{IP: ip}
+		}
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return nil
+	}
+	port, _ := strconv.Atoi(portStr)
+	return &net.UDPAddr{IP: ip, Port: port}
 }
 
 // Read reads from the pipe. This method does NOT block when paused because:
