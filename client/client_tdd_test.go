@@ -118,11 +118,11 @@ func TestWritePumpDoesNotReplayStaleMessages(t *testing.T) {
 	c.ws = clientConn1
 	c.wsMu.Unlock()
 
-	sessionCh1 := c.beginSession()
+	session1 := c.beginSession()
 	done1 := make(chan struct{})
 	c.wg.Add(1)
 	go func() {
-		c.writePump(sessionCh1)
+		c.writePump(session1)
 		close(done1)
 	}()
 
@@ -149,6 +149,7 @@ func TestWritePumpDoesNotReplayStaleMessages(t *testing.T) {
 		id:       staleID,
 		conn:     localClient,
 		hostname: "stale.test",
+		session:  session1, // Bind to dead session 1
 		quit:     make(chan struct{}),
 	}
 	c.localConns.Store(staleID, cc)
@@ -166,11 +167,11 @@ func TestWritePumpDoesNotReplayStaleMessages(t *testing.T) {
 	c.ws = clientConn2
 	c.wsMu.Unlock()
 
-	sessionCh2 := c.beginSession()
+	session2 := c.beginSession()
 	done2 := make(chan struct{})
 	c.wg.Add(1)
 	go func() {
-		c.writePump(sessionCh2)
+		c.writePump(session2)
 		close(done2)
 	}()
 
@@ -192,17 +193,17 @@ func TestTransitionToClosedNoStaleDisconnect(t *testing.T) {
 	c := newTestClient(t)
 
 	// Simulate session 1 lifecycle: start then die.
-	sessionCh := c.beginSession()
-	c.connected.Store(false)
-	close(sessionCh)
-	c.sessionDone.Store((chan struct{})(nil))
+	session := c.beginSession()
+	session.Close()
+	c.activeSession.Store(nil)
 	c.clearSendQueues()
 
-	// Create a pending clientConn (simulates a dial that never completed).
+	// Create a pending clientConn bound to the dead session.
 	staleID := uuid.New()
 	cc := &clientConn{
 		id:       staleID,
 		hostname: "stale.test",
+		session:  session,
 		quit:     make(chan struct{}),
 		drained:  make(chan struct{}),
 	}
@@ -225,9 +226,97 @@ func TestTransitionToClosedNoStaleDisconnect(t *testing.T) {
 	}
 }
 
+// TestTransitionToClosedNoStaleDisconnectAfterReconnect verifies that a stale
+// connection from session 1 does NOT send a disconnect onto session 2 when the
+// goroutine calling transitionToClosed runs after session 2 has already started.
+// This is the deterministic reproducer for the race that
+// TestWritePumpDoesNotReplayStaleMessages catches probabilistically.
+func TestTransitionToClosedNoStaleDisconnectAfterReconnect(t *testing.T) {
+	c := newTestClient(t)
+
+	// Session 1 lifecycle: start then die.
+	session1 := c.beginSession()
+	session1.Close()
+	c.activeSession.Store(nil)
+	c.clearSendQueues()
+
+	// Session 2 starts (simulates successful reconnect).
+	_ = c.beginSession()
+
+	// A stale connection from session 1 calls transitionToClosed.
+	staleID := uuid.New()
+	cc := &clientConn{
+		id:       staleID,
+		hostname: "stale.test",
+		session:  session1, // Bound to dead session 1
+		quit:     make(chan struct{}),
+		drained:  make(chan struct{}),
+	}
+	c.localConns.Store(staleID, cc)
+
+	c.transitionToClosed(cc, DisconnectNormal)
+
+	// The disconnect must NOT be enqueued — it belongs to session 1, not session 2.
+	select {
+	case msg := <-c.controlSend:
+		t.Fatalf("stale disconnect leaked onto successor session: %x", msg.payload)
+	default:
+	}
+
+	if _, ok := c.localConns.Load(staleID); ok {
+		t.Fatal("expected localConns entry to be cleaned up")
+	}
+}
+
+// TestTransitionToClosedDrainPathNoStaleDisconnectAfterReconnect verifies the
+// drain path: an Active-state connection from session 1 must NOT send a
+// disconnect onto session 2 when the drain goroutine completes after reconnect.
+func TestTransitionToClosedDrainPathNoStaleDisconnectAfterReconnect(t *testing.T) {
+	c := newTestClient(t)
+
+	// Session 1 lifecycle: start then die.
+	session1 := c.beginSession()
+	session1.Close()
+	c.activeSession.Store(nil)
+	c.clearSendQueues()
+
+	// Session 2 starts (simulates successful reconnect).
+	_ = c.beginSession()
+
+	// A stale Active-state connection from session 1.
+	staleID := uuid.New()
+	cc := &clientConn{
+		id:       staleID,
+		hostname: "stale.test",
+		session:  session1,
+		quit:     make(chan struct{}),
+		drained:  make(chan struct{}),
+	}
+	cc.state.Store(uint32(ConnStateActive))
+	c.localConns.Store(staleID, cc)
+	c.getOrCreateQueue(staleID)
+
+	// transitionToClosed enters the drain path (Active → Closed).
+	// The drain goroutine should detect session1 is dead and skip disconnect.
+	c.transitionToClosed(cc, DisconnectNormal)
+
+	// Give the async drain goroutine time to complete.
+	time.Sleep(50 * time.Millisecond)
+
+	select {
+	case msg := <-c.controlSend:
+		t.Fatalf("stale disconnect leaked onto successor session via drain path: %x", msg.payload)
+	default:
+	}
+
+	if _, ok := c.localConns.Load(staleID); ok {
+		t.Fatal("expected localConns entry to be cleaned up")
+	}
+}
+
 func TestHandleTextMessageRespondsToReauthChallenge(t *testing.T) {
 	c := newTestClient(t)
-	c.connected.Store(true)
+	c.beginSession()
 	c.controlSend = make(chan outboundMessage, 1)
 
 	msg := []byte(`{"type":"reauth_challenge","nonce":"abc123"}`)
@@ -259,7 +348,7 @@ func TestSendControlMessageSkipsMarshalErrors(t *testing.T) {
 
 	c.controlSend = make(chan outboundMessage, 1)
 
-	c.connected.Store(true)
+	c.beginSession()
 	err := c.sendControlMessage(protocol.EventPingClient, uuid.New())
 	if err == nil {
 		t.Fatalf("expected marshal error")

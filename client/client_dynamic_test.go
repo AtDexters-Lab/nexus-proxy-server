@@ -53,7 +53,7 @@ func TestClientWithCustomConnectHandler(t *testing.T) {
 		t.Fatalf("failed to construct client: %v", err)
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
-	c.connected.Store(true) // Simulate active session
+	session := c.beginSession() // Simulate active session
 	defer c.cancel()
 
 	msg := protocol.ControlMessage{
@@ -100,6 +100,11 @@ func TestClientWithCustomConnectHandler(t *testing.T) {
 
 	appConn := <-appConnCh
 	appConn.Close()
+
+	// End the session so transitionToClosed's drain goroutine exits promptly
+	// instead of waiting for the 5s drain timeout (no writePump in this test).
+	session.Close()
+	c.activeSession.Store(nil)
 
 	deadline := time.Now().Add(200 * time.Millisecond)
 	for time.Now().Before(deadline) {

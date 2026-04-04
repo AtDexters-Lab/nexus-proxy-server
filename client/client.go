@@ -139,6 +139,42 @@ const (
 
 var errSessionInactive = errors.New("client session inactive")
 
+// Session represents a single WebSocket session with the relay.
+// A new Session is created for each successful connectAndAuthenticate.
+// Fields are immutable after creation except for connected (set to false on close).
+type Session struct {
+	done      chan struct{}
+	connected atomic.Bool
+	closeOnce sync.Once
+}
+
+// Done returns a channel that is closed when the session ends.
+// Returns nil if s is nil (no active session).
+func (s *Session) Done() <-chan struct{} {
+	if s == nil {
+		return nil
+	}
+	return s.done
+}
+
+// IsConnected returns whether the session is still active.
+func (s *Session) IsConnected() bool {
+	if s == nil {
+		return false
+	}
+	return s.connected.Load()
+}
+
+// Close marks the session as disconnected and signals all waiters.
+// Safe to call multiple times. Order matters: connected=false before close(done)
+// so IsConnected() returns false before any Done() select unblocks.
+func (s *Session) Close() {
+	s.closeOnce.Do(func() {
+		s.connected.Store(false)
+		close(s.done)
+	})
+}
+
 // EventType represents the type of client event.
 type EventType int
 
@@ -329,6 +365,11 @@ type clientConn struct {
 	// Signaling state for fair queuing
 	signaled atomic.Bool
 
+	// session is the Session that created this connection. Used by
+	// transitionToClosed to check the owning session's liveness instead of
+	// the global active session, preventing stale disconnects after reconnect.
+	session *Session
+
 	isUDP          bool
 	droppedPackets atomic.Int64 // UDP only: packets dropped due to slow local service
 
@@ -450,9 +491,8 @@ type Client struct {
 	connQueues sync.Map
 	// Notifies writePump that a queue has data
 	dataReady           chan uuid.UUID
-	connected           atomic.Bool
-	shuttingDown        atomic.Bool  // Flag for graceful shutdown
-	sessionDone         atomic.Value // stores chan struct{}
+	activeSession       atomic.Pointer[Session]
+	shuttingDown        atomic.Bool // Flag for graceful shutdown
 	ctx                 context.Context
 	cancel              context.CancelFunc
 	wg                  sync.WaitGroup // Tracks readPump and writePump per session
@@ -518,7 +558,6 @@ func New(cfg ClientBackendConfig, opts ...Option) (*Client, error) {
 		dataReady:   make(chan uuid.UUID, 256), // Buffer: 256
 		eventCh:     make(chan Event, eventBufferSize),
 	}
-	c.sessionDone.Store((chan struct{})(nil))
 
 	c.connectHandler = c.configBasedConnectHandler()
 	c.staticTokenProvider = defaultProvider
@@ -572,7 +611,7 @@ func (c *Client) Stats() Stats {
 
 	sessionStart := c.stats.sessionStart.Load()
 	var sessionUptime time.Duration
-	if sessionStart > 0 && c.connected.Load() {
+	if sessionStart > 0 && c.activeSession.Load().IsConnected() {
 		sessionUptime = time.Since(time.Unix(sessionStart, 0))
 	}
 
@@ -742,11 +781,11 @@ func (c *Client) Start(ctx context.Context) {
 			c.emit(Event{Type: EventConnected})
 			log.Printf("INFO: [%s] Connection established and authenticated. Starting pumps.", c.config.Name)
 
-			sessionCh := c.beginSession()
+			session := c.beginSession()
 			c.wg.Add(1)
 			go c.readPump()
 			c.wg.Add(1)
-			go c.writePump(sessionCh)
+			go c.writePump(session)
 
 			c.wg.Wait() // Wait for pumps to exit, indicating a disconnection.
 			c.clearSendQueues()
@@ -1097,6 +1136,7 @@ func (c *Client) handleControlMessage(payload []byte) {
 			id:       msg.ClientID,
 			conn:     nil, // Set after dial completes
 			hostname: normalizedHost,
+			session:  c.activeSession.Load(),
 			quit:     make(chan struct{}),
 			drained:  make(chan struct{}),
 			writeCh:  make(chan []byte, localConnWriteBuffer),
@@ -1227,8 +1267,8 @@ func (c *Client) establishLocalConnection(req ConnectRequest, pendingClient *cli
 		return
 	}
 
-	// Check if session is still active after dial (handles shutdown race)
-	if !c.connected.Load() {
+	// Check if the session that created this connection is still active after dial
+	if !pendingClient.session.IsConnected() {
 		conn.Close()
 		c.transitionToClosed(pendingClient, DisconnectShutdown)
 		log.Printf("DEBUG: [%s] Session ended during dial for client %s, closing connection", c.config.Name, req.ClientID)
@@ -1241,9 +1281,12 @@ func (c *Client) establishLocalConnection(req ConnectRequest, pendingClient *cli
 		conn.Close()
 		c.localConns.Delete(req.ClientID) // Ensure stale entry is removed
 		log.Printf("DEBUG: [%s] Pending connection closed during dial for client %s", c.config.Name, req.ClientID)
-		// Best-effort disconnect notification (may fail if session ended)
-		if err := c.sendDisconnectMessage(req.ClientID, DisconnectShutdown); err != nil {
-			log.Printf("DEBUG: [%s] Failed to send disconnect for client %s after pending close: %v", c.config.Name, req.ClientID, err)
+		// Best-effort disconnect notification — only if the connection's
+		// owning session is still alive to avoid stale leaks after reconnect.
+		if pendingClient.session.IsConnected() {
+			if err := c.sendDisconnectMessage(req.ClientID, DisconnectShutdown); err != nil {
+				log.Printf("DEBUG: [%s] Failed to send disconnect for client %s after pending close: %v", c.config.Name, req.ClientID, err)
+			}
 		}
 		return
 	default:
@@ -1347,10 +1390,10 @@ func (c *Client) transitionToClosed(conn *clientConn, reason DisconnectReason) {
 	// Pending connections (dial in progress / dial failed) have no outbound queue.
 	needsDrain := fromState == ConnStateActive || fromState == ConnStateDraining
 
-	// Capture session liveness. Used by both the drain path (to detect writePump
-	// death during drain) and the non-drain path (to prevent stale disconnect
-	// messages from leaking onto a successor session after reconnect).
-	sessionDone := c.getSessionDone()
+	// Use the connection's owning session, not the global active session.
+	// This prevents stale disconnect messages from leaking onto a successor
+	// session when a goroutine from an old session runs after reconnect.
+	sessionDone := conn.session.Done()
 
 	if needsDrain && sessionDone != nil {
 		// Drain asynchronously to avoid blocking the caller — transitionToClosed
@@ -1384,7 +1427,14 @@ func (c *Client) transitionToClosed(conn *clientConn, reason DisconnectReason) {
 				finalize(false)
 			case <-drainTimer.C:
 				log.Printf("WARN: [%s] Drain timeout for ClientID %s, proceeding with disconnect", c.config.Name, conn.id)
-				finalize(true)
+				// Re-check session liveness — if both drainTimer and sessionDone
+				// fired simultaneously, Go may have picked the timer case.
+				select {
+				case <-sessionDone:
+					finalize(false)
+				default:
+					finalize(true)
+				}
 			case <-c.ctx.Done():
 				// Client shutting down — relay connection is gone.
 				finalize(false)
@@ -1672,22 +1722,13 @@ drainDataReady:
 	}
 }
 
-func (c *Client) beginSession() chan struct{} {
-	sessionCh := make(chan struct{})
-	c.sessionDone.Store(sessionCh)
-	c.connected.Store(true)
-	return sessionCh
-}
-
-// getSessionDone returns the current session's done channel, or nil if no
-// session is active. The returned channel is closed when the session ends.
-func (c *Client) getSessionDone() <-chan struct{} {
-	if v := c.sessionDone.Load(); v != nil {
-		if ch, ok := v.(chan struct{}); ok && ch != nil {
-			return ch
-		}
+func (c *Client) beginSession() *Session {
+	s := &Session{
+		done: make(chan struct{}),
 	}
-	return nil
+	s.connected.Store(true)
+	c.activeSession.Store(s)
+	return s
 }
 
 func (c *Client) enqueueData(message outboundMessage) error {
@@ -1742,11 +1783,10 @@ func (c *Client) enqueueControl(message outboundMessage) error {
 }
 
 func (c *Client) enqueue(message outboundMessage, queue chan outboundMessage) error {
-	if !c.connected.Load() {
+	s := c.activeSession.Load()
+	if s == nil || !s.IsConnected() {
 		return errSessionInactive
 	}
-
-	done := c.getSessionDone()
 
 	select {
 	case queue <- message:
@@ -1754,7 +1794,7 @@ func (c *Client) enqueue(message outboundMessage, queue chan outboundMessage) er
 	case <-time.After(enqueueTimeout):
 		c.stats.enqueueTimeouts.Add(1)
 		return fmt.Errorf("enqueue timeout")
-	case <-done:
+	case <-s.Done():
 		return errSessionInactive
 	case <-c.ctx.Done():
 		return c.ctx.Err()
@@ -1837,21 +1877,16 @@ func (c *Client) writeMessage(ws *websocket.Conn, message outboundMessage) error
 	return nil
 }
 
-func (c *Client) writePump(sessionCh chan struct{}) {
+func (c *Client) writePump(s *Session) {
 	defer c.wg.Done()
 	c.wsMu.Lock()
 	ws := c.ws
 	c.wsMu.Unlock()
 
-	if sessionCh == nil {
-		sessionCh = c.beginSession()
-	}
-
 	ticker := time.NewTicker(pingInterval)
 	defer func() {
-		c.connected.Store(false)
-		close(sessionCh)
-		c.sessionDone.Store((chan struct{})(nil))
+		s.Close()
+		c.activeSession.Store(nil)
 		c.clearSendQueues()
 		if ws != nil {
 			ws.Close()
@@ -1895,7 +1930,7 @@ func (c *Client) writePump(sessionCh chan struct{}) {
 				log.Printf("ERROR: [%s] Failed to write ping to Nexus: %v", c.config.Name, err)
 				return // Terminate the pump and session.
 			}
-		case <-sessionCh:
+		case <-s.done:
 			return
 		case <-c.ctx.Done():
 			// The session context was canceled.
@@ -2236,7 +2271,9 @@ func (c *Client) handleSocks5Conn(conn net.Conn) {
 	// Clear the deadline set for the handshake.
 	_ = conn.SetDeadline(time.Time{})
 
-	if !c.connected.Load() {
+	// Capture session once for both the pre-flight check and binding.
+	sess := c.activeSession.Load()
+	if sess == nil || !sess.IsConnected() {
 		log.Printf("WARN: [%s] SOCKS5 outbound to %s rejected: not connected to proxy", c.config.Name, targetAddr)
 		_ = socks5SendReply(conn, socks5RepGeneralFailure)
 		_ = conn.Close()
@@ -2249,6 +2286,7 @@ func (c *Client) handleSocks5Conn(conn net.Conn) {
 	pendingClient := &clientConn{
 		id:      clientID,
 		conn:    conn,
+		session: sess,
 		quit:    make(chan struct{}),
 		drained: make(chan struct{}),
 		writeCh: make(chan []byte, localConnWriteBuffer),

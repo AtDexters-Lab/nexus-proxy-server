@@ -58,7 +58,9 @@ func TestFlowControlLogic(t *testing.T) {
 	c := &Client{
 		controlSend: make(chan outboundMessage, 10),
 	}
-	c.connected.Store(true)
+	s := &Session{done: make(chan struct{})}
+	s.connected.Store(true)
+	c.activeSession.Store(s)
 	c.ctx = context.Background()
 
 	// Helper to consume control messages
