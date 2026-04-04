@@ -2343,6 +2343,15 @@ func (c *Client) handleSocks5Conn(conn net.Conn) {
 		return
 	}
 
+	// If the session died between capture and enqueue, the connect message
+	// may have been drained or sent on a dying websocket. Either way the
+	// relay-side connection is orphaned — clean up locally.
+	if !sess.IsConnected() {
+		log.Printf("DEBUG: [%s] Session ended during outbound connect for %s, cleaning up", c.config.Name, targetAddr)
+		fail(DisconnectSessionEnded, socks5RepGeneralFailure)
+		return
+	}
+
 	// Wait for the proxy's result.
 	timer := time.NewTimer(outboundConnectTimeout)
 	defer timer.Stop()
