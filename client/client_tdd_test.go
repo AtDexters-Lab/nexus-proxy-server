@@ -184,6 +184,47 @@ func TestWritePumpDoesNotReplayStaleMessages(t *testing.T) {
 	<-done2
 }
 
+// TestTransitionToClosedNoStaleDisconnect verifies that transitionToClosed does
+// NOT send a disconnect message when the session that owned the connection is
+// already dead. This prevents stale disconnects from leaking onto a successor
+// session after reconnect.
+func TestTransitionToClosedNoStaleDisconnect(t *testing.T) {
+	c := newTestClient(t)
+
+	// Simulate session 1 lifecycle: start then die.
+	sessionCh := c.beginSession()
+	c.connected.Store(false)
+	close(sessionCh)
+	c.sessionDone.Store((chan struct{})(nil))
+	c.clearSendQueues()
+
+	// Create a pending clientConn (simulates a dial that never completed).
+	staleID := uuid.New()
+	cc := &clientConn{
+		id:       staleID,
+		hostname: "stale.test",
+		quit:     make(chan struct{}),
+		drained:  make(chan struct{}),
+	}
+	c.localConns.Store(staleID, cc)
+
+	// transitionToClosed should NOT enqueue a disconnect (session is dead).
+	c.transitionToClosed(cc, DisconnectNormal)
+
+	// Verify no message was enqueued to controlSend.
+	select {
+	case msg := <-c.controlSend:
+		t.Fatalf("stale disconnect leaked onto control channel: %x", msg.payload)
+	default:
+		// Good — no stale message.
+	}
+
+	// Verify cleanup still happened.
+	if _, ok := c.localConns.Load(staleID); ok {
+		t.Fatal("expected localConns entry to be cleaned up")
+	}
+}
+
 func TestHandleTextMessageRespondsToReauthChallenge(t *testing.T) {
 	c := newTestClient(t)
 	c.connected.Store(true)

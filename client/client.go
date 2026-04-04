@@ -1347,17 +1347,12 @@ func (c *Client) transitionToClosed(conn *clientConn, reason DisconnectReason) {
 	// Pending connections (dial in progress / dial failed) have no outbound queue.
 	needsDrain := fromState == ConnStateActive || fromState == ConnStateDraining
 
-	// Load session channel to detect writePump death.
-	var sessionDone <-chan struct{}
-	if needsDrain {
-		if v := c.sessionDone.Load(); v != nil {
-			if ch, ok := v.(chan struct{}); ok && ch != nil {
-				sessionDone = ch
-			}
-		}
-	}
+	// Capture session liveness. Used by both the drain path (to detect writePump
+	// death during drain) and the non-drain path (to prevent stale disconnect
+	// messages from leaking onto a successor session after reconnect).
+	sessionDone := c.getSessionDone()
 
-	if sessionDone != nil {
+	if needsDrain && sessionDone != nil {
 		// Drain asynchronously to avoid blocking the caller — transitionToClosed
 		// can be called from readPump (e.g., relay-initiated disconnect) and must
 		// not stall the WebSocket reader while waiting for writePump to flush.
@@ -1399,8 +1394,20 @@ func (c *Client) transitionToClosed(conn *clientConn, reason DisconnectReason) {
 		return
 	}
 
-	// Pump is gone or connection was never active — clean up immediately.
-	finalize(true)
+	// No drain needed or session already gone — clean up immediately.
+	// Only send disconnect if the session captured above is still alive;
+	// otherwise the relay already knows via the broken WebSocket and
+	// sending could leak a stale frame onto a reconnected session.
+	sendDisconnect := false
+	if sessionDone != nil {
+		select {
+		case <-sessionDone:
+			// Session ended — relay already knows.
+		default:
+			sendDisconnect = true
+		}
+	}
+	finalize(sendDisconnect)
 }
 
 func (c *Client) getOrCreateQueue(clientID uuid.UUID) chan outboundMessage {
@@ -1672,6 +1679,17 @@ func (c *Client) beginSession() chan struct{} {
 	return sessionCh
 }
 
+// getSessionDone returns the current session's done channel, or nil if no
+// session is active. The returned channel is closed when the session ends.
+func (c *Client) getSessionDone() <-chan struct{} {
+	if v := c.sessionDone.Load(); v != nil {
+		if ch, ok := v.(chan struct{}); ok && ch != nil {
+			return ch
+		}
+	}
+	return nil
+}
+
 func (c *Client) enqueueData(message outboundMessage) error {
 	// Parse ClientID from message to ensure fair queuing
 	// message payload: [ControlByte + ClientID + Data...]
@@ -1728,12 +1746,7 @@ func (c *Client) enqueue(message outboundMessage, queue chan outboundMessage) er
 		return errSessionInactive
 	}
 
-	var done <-chan struct{}
-	if v := c.sessionDone.Load(); v != nil {
-		if ch, ok := v.(chan struct{}); ok && ch != nil {
-			done = ch
-		}
-	}
+	done := c.getSessionDone()
 
 	select {
 	case queue <- message:
