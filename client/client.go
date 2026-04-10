@@ -376,6 +376,13 @@ type clientConn struct {
 	closeOnce   sync.Once   // Ensures connection is closed only once
 	pongTimer   *time.Timer // Timer for pong timeout, can be cancelled
 	pongTimerMu sync.Mutex  // Protects pongTimer access
+
+	// Server-initiated backpressure (reverse direction: Nexus → client).
+	// When Nexus's per-client write buffer fills, it sends EventPauseStream.
+	// The client suppresses writePump signaling so no new data enters the
+	// WebSocket pipeline, and enqueueData tolerates the full queue.
+	serverPaused   atomic.Bool   // true when Nexus told us to pause
+	serverPauseGen atomic.Uint64 // generation counter — invalidates stale auto-resume timers
 }
 
 // Atomic state transitions with validation
@@ -1200,6 +1207,32 @@ func (c *Client) handleControlMessage(payload []byte) {
 				ch <- fmt.Errorf("%s", reason)
 			}
 		}
+
+	case protocol.EventPauseStream:
+		if val, ok := c.localConns.Load(msg.ClientID); ok {
+			conn := val.(*clientConn)
+			if conn.serverPaused.CompareAndSwap(false, true) {
+				log.Printf("DEBUG: [%s] Server paused client %s (reason: %s)", c.config.Name, msg.ClientID, msg.Reason)
+				// Safety net: auto-resume after 30s in case the resume message is lost.
+				gen := conn.serverPauseGen.Add(1)
+				time.AfterFunc(30*time.Second, func() {
+					if conn.serverPauseGen.Load() == gen && conn.serverPaused.CompareAndSwap(true, false) {
+						log.Printf("WARN: [%s] Auto-resuming client %s after 30s (lost resume?)", c.config.Name, conn.id)
+						c.reSignalDataReady(conn)
+					}
+				})
+			}
+		}
+
+	case protocol.EventResumeStream:
+		if val, ok := c.localConns.Load(msg.ClientID); ok {
+			conn := val.(*clientConn)
+			conn.serverPauseGen.Add(1) // invalidate pending auto-resume timer
+			if conn.serverPaused.CompareAndSwap(true, false) {
+				log.Printf("DEBUG: [%s] Server resumed client %s", c.config.Name, msg.ClientID)
+				c.reSignalDataReady(conn)
+			}
+		}
 	}
 }
 
@@ -1748,33 +1781,77 @@ func (c *Client) enqueueData(message outboundMessage) error {
 		return fmt.Errorf("connection not found for ClientID %s", clientID)
 	}
 
-	select {
-	case queue <- message:
-		// Notify writePump using signaled flag to prevent duplicate notifications.
-		// The signaled flag ensures only one notification is in dataReady at a time
-		// per connection, preventing busy connections from flooding the channel.
-		if conn, ok := c.localConns.Load(clientID); ok {
-			if cConn, ok := conn.(*clientConn); ok {
-				if cConn.signaled.CompareAndSwap(false, true) {
-					// We own the notification responsibility - must push to dataReady
-					// Block here to apply backpressure (P3 fix: avoid unbounded goroutines)
+	timer := time.NewTimer(enqueueTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case queue <- message:
+			// Notify writePump using signaled flag to prevent duplicate notifications.
+			// The signaled flag ensures only one notification is in dataReady at a time
+			// per connection, preventing busy connections from flooding the channel.
+			if conn, ok := c.localConns.Load(clientID); ok {
+				if cConn, ok := conn.(*clientConn); ok {
+					// Layer 1: suppress writePump signaling when server-paused.
+					// Data stays in the queue until the server resumes.
+					if cConn.serverPaused.Load() {
+						return nil
+					}
+					if cConn.signaled.CompareAndSwap(false, true) {
+						// We own the notification responsibility - must push to dataReady
+						// Block here to apply backpressure (P3 fix: avoid unbounded goroutines)
+						select {
+						case c.dataReady <- clientID:
+							// Successfully notified
+						case <-c.ctx.Done():
+							// Context canceled, stop trying
+							cConn.signaled.Store(false) // Reset flag since we didn't notify
+						}
+					}
+					// If CAS failed, another notification is already pending - no action needed
+				}
+			}
+			return nil
+		case <-timer.C:
+			// Layer 3: if server-paused, the queue is intentionally not draining.
+			// Loop back and wait rather than killing the connection.
+			if conn, ok := c.localConns.Load(clientID); ok {
+				if cConn, ok := conn.(*clientConn); ok {
+					// Check if connection is closing — exit immediately
+					// instead of waiting for the 30s auto-resume.
 					select {
-					case c.dataReady <- clientID:
-						// Successfully notified
-					case <-c.ctx.Done():
-						// Context canceled, stop trying
-						cConn.signaled.Store(false) // Reset flag since we didn't notify
+					case <-cConn.quit:
+					default:
+						if cConn.serverPaused.Load() {
+							timer.Reset(enqueueTimeout)
+							continue
+						}
 					}
 				}
-				// If CAS failed, another notification is already pending - no action needed
 			}
+			c.stats.enqueueTimeouts.Add(1)
+			return fmt.Errorf("enqueue timeout")
+		case <-c.ctx.Done():
+			return c.ctx.Err()
 		}
-		return nil
-	case <-time.After(enqueueTimeout):
-		c.stats.enqueueTimeouts.Add(1)
-		return fmt.Errorf("enqueue timeout")
-	case <-c.ctx.Done():
-		return c.ctx.Err()
+	}
+}
+
+// reSignalDataReady notifies writePump that a previously-paused client has
+// pending data to drain. Called when EventResumeStream arrives or the
+// auto-resume timer fires.
+func (c *Client) reSignalDataReady(conn *clientConn) {
+	if conn.signaled.CompareAndSwap(false, true) {
+		select {
+		case c.dataReady <- conn.id:
+		default:
+			go func(id uuid.UUID, quit <-chan struct{}) {
+				select {
+				case c.dataReady <- id:
+				case <-quit:
+				case <-c.ctx.Done():
+				}
+			}(conn.id, conn.quit)
+		}
 	}
 }
 
@@ -1944,6 +2021,23 @@ func (c *Client) drainConnectionQueue(ws *websocket.Conn, clientID uuid.UUID, ma
 	if queue == nil {
 		// Stale notification - connection was already cleaned up
 		return
+	}
+
+	// Skip drain when server has paused this client — data stays in the
+	// queue, which fills and applies TCP backpressure to the local service.
+	// Exception: if the connection is closing (quit closed), fall through
+	// to the normal drain path so closeOnDrained fires and transitionToClosed
+	// doesn't stall on the drain timeout.
+	if conn, ok := c.localConns.Load(clientID); ok {
+		if cConn, ok := conn.(*clientConn); ok && cConn.serverPaused.Load() {
+			select {
+			case <-cConn.quit:
+				// Connection closing — fall through to normal drain/cleanup
+			default:
+				cConn.signaled.Store(false) // allow re-signal on resume
+				return
+			}
+		}
 	}
 
 	drained := 0

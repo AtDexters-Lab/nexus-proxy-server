@@ -209,7 +209,9 @@ func (b *Backend) AddClient(clientConn net.Conn, clientID uuid.UUID, hostname st
 	if err := b.SendControlMessage(msg); err != nil {
 		return fmt.Errorf("failed to send connect message for client %s: %w", clientID, err)
 	}
-	b.clients.Store(clientID, newBufferedConn(clientConn, b.config.IdleTimeout()))
+	b.clients.Store(clientID, newBufferedConn(clientConn, b.config.IdleTimeout(),
+		b.streamControlCallback(protocol.EventPauseStream, clientID),
+		b.streamControlCallback(protocol.EventResumeStream, clientID)))
 	return nil
 }
 
@@ -225,6 +227,27 @@ func (b *Backend) RemoveClient(clientID uuid.UUID) {
 			log.Printf("ERROR: Failed to send disconnect message for client %s: %v", clientID, err)
 		} else {
 			log.Printf("INFO: Client %s disconnected from backend %s", clientID, b.id)
+		}
+	}
+}
+
+// streamControlCallback returns a non-blocking callback that sends a
+// pause or resume control message to the backend for the given client.
+// Used by bufferedConn's watermark logic. If the outgoing channel is full,
+// the message is silently dropped: for pause, the buffer eventually
+// overflows (pre-backpressure behavior); for resume, the client's 30-second
+// auto-resume timer fires as a safety net.
+func (b *Backend) streamControlCallback(event protocol.EventType, clientID uuid.UUID) func() {
+	return func() {
+		msg := protocol.ControlMessage{
+			Event:    event,
+			ClientID: clientID,
+		}
+		if event == protocol.EventPauseStream {
+			msg.Reason = "server_buffer_full"
+		}
+		if err := b.SendControlMessage(msg); err != nil {
+			log.Printf("WARN: Failed to send %s for client %s on backend %s: %v", event, clientID, b.id, err)
 		}
 	}
 }
@@ -245,7 +268,9 @@ func (b *Backend) AddOutboundClient(conn net.Conn, clientID uuid.UUID) error {
 		return fmt.Errorf("backend %s is closing", b.id)
 	}
 	wrapped := proxy.NewPausableConn(conn)
-	buffered := newBufferedConn(wrapped, b.config.OutboundIdleTimeout())
+	buffered := newBufferedConn(wrapped, b.config.OutboundIdleTimeout(),
+		b.streamControlCallback(protocol.EventPauseStream, clientID),
+		b.streamControlCallback(protocol.EventResumeStream, clientID))
 	if _, loaded := b.clients.LoadOrStore(clientID, buffered); loaded {
 		buffered.Close()
 		return fmt.Errorf("client ID %s already exists", clientID)
