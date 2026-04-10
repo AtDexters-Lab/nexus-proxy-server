@@ -186,15 +186,9 @@ func TestReadPumpDeadlock_SelfLoop(t *testing.T) {
 	}
 }
 
-// TestReadPumpBackpressure_LargePayload verifies that a large response
-// (>64 messages) to a slow client does NOT cause the client to be
-// disconnected. With proper backpressure, the proxy should signal the
-// backend to pause (EventPauseStream) rather than overflowing the buffer.
-//
-// The test simulates the client-side behavior: a writer goroutine sends
-// messages until EventPauseStream is received on the WebSocket, then stops.
-// This mirrors what the real client library does.
-func TestReadPumpBackpressure_LargePayload(t *testing.T) {
+// TestReadPumpCredits_EventConnectCarriesCredits verifies that AddClient
+// sends EventConnect with Credits > 0, enabling credit-based flow control.
+func TestReadPumpCredits_EventConnectCarriesCredits(t *testing.T) {
 	t.Parallel()
 
 	serverConnCh := make(chan *websocket.Conn, 1)
@@ -231,9 +225,6 @@ func TestReadPumpBackpressure_LargePayload(t *testing.T) {
 		pumpWg.Wait()
 	}()
 
-	// Client B: "slow client" — net.Pipe is synchronous, we never read
-	// from slowRemote. The drain goroutine blocks on the first write,
-	// so the bufferedConn's channel fills up.
 	clientBID := uuid.New()
 	slowLocal, slowRemote := pipeTCPPair(443)
 	defer slowRemote.Close()
@@ -242,7 +233,75 @@ func TestReadPumpBackpressure_LargePayload(t *testing.T) {
 	err = b.AddClient(slowLocal, clientBID, "example.com", false)
 	require.NoError(t, err)
 
-	// Client C: "fast client" — actively drained.
+	// Read EventConnect from the WebSocket — it should carry Credits.
+	clientWS.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
+		_, msg, err := clientWS.ReadMessage()
+		require.NoError(t, err, "timed out reading EventConnect")
+		if len(msg) < 2 || msg[0] != protocol.ControlByteControl {
+			continue
+		}
+		var ctrl protocol.ControlMessage
+		require.NoError(t, json.Unmarshal(msg[1:], &ctrl))
+		if ctrl.Event == protocol.EventConnect && ctrl.ClientID == clientBID {
+			require.Equal(t, protocol.DefaultCreditCapacity, ctrl.Credits,
+				"EventConnect should carry initial credits")
+			return
+		}
+	}
+}
+
+// TestReadPumpCredits_BufferNotOverflowAtCreditLimit verifies that sending
+// exactly DefaultCreditCapacity messages does NOT overflow the buffer
+// (buffer size = credit count) and the client is NOT disconnected.
+func TestReadPumpCredits_BufferNotOverflowAtCreditLimit(t *testing.T) {
+	t.Parallel()
+
+	serverConnCh := make(chan *websocket.Conn, 1)
+	upgrader := websocket.Upgrader{}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		require.NoError(t, err)
+		serverConnCh <- conn
+	}))
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http")
+	clientWS, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer clientWS.Close()
+
+	backendWS := <-serverConnCh
+
+	cfg := &config.Config{
+		BackendsJWTSecret:  "secret",
+		IdleTimeoutSeconds: 10,
+	}
+	meta := &hub.AttestationMetadata{Hostnames: []string{"example.com"}, Weight: 1}
+	b := hub.NewBackend(backendWS, meta, cfg, stubValidator{}, &http.Client{})
+
+	var pumpWg sync.WaitGroup
+	pumpWg.Add(1)
+	go func() {
+		defer pumpWg.Done()
+		b.StartPumps()
+	}()
+	defer func() {
+		b.Close()
+		pumpWg.Wait()
+	}()
+
+	// Client B: slow (net.Pipe, no reader). Buffer fills but shouldn't overflow
+	// as long as we send <= DefaultCreditCapacity messages.
+	clientBID := uuid.New()
+	slowLocal, slowRemote := pipeTCPPair(443)
+	defer slowRemote.Close()
+	defer slowLocal.Close()
+
+	err = b.AddClient(slowLocal, clientBID, "example.com", false)
+	require.NoError(t, err)
+
+	// Client C: fast (drained).
 	clientCID := uuid.New()
 	fastLocal, fastRemote := pipeTCPPair(443)
 	defer fastRemote.Close()
@@ -274,75 +333,36 @@ func TestReadPumpBackpressure_LargePayload(t *testing.T) {
 		return msg
 	}
 
-	// Reader goroutine: watches for EventPauseStream from Nexus.
-	// This simulates the client library receiving the pause signal.
-	pauseReceived := make(chan struct{}, 1)
-	go func() {
-		for {
-			_, msg, err := clientWS.ReadMessage()
-			if err != nil {
-				return
-			}
-			if len(msg) < 2 || msg[0] != protocol.ControlByteControl {
-				continue
-			}
-			var ctrl protocol.ControlMessage
-			if err := json.Unmarshal(msg[1:], &ctrl); err != nil {
-				continue
-			}
-			if ctrl.Event == protocol.EventPauseStream && ctrl.ClientID == clientBID {
-				select {
-				case pauseReceived <- struct{}{}:
-				default:
-				}
-			}
-		}
-	}()
-
-	// Send 55 messages for Client B — enough to trigger the pause at
-	// high watermark (48) with headroom to spare. Total 55 < 128
-	// (buffer size), so no overflow. The drain goroutine is stuck
-	// (net.Pipe, slowRemote not reading), so all 55 stay in the channel.
+	// Send exactly DefaultCreditCapacity messages for Client B.
+	// The buffer has exactly this many slots. No overflow.
 	payload := []byte("response_chunk")
-	for i := 0; i < 55; i++ {
+	for i := int64(0); i < protocol.DefaultCreditCapacity; i++ {
 		err = clientWS.WriteMessage(websocket.BinaryMessage, buildDataMsg(clientBID, payload))
 		require.NoError(t, err)
 	}
 
-	// Wait for the EventPauseStream to arrive — this proves Nexus detected
-	// the buffer filling and signaled the backend to stop.
-	select {
-	case <-pauseReceived:
-		// Backpressure signal received — Nexus told us to stop.
-	case <-time.After(3 * time.Second):
-		t.Fatal("BACKPRESSURE MISSING: EventPauseStream was never received " +
-			"(expected at high watermark ~48)")
-	}
-
-	// Now send a message for Client C (the tunnel ACK). readPump must not
-	// be blocked — it should process this immediately.
+	// Send a message for Client C to verify readPump is not blocked.
 	marker := []byte("TUNNEL_ACK_DATA")
 	err = clientWS.WriteMessage(websocket.BinaryMessage, buildDataMsg(clientCID, marker))
 	require.NoError(t, err)
 
-	// Verify Client C receives its data (readPump not blocked).
 	deadline := time.After(3 * time.Second)
-	received := false
-	for !received {
+	for {
 		select {
 		case data, ok := <-fastReceived:
 			if !ok {
-				t.Fatal("fast client connection closed unexpectedly")
+				t.Fatal("fast client closed")
 			}
 			if string(data) == string(marker) {
-				received = true
+				goto verified
 			}
 		case <-deadline:
-			t.Fatal("Client C (tunnel) data was not delivered within 3s")
+			t.Fatal("Client C data not delivered within 3s")
 		}
 	}
+verified:
 
-	// Verify Client B was NOT disconnected.
+	// Verify Client B is still connected.
 	time.Sleep(100 * time.Millisecond)
 	slowRemote.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 	_, readErr := slowRemote.Read(make([]byte, 1))
@@ -350,7 +370,7 @@ func TestReadPumpBackpressure_LargePayload(t *testing.T) {
 		if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
 			// Timeout = pipe still open = Client B alive. Good.
 		} else {
-			t.Fatalf("BACKPRESSURE MISSING: Client B was disconnected after buffer overflow: %v", readErr)
+			t.Fatalf("Client B was disconnected: %v", readErr)
 		}
 	}
 }

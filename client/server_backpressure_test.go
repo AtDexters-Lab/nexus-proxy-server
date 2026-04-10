@@ -2,6 +2,8 @@ package client
 
 import (
 	"encoding/json"
+	"math"
+	"net"
 	"testing"
 	"time"
 
@@ -11,8 +13,7 @@ import (
 )
 
 // makeTestConn creates a clientConn registered in the client's localConns
-// and connQueues, suitable for testing backpressure. Returns the conn and
-// its per-connection outbound queue.
+// and connQueues, suitable for testing credit-based flow control.
 func makeTestConn(c *Client, id uuid.UUID) (*clientConn, chan outboundMessage) {
 	cc := &clientConn{
 		id:      id,
@@ -34,11 +35,8 @@ func makeTestConn(c *Client, id uuid.UUID) (*clientConn, chan outboundMessage) {
 	return cc, c.getQueue(id)
 }
 
-// sendControlMessage sends a control message from the "server" side of the
-// WebSocket to the client's readPump.
-func sendControlMessage(t *testing.T, serverWS *websocket.Conn, event protocol.EventType, clientID uuid.UUID) {
+func sendControlMessage(t *testing.T, serverWS *websocket.Conn, msg protocol.ControlMessage) {
 	t.Helper()
-	msg := protocol.ControlMessage{Event: event, ClientID: clientID, Reason: "test"}
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -49,70 +47,74 @@ func sendControlMessage(t *testing.T, serverWS *websocket.Conn, event protocol.E
 	}
 }
 
-// TestServerPause_SetsFlag verifies that EventPauseStream from the server
-// sets serverPaused on the corresponding clientConn.
-func TestServerPause_SetsFlag(t *testing.T) {
-	c := newTestClient(t)
-	clientWS, serverWS := newWebsocketPair(t)
-	c.wsMu.Lock()
-	c.ws = clientWS
-	c.wsMu.Unlock()
-
-	id := uuid.New()
-	cc, _ := makeTestConn(c, id)
-
-	// Start readPump to process the control message.
-	c.wg.Add(1)
-	go c.readPump()
-
-	sendControlMessage(t, serverWS, protocol.EventPauseStream, id)
-	time.Sleep(50 * time.Millisecond)
-
-	if !cc.serverPaused.Load() {
-		t.Fatal("serverPaused was not set after EventPauseStream")
+// setupTestListener starts a TCP listener and configures the client's
+// port mapping to route to it. Returns the port and a cleanup function.
+func setupTestListener(t *testing.T, c *Client) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
 	}
-
-	c.cancel()
-	clientWS.Close()
-	c.wg.Wait()
-}
-
-// TestServerResume_ClearsFlag verifies that EventResumeStream clears
-// serverPaused and re-signals dataReady.
-func TestServerResume_ClearsFlag(t *testing.T) {
-	c := newTestClient(t)
-	clientWS, serverWS := newWebsocketPair(t)
-	c.wsMu.Lock()
-	c.ws = clientWS
-	c.wsMu.Unlock()
-
-	id := uuid.New()
-	cc, _ := makeTestConn(c, id)
-
-	c.wg.Add(1)
-	go c.readPump()
-
-	// Pause, then resume.
-	sendControlMessage(t, serverWS, protocol.EventPauseStream, id)
-	time.Sleep(50 * time.Millisecond)
-	if !cc.serverPaused.Load() {
-		t.Fatal("serverPaused not set")
-	}
-
-	sendControlMessage(t, serverWS, protocol.EventResumeStream, id)
-	time.Sleep(50 * time.Millisecond)
-	if cc.serverPaused.Load() {
-		t.Fatal("serverPaused was not cleared after EventResumeStream")
-	}
-
-	// Verify dataReady was signaled (reSignalDataReady should have fired).
-	select {
-	case gotID := <-c.dataReady:
-		if gotID != id {
-			t.Fatalf("dataReady signaled for wrong clientID: got %s, want %s", gotID, id)
+	t.Cleanup(func() { ln.Close() })
+	// Accept and discard connections so dial succeeds.
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				buf := make([]byte, 4096)
+				for {
+					if _, err := conn.Read(buf); err != nil {
+						conn.Close()
+						return
+					}
+				}
+			}()
 		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("dataReady was not signaled after resume")
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+	c.config.PortMappings[port] = PortMapping{Default: ln.Addr().String()}
+	return port
+}
+
+// TestCredits_Reverse_InitialFromConnect verifies that Credits in
+// EventConnect are stored as initial availableCredits.
+func TestCredits_Reverse_InitialFromConnect(t *testing.T) {
+	c := newTestClient(t)
+	port := setupTestListener(t, c)
+	clientWS, serverWS := newWebsocketPair(t)
+	c.wsMu.Lock()
+	c.ws = clientWS
+	c.wsMu.Unlock()
+
+	session := c.beginSession()
+	c.wg.Add(1)
+	go c.writePump(session)
+	c.wg.Add(1)
+	go c.readPump()
+
+	id := uuid.New()
+	sendControlMessage(t, serverWS, protocol.ControlMessage{
+		Event:    protocol.EventConnect,
+		ClientID: id,
+		ConnPort: port,
+		ClientIP: "127.0.0.1",
+		Hostname: "example.com",
+		Credits:  42,
+	})
+
+	time.Sleep(100 * time.Millisecond)
+
+	val, ok := c.localConns.Load(id)
+	if !ok {
+		t.Fatal("connection not created")
+	}
+	cc := val.(*clientConn)
+	got := cc.availableCredits.Load()
+	if got != 42 {
+		t.Fatalf("availableCredits = %d, want 42", got)
 	}
 
 	c.cancel()
@@ -120,18 +122,58 @@ func TestServerResume_ClearsFlag(t *testing.T) {
 	c.wg.Wait()
 }
 
-// TestLayer1_SuppressSignaling verifies that enqueueData does NOT signal
-// dataReady when serverPaused is true.
-func TestLayer1_SuppressSignaling(t *testing.T) {
+// TestCredits_Reverse_UnlimitedWhenZero verifies that Credits=0
+// (old server) results in math.MaxInt64 (unlimited).
+func TestCredits_Reverse_UnlimitedWhenZero(t *testing.T) {
+	c := newTestClient(t)
+	port := setupTestListener(t, c)
+	clientWS, serverWS := newWebsocketPair(t)
+	c.wsMu.Lock()
+	c.ws = clientWS
+	c.wsMu.Unlock()
+
+	session := c.beginSession()
+	c.wg.Add(1)
+	go c.writePump(session)
+	c.wg.Add(1)
+	go c.readPump()
+
+	id := uuid.New()
+	sendControlMessage(t, serverWS, protocol.ControlMessage{
+		Event:    protocol.EventConnect,
+		ClientID: id,
+		ConnPort: port,
+		ClientIP: "127.0.0.1",
+		Hostname: "example.com",
+		// Credits deliberately omitted (zero value)
+	})
+
+	time.Sleep(100 * time.Millisecond)
+
+	val, ok := c.localConns.Load(id)
+	if !ok {
+		t.Fatal("connection not created")
+	}
+	cc := val.(*clientConn)
+	got := cc.availableCredits.Load()
+	if got != math.MaxInt64 {
+		t.Fatalf("availableCredits = %d, want MaxInt64", got)
+	}
+
+	c.cancel()
+	clientWS.Close()
+	c.wg.Wait()
+}
+
+// TestCredits_Reverse_SuppressSignalingAtZero verifies that enqueueData
+// does NOT signal dataReady when availableCredits <= 0.
+func TestCredits_Reverse_SuppressSignalingAtZero(t *testing.T) {
 	c := newTestClient(t)
 
 	id := uuid.New()
 	cc, queue := makeTestConn(c, id)
+	cc.availableCredits.Store(0)
 
-	// Set server-paused.
-	cc.serverPaused.Store(true)
-
-	// Enqueue a data message.
 	header := make([]byte, 1+protocol.ClientIDLength)
 	header[0] = protocol.ControlByteData
 	copy(header[1:], id[:])
@@ -144,217 +186,213 @@ func TestLayer1_SuppressSignaling(t *testing.T) {
 		t.Fatalf("enqueueData failed: %v", err)
 	}
 
-	// Data should be in the queue.
 	select {
 	case <-queue:
-		// Good — data was enqueued.
 	default:
-		t.Fatal("data was not enqueued to the per-connection queue")
+		t.Fatal("data was not enqueued")
 	}
 
-	// dataReady should NOT have been signaled (Layer 1).
 	select {
 	case <-c.dataReady:
-		t.Fatal("dataReady was signaled despite serverPaused being true — Layer 1 failed")
+		t.Fatal("dataReady was signaled despite credits=0")
 	case <-time.After(100 * time.Millisecond):
-		// Good — no signal.
 	}
 }
 
-// TestLayer2_SkipDrain verifies that drainConnectionQueue returns without
-// dequeuing when serverPaused is true.
-func TestLayer2_SkipDrain(t *testing.T) {
+// TestCredits_Reverse_SkipDrainAtZero verifies drainConnectionQueue
+// returns without dequeuing when credits=0.
+func TestCredits_Reverse_SkipDrainAtZero(t *testing.T) {
 	c := newTestClient(t)
 	clientWS, _ := newWebsocketPair(t)
 
 	id := uuid.New()
 	cc, queue := makeTestConn(c, id)
 
-	// Put a message in the queue.
 	queue <- outboundMessage{
 		messageType: websocket.BinaryMessage,
 		payload:     []byte("should_not_be_drained"),
 	}
 
-	// Set server-paused.
-	cc.serverPaused.Store(true)
+	cc.availableCredits.Store(0)
 	cc.signaled.Store(true)
 
-	// Call drainConnectionQueue — it should skip the drain.
 	c.drainConnectionQueue(clientWS, id, 4)
 
-	// Message should still be in the queue (not dequeued).
 	select {
 	case <-queue:
-		// Good — message is still there.
 	default:
-		t.Fatal("drainConnectionQueue dequeued data despite serverPaused — Layer 2 failed")
+		t.Fatal("drainConnectionQueue dequeued data despite credits=0")
 	}
 
-	// signaled should be cleared to allow re-signal on resume.
 	if cc.signaled.Load() {
-		t.Fatal("signaled flag was not cleared after skip — re-signal on resume would fail")
+		t.Fatal("signaled flag not cleared")
 	}
 }
 
-// TestLayer2_FallsThroughOnClose verifies that drainConnectionQueue does
-// NOT skip drain when the connection is closing (quit closed), even if
-// serverPaused is true. This ensures closeOnDrained fires promptly.
-func TestLayer2_FallsThroughOnClose(t *testing.T) {
+// TestCredits_Reverse_DrainFallsThroughOnClose verifies drain proceeds
+// at credits=0 when quit is closed (connection closing).
+func TestCredits_Reverse_DrainFallsThroughOnClose(t *testing.T) {
 	c := newTestClient(t)
 	clientWS, _ := newWebsocketPair(t)
 
 	id := uuid.New()
 	cc, queue := makeTestConn(c, id)
 
-	// Put a message in the queue.
 	queue <- outboundMessage{
 		messageType: websocket.BinaryMessage,
 		payload:     []byte("should_be_drained"),
 	}
 
-	// Set server-paused AND close quit (connection closing).
-	cc.serverPaused.Store(true)
+	cc.availableCredits.Store(0)
 	close(cc.quit)
 
-	// drainConnectionQueue should fall through to normal drain.
 	c.drainConnectionQueue(clientWS, id, 4)
 
-	// Queue should be empty (message was drained).
 	select {
 	case <-queue:
-		t.Fatal("message still in queue — drain should have processed it")
+		t.Fatal("message still in queue")
 	default:
-		// Good — drained.
 	}
 }
 
-// TestLayer3_RetryOnTimeout verifies that enqueueData retries (instead of
-// returning error) when the queue is full and serverPaused is true.
-func TestLayer3_RetryOnTimeout(t *testing.T) {
+// TestCredits_Reverse_Replenish verifies EventResumeStream with Credits
+// adds to availableCredits and re-signals dataReady.
+func TestCredits_Reverse_Replenish(t *testing.T) {
 	c := newTestClient(t)
-
-	id := uuid.New()
-	cc, queue := makeTestConn(c, id)
-
-	// Fill the queue completely.
-	for i := 0; i < cap(queue); i++ {
-		queue <- outboundMessage{payload: []byte("filler")}
-	}
-
-	// Set server-paused.
-	cc.serverPaused.Store(true)
-
-	// Start enqueueData in a goroutine — it should retry (not fail).
-	header := make([]byte, 1+protocol.ClientIDLength)
-	header[0] = protocol.ControlByteData
-	copy(header[1:], id[:])
-	msg := outboundMessage{
-		messageType: websocket.BinaryMessage,
-		payload:     append(header, []byte("blocked_data")...),
-	}
-
-	result := make(chan error, 1)
-	go func() {
-		result <- c.enqueueData(msg)
-	}()
-
-	// Wait a moment — enqueueData should be looping, not returning error.
-	select {
-	case err := <-result:
-		t.Fatalf("enqueueData returned immediately instead of retrying: %v", err)
-	case <-time.After(300 * time.Millisecond):
-		// Good — it's retrying.
-	}
-
-	// Now clear the pause and drain one item to make room.
-	cc.serverPaused.Store(false)
-	<-queue // free one slot
-
-	// enqueueData should now succeed.
-	select {
-	case err := <-result:
-		if err != nil {
-			t.Fatalf("enqueueData failed after unpause: %v", err)
-		}
-	case <-time.After(enqueueTimeout + time.Second):
-		t.Fatal("enqueueData did not complete after unpause and queue drain")
-	}
-}
-
-// TestLayer3_ExitsOnQuit verifies that enqueueData exits promptly when the
-// connection is closing (quit closed), even if serverPaused is true and
-// the queue is full.
-func TestLayer3_ExitsOnQuit(t *testing.T) {
-	c := newTestClient(t)
-
-	id := uuid.New()
-	cc, queue := makeTestConn(c, id)
-
-	// Fill the queue.
-	for i := 0; i < cap(queue); i++ {
-		queue <- outboundMessage{payload: []byte("filler")}
-	}
-	cc.serverPaused.Store(true)
-
-	header := make([]byte, 1+protocol.ClientIDLength)
-	header[0] = protocol.ControlByteData
-	copy(header[1:], id[:])
-	msg := outboundMessage{
-		messageType: websocket.BinaryMessage,
-		payload:     append(header, []byte("data")...),
-	}
-
-	result := make(chan error, 1)
-	go func() {
-		result <- c.enqueueData(msg)
-	}()
-
-	// Let it enter the retry loop.
-	time.Sleep(100 * time.Millisecond)
-
-	// Close quit — simulates connection teardown.
-	close(cc.quit)
-
-	// enqueueData should exit within one enqueueTimeout cycle.
-	select {
-	case err := <-result:
-		if err == nil {
-			t.Fatal("expected error from enqueueData after quit, got nil")
-		}
-	case <-time.After(enqueueTimeout + 2*time.Second):
-		t.Fatal("enqueueData did not exit after quit was closed — Layer 3 quit check failed")
-	}
-}
-
-// TestAutoResume_GenerationCounter verifies that a stale auto-resume timer
-// does not clear a newer pause.
-func TestAutoResume_GenerationCounter(t *testing.T) {
-	c := newTestClient(t)
+	clientWS, serverWS := newWebsocketPair(t)
+	c.wsMu.Lock()
+	c.ws = clientWS
+	c.wsMu.Unlock()
 
 	id := uuid.New()
 	cc, _ := makeTestConn(c, id)
+	cc.availableCredits.Store(0)
 
-	// Simulate pause → resume → pause cycle.
-	// The first pause's auto-resume timer should not clear the second pause.
-	cc.serverPaused.CompareAndSwap(false, true)
-	gen1 := cc.serverPauseGen.Add(1)
+	c.wg.Add(1)
+	go c.readPump()
 
-	// Simulate resume (invalidates gen1 timer).
-	cc.serverPauseGen.Add(1)
-	cc.serverPaused.Store(false)
+	sendControlMessage(t, serverWS, protocol.ControlMessage{
+		Event:    protocol.EventResumeStream,
+		ClientID: id,
+		Credits:  16,
+	})
 
-	// Simulate second pause.
-	cc.serverPaused.Store(true)
-	cc.serverPauseGen.Add(1)
+	time.Sleep(50 * time.Millisecond)
 
-	// Fire gen1's auto-resume callback manually.
-	if cc.serverPauseGen.Load() == gen1 && cc.serverPaused.CompareAndSwap(true, false) {
-		t.Fatal("stale auto-resume timer cleared a newer pause — generation counter failed")
+	got := cc.availableCredits.Load()
+	if got != 16 {
+		t.Fatalf("availableCredits = %d, want 16", got)
 	}
 
-	// serverPaused should still be true (second pause intact).
-	if !cc.serverPaused.Load() {
-		t.Fatal("serverPaused was cleared by stale timer")
+	select {
+	case gotID := <-c.dataReady:
+		if gotID != id {
+			t.Fatalf("wrong clientID in dataReady")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("dataReady not signaled after replenishment")
+	}
+
+	c.cancel()
+	clientWS.Close()
+	c.wg.Wait()
+}
+
+// TestCredits_Forward_InitialGrant verifies that the client sends
+// forward credits to Nexus after receiving EventConnect.
+func TestCredits_Forward_InitialGrant(t *testing.T) {
+	c := newTestClient(t)
+	port := setupTestListener(t, c)
+	clientWS, serverWS := newWebsocketPair(t)
+	c.wsMu.Lock()
+	c.ws = clientWS
+	c.wsMu.Unlock()
+
+	session := c.beginSession()
+	c.wg.Add(1)
+	go c.writePump(session)
+	c.wg.Add(1)
+	go c.readPump()
+
+	id := uuid.New()
+	sendControlMessage(t, serverWS, protocol.ControlMessage{
+		Event:    protocol.EventConnect,
+		ClientID: id,
+		ConnPort: port,
+		ClientIP: "127.0.0.1",
+		Hostname: "example.com",
+		Credits:  protocol.DefaultCreditCapacity,
+	})
+
+	// Read from serverWS — should receive forward credit grant.
+	serverWS.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
+		_, msg, err := serverWS.ReadMessage()
+		if err != nil {
+			t.Fatalf("timed out waiting for forward credit grant: %v", err)
+		}
+		if len(msg) < 2 || msg[0] != protocol.ControlByteControl {
+			continue
+		}
+		var ctrl protocol.ControlMessage
+		if err := json.Unmarshal(msg[1:], &ctrl); err != nil {
+			continue
+		}
+		if ctrl.Event == protocol.EventResumeStream && ctrl.ClientID == id && ctrl.Credits > 0 {
+			if ctrl.Credits != int64(c.config.FlowControl.MaxBuffer) {
+				t.Fatalf("forward credits = %d, want %d", ctrl.Credits, c.config.FlowControl.MaxBuffer)
+			}
+			break
+		}
+	}
+
+	c.cancel()
+	clientWS.Close()
+	c.wg.Wait()
+}
+
+// TestCredits_Reverse_RetryEnqueueAtZero verifies enqueueData retries
+// when the queue is full and credits=0 (doesn't kill the connection).
+func TestCredits_Reverse_RetryEnqueueAtZero(t *testing.T) {
+	c := newTestClient(t)
+
+	id := uuid.New()
+	cc, queue := makeTestConn(c, id)
+
+	for i := 0; i < cap(queue); i++ {
+		queue <- outboundMessage{payload: []byte("filler")}
+	}
+
+	cc.availableCredits.Store(0)
+
+	header := make([]byte, 1+protocol.ClientIDLength)
+	header[0] = protocol.ControlByteData
+	copy(header[1:], id[:])
+	msg := outboundMessage{
+		messageType: websocket.BinaryMessage,
+		payload:     append(header, []byte("blocked")...),
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- c.enqueueData(msg)
+	}()
+
+	select {
+	case err := <-result:
+		t.Fatalf("enqueueData returned immediately: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	cc.availableCredits.Store(10)
+	<-queue
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("enqueueData failed after replenishment: %v", err)
+		}
+	case <-time.After(enqueueTimeout + time.Second):
+		t.Fatal("enqueueData did not complete after replenishment")
 	}
 }

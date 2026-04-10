@@ -377,12 +377,19 @@ type clientConn struct {
 	pongTimer   *time.Timer // Timer for pong timeout, can be cancelled
 	pongTimerMu sync.Mutex  // Protects pongTimer access
 
-	// Server-initiated backpressure (reverse direction: Nexus → client).
-	// When Nexus's per-client write buffer fills, it sends EventPauseStream.
-	// The client suppresses writePump signaling so no new data enters the
-	// WebSocket pipeline, and enqueueData tolerates the full queue.
-	serverPaused   atomic.Bool   // true when Nexus told us to pause
-	serverPauseGen atomic.Uint64 // generation counter — invalidates stale auto-resume timers
+	// Credit-based flow control (reverse direction: client → Nexus).
+	// Nexus grants initial credits in EventConnect. The client decrements
+	// before each WebSocket write and self-limits at zero.
+	availableCredits atomic.Int64
+
+	// Credit-based flow control (forward direction: Nexus → client).
+	// Tracks consumed messages since last replenishment sent to Nexus.
+	forwardConsumed atomic.Int32
+
+	// Watchdog guard: prevents unbounded 10s probe cycles when credits
+	// are exhausted. Only one watchdog timer per connection. Cleared
+	// when a real replenishment (EventResumeStream with Credits > 0) arrives.
+	watchdogPending atomic.Bool
 }
 
 // Atomic state transitions with validation
@@ -1156,10 +1163,22 @@ func (c *Client) handleControlMessage(payload []byte) {
 		}
 		pendingClient.state.Store(uint32(ConnStatePending))
 		pendingClient.lastActivity.Store(time.Now().Unix())
+
+		// Initialize reverse credits (client → Nexus direction).
+		if msg.Credits > 0 {
+			pendingClient.availableCredits.Store(msg.Credits)
+		} else {
+			pendingClient.availableCredits.Store(math.MaxInt64) // old server, unlimited
+		}
+
 		c.localConns.Store(msg.ClientID, pendingClient)
 
 		// Create the per-connection queue upfront to avoid memory leaks from late-arriving data
 		c.getOrCreateQueue(msg.ClientID)
+
+		// Send forward credits (Nexus → client direction) so Nexus can
+		// self-limit before our writeCh overflows.
+		c.enqueueControl(creditMessage(msg.ClientID, int64(c.config.FlowControl.MaxBuffer)))
 
 		// Update stats
 		c.stats.pendingConns.Add(1)
@@ -1199,6 +1218,14 @@ func (c *Client) handleControlMessage(payload []byte) {
 			ch := val.(chan error)
 			if msg.Success {
 				ch <- nil
+				// Store initial reverse credits for outbound connections.
+				if conn, ok := c.localConns.Load(msg.ClientID); ok {
+					if msg.Credits > 0 {
+						conn.(*clientConn).availableCredits.Store(msg.Credits)
+					} else {
+						conn.(*clientConn).availableCredits.Store(math.MaxInt64) // old server
+					}
+				}
 			} else {
 				reason := msg.Reason
 				if reason == "" {
@@ -1208,28 +1235,13 @@ func (c *Client) handleControlMessage(payload []byte) {
 			}
 		}
 
-	case protocol.EventPauseStream:
-		if val, ok := c.localConns.Load(msg.ClientID); ok {
-			conn := val.(*clientConn)
-			if conn.serverPaused.CompareAndSwap(false, true) {
-				log.Printf("DEBUG: [%s] Server paused client %s (reason: %s)", c.config.Name, msg.ClientID, msg.Reason)
-				// Safety net: auto-resume after 30s in case the resume message is lost.
-				gen := conn.serverPauseGen.Add(1)
-				time.AfterFunc(30*time.Second, func() {
-					if conn.serverPauseGen.Load() == gen && conn.serverPaused.CompareAndSwap(true, false) {
-						log.Printf("WARN: [%s] Auto-resuming client %s after 30s (lost resume?)", c.config.Name, conn.id)
-						c.reSignalDataReady(conn)
-					}
-				})
-			}
-		}
-
 	case protocol.EventResumeStream:
+		// Credit replenishment from Nexus (reverse direction).
 		if val, ok := c.localConns.Load(msg.ClientID); ok {
 			conn := val.(*clientConn)
-			conn.serverPauseGen.Add(1) // invalidate pending auto-resume timer
-			if conn.serverPaused.CompareAndSwap(true, false) {
-				log.Printf("DEBUG: [%s] Server resumed client %s", c.config.Name, msg.ClientID)
+			if msg.Credits > 0 {
+				conn.availableCredits.Add(msg.Credits)
+				conn.watchdogPending.Store(false) // real replenishment arrived, allow future watchdog
 				c.reSignalDataReady(conn)
 			}
 		}
@@ -1572,7 +1584,7 @@ func (c *Client) writeToLocal(client *clientConn) {
 				return
 			}
 
-			// TCP Flow Control: Update level and check for resume
+			// TCP Flow Control: Update level and check for resume (watermark safety net)
 			if !client.isUDP {
 				newLevel := int(client.flow.level.Add(-1))
 				if client.flow.paused.Load() && newLevel <= client.flow.lowWaterMark {
@@ -1585,6 +1597,14 @@ func (c *Client) writeToLocal(client *clientConn) {
 						Hostname: client.hostname,
 					})
 				}
+			}
+
+			// Forward credit replenishment (both TCP and UDP): tell Nexus
+			// it can send more data for this connection.
+			consumed := client.forwardConsumed.Add(1)
+			if int64(consumed) >= protocol.CreditReplenishBatch {
+				actual := client.forwardConsumed.Swap(0)
+				c.enqueueControl(creditMessage(client.id, int64(actual)))
 			}
 
 			// Optimized Drain Check: If draining and no more data, exit immediately
@@ -1791,9 +1811,9 @@ func (c *Client) enqueueData(message outboundMessage) error {
 			// per connection, preventing busy connections from flooding the channel.
 			if conn, ok := c.localConns.Load(clientID); ok {
 				if cConn, ok := conn.(*clientConn); ok {
-					// Layer 1: suppress writePump signaling when server-paused.
-					// Data stays in the queue until the server resumes.
-					if cConn.serverPaused.Load() {
+					// Suppress writePump signaling when out of credits.
+					// Data stays in the queue until credits are replenished.
+					if cConn.availableCredits.Load() <= 0 {
 						return nil
 					}
 					if cConn.signaled.CompareAndSwap(false, true) {
@@ -1812,7 +1832,7 @@ func (c *Client) enqueueData(message outboundMessage) error {
 			}
 			return nil
 		case <-timer.C:
-			// Layer 3: if server-paused, the queue is intentionally not draining.
+			// If out of credits, the queue is intentionally not draining.
 			// Loop back and wait rather than killing the connection.
 			if conn, ok := c.localConns.Load(clientID); ok {
 				if cConn, ok := conn.(*clientConn); ok {
@@ -1821,7 +1841,7 @@ func (c *Client) enqueueData(message outboundMessage) error {
 					select {
 					case <-cConn.quit:
 					default:
-						if cConn.serverPaused.Load() {
+						if cConn.availableCredits.Load() <= 0 {
 							timer.Reset(enqueueTimeout)
 							continue
 						}
@@ -2023,18 +2043,33 @@ func (c *Client) drainConnectionQueue(ws *websocket.Conn, clientID uuid.UUID, ma
 		return
 	}
 
-	// Skip drain when server has paused this client — data stays in the
-	// queue, which fills and applies TCP backpressure to the local service.
+	// Skip drain when out of credits — data stays in the queue, which
+	// fills and applies TCP backpressure to the local service.
 	// Exception: if the connection is closing (quit closed), fall through
 	// to the normal drain path so closeOnDrained fires and transitionToClosed
 	// doesn't stall on the drain timeout.
 	if conn, ok := c.localConns.Load(clientID); ok {
-		if cConn, ok := conn.(*clientConn); ok && cConn.serverPaused.Load() {
+		if cConn, ok := conn.(*clientConn); ok && cConn.availableCredits.Load() <= 0 {
 			select {
 			case <-cConn.quit:
 				// Connection closing — fall through to normal drain/cleanup
 			default:
-				cConn.signaled.Store(false) // allow re-signal on resume
+				cConn.signaled.Store(false) // allow re-signal on replenishment
+				// Watchdog: if no replenishment in 10s (dropped by
+				// SendControlMessage), self-grant 1 credit to probe.
+				// Guard: only one watchdog per connection to prevent
+				// infinite 10s probe cycles.
+				if cConn.watchdogPending.CompareAndSwap(false, true) {
+					time.AfterFunc(10*time.Second, func() {
+						if cConn.availableCredits.Load() <= 0 {
+							log.Printf("WARN: [%s] No credit replenishment for %s in 10s, probing", c.config.Name, cConn.id)
+							cConn.availableCredits.Add(1)
+							c.reSignalDataReady(cConn)
+						}
+						// Don't clear watchdogPending here — only a real
+						// replenishment (EventResumeStream) clears it.
+					})
+				}
 				return
 			}
 		}
@@ -2048,6 +2083,10 @@ func (c *Client) drainConnectionQueue(ws *websocket.Conn, clientID uuid.UUID, ma
 			ws.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.writeMessage(ws, msg); err != nil {
 				return // Write error will be caught by main loop ping or next write
+			}
+			// Consume one reverse credit per WebSocket write.
+			if conn, ok := c.localConns.Load(clientID); ok {
+				conn.(*clientConn).availableCredits.Add(-1)
 			}
 			drained++
 		default:
@@ -2133,6 +2172,22 @@ func resumeStreamMessage(clientID uuid.UUID) outboundMessage {
 	msg := protocol.ControlMessage{
 		Event:    protocol.EventResumeStream,
 		ClientID: clientID,
+	}
+	payload, _ := json.Marshal(msg)
+	return outboundMessage{
+		messageType: websocket.BinaryMessage,
+		payload:     append([]byte{protocol.ControlByteControl}, payload...),
+	}
+}
+
+// creditMessage creates a credit replenishment message (EventResumeStream
+// with Credits). Used for both initial forward credit grant and periodic
+// replenishment from writeToLocal.
+func creditMessage(clientID uuid.UUID, credits int64) outboundMessage {
+	msg := protocol.ControlMessage{
+		Event:    protocol.EventResumeStream,
+		ClientID: clientID,
+		Credits:  credits,
 	}
 	payload, _ := json.Marshal(msg)
 	return outboundMessage{

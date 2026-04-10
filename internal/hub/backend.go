@@ -87,6 +87,11 @@ type Backend struct {
 	// Bandwidth management
 	bandwidthState     *bandwidth.BackendBandwidth
 	bandwidthScheduler *bandwidth.Scheduler
+
+	// Forward credit-based flow control (end-user → backend direction).
+	// Each entry is a chan struct{} used as a counting semaphore.
+	// Nil entry = old client, unlimited.
+	forwardCredits sync.Map // uuid.UUID → chan struct{}
 }
 
 // NewBackend creates a new Backend instance.
@@ -147,7 +152,11 @@ func (b *Backend) Close() {
 			}
 			return true
 		})
-		// Drain outbound tracking state.
+		// Drain outbound and credit tracking state.
+		b.forwardCredits.Range(func(key, _ interface{}) bool {
+			b.forwardCredits.Delete(key)
+			return true
+		})
 		b.outboundIDs.Range(func(key, _ interface{}) bool {
 			b.outboundIDs.Delete(key)
 			return true
@@ -204,20 +213,21 @@ func (b *Backend) AddClient(clientConn net.Conn, clientID uuid.UUID, hostname st
 		Transport: transport,
 		Hostname:  hostname,
 		IsTLS:     isTLS,
+		Credits:   protocol.DefaultCreditCapacity,
 	}
 
 	if err := b.SendControlMessage(msg); err != nil {
 		return fmt.Errorf("failed to send connect message for client %s: %w", clientID, err)
 	}
 	b.clients.Store(clientID, newBufferedConn(clientConn, b.config.IdleTimeout(),
-		b.streamControlCallback(protocol.EventPauseStream, clientID),
-		b.streamControlCallback(protocol.EventResumeStream, clientID)))
+		b.replenishCallbackFor(clientID)))
 	return nil
 }
 
 func (b *Backend) RemoveClient(clientID uuid.UUID) {
 	if val, ok := b.clients.LoadAndDelete(clientID); ok {
 		b.releaseOutboundSlot(clientID)
+		b.forwardCredits.Delete(clientID)
 		// Stop the bufferedConn's drain goroutine (Client.Start has already exited).
 		if conn, ok := val.(net.Conn); ok {
 			_ = conn.Close()
@@ -231,24 +241,45 @@ func (b *Backend) RemoveClient(clientID uuid.UUID) {
 	}
 }
 
-// streamControlCallback returns a non-blocking callback that sends a
-// pause or resume control message to the backend for the given client.
-// Used by bufferedConn's watermark logic. If the outgoing channel is full,
-// the message is silently dropped: for pause, the buffer eventually
-// overflows (pre-backpressure behavior); for resume, the client's 30-second
-// auto-resume timer fires as a safety net.
-func (b *Backend) streamControlCallback(event protocol.EventType, clientID uuid.UUID) func() {
-	return func() {
+// replenishCallbackFor returns a non-blocking callback that sends credit
+// replenishment (EventResumeStream with Credits) to the backend for the
+// given client. Called by bufferedConn's drain goroutine after every
+// CreditReplenishBatch successful TCP writes.
+func (b *Backend) replenishCallbackFor(clientID uuid.UUID) func(int64) {
+	return func(credits int64) {
 		msg := protocol.ControlMessage{
-			Event:    event,
+			Event:    protocol.EventResumeStream,
 			ClientID: clientID,
-		}
-		if event == protocol.EventPauseStream {
-			msg.Reason = "server_buffer_full"
+			Credits:  credits,
 		}
 		if err := b.SendControlMessage(msg); err != nil {
-			log.Printf("WARN: Failed to send %s for client %s on backend %s: %v", event, clientID, b.id, err)
+			log.Printf("WARN: Failed to send credit replenishment for client %s on backend %s: %v", clientID, b.id, err)
 		}
+	}
+}
+
+// acquireForwardCredit blocks until a forward credit is available for the
+// given client. Returns immediately if no credit tracking exists for this
+// client (old client, unlimited). Uses IdleTimeout as an escape valve to
+// prevent goroutine leaks when the end-user disconnects while blocked.
+func (b *Backend) acquireForwardCredit(clientID uuid.UUID) error {
+	raw, ok := b.forwardCredits.Load(clientID)
+	if !ok {
+		return nil // unlimited (old client or not yet registered)
+	}
+	timeout := b.config.IdleTimeout()
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-raw.(chan struct{}):
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("forward credit timeout for client %s", clientID)
+	case <-b.quit:
+		return fmt.Errorf("backend %s is closing", b.id)
 	}
 }
 
@@ -269,8 +300,7 @@ func (b *Backend) AddOutboundClient(conn net.Conn, clientID uuid.UUID) error {
 	}
 	wrapped := proxy.NewPausableConn(conn)
 	buffered := newBufferedConn(wrapped, b.config.OutboundIdleTimeout(),
-		b.streamControlCallback(protocol.EventPauseStream, clientID),
-		b.streamControlCallback(protocol.EventResumeStream, clientID))
+		b.replenishCallbackFor(clientID))
 	if _, loaded := b.clients.LoadOrStore(clientID, buffered); loaded {
 		buffered.Close()
 		return fmt.Errorf("client ID %s already exists", clientID)
@@ -290,6 +320,13 @@ func (b *Backend) SendData(clientID uuid.UUID, data []byte) error {
 	message := append(header, data...)
 
 	messageSize := len(message)
+
+	// Forward credit check — blocks until the backend client has buffer
+	// room. This is a per-client goroutine (Client.Start), so blocking
+	// here doesn't affect readPump or other clients.
+	if err := b.acquireForwardCredit(clientID); err != nil {
+		return err
+	}
 
 	// Bandwidth check with retry loop (if scheduler enabled)
 	if b.bandwidthScheduler != nil {
@@ -516,7 +553,7 @@ func (b *Backend) handleControlMessage(msg protocol.ControlMessage) {
 	case protocol.EventPauseStream:
 		b.handlePauseStream(msg.ClientID)
 	case protocol.EventResumeStream:
-		b.handleResumeStream(msg.ClientID)
+		b.handleResumeStream(msg.ClientID, msg.Credits)
 	default:
 		log.Printf("WARN: Unknown control event '%s' from backend %s", msg.Event, b.id)
 	}
@@ -541,7 +578,8 @@ func (b *Backend) handlePauseStream(clientID uuid.UUID) {
 	}
 }
 
-func (b *Backend) handleResumeStream(clientID uuid.UUID) {
+func (b *Backend) handleResumeStream(clientID uuid.UUID, credits int64) {
+	// PausableConn resume (backward compat for forward direction watermarks)
 	rawConn, ok := b.clients.Load(clientID)
 	if !ok {
 		log.Printf("WARN: resume_stream for unknown client %s on backend %s (ignored)", clientID, b.id)
@@ -549,7 +587,39 @@ func (b *Backend) handleResumeStream(clientID uuid.UUID) {
 	}
 	if pausable, ok := rawConn.(interface{ Resume() }); ok {
 		pausable.Resume()
-		log.Printf("DEBUG: Resumed stream for client %s on backend %s", clientID, b.id)
+	}
+
+	// Forward credit replenishment
+	if credits > 0 {
+		// Use the larger of credits and DefaultCreditCapacity as semaphore
+		// capacity so both initial grants and replenishments fit.
+		capacity := protocol.DefaultCreditCapacity
+		if credits > capacity {
+			capacity = credits
+		}
+		sem := make(chan struct{}, capacity)
+		raw, loaded := b.forwardCredits.LoadOrStore(clientID, sem)
+		if !loaded {
+			// First credit grant — fill with non-blocking sends to avoid
+			// wedging the readPump if credits > capacity somehow.
+			for i := int64(0); i < credits; i++ {
+				select {
+				case sem <- struct{}{}:
+				default:
+				}
+			}
+			log.Printf("DEBUG: Registered %d forward credits for client %s on backend %s", credits, clientID, b.id)
+			return
+		}
+		// Existing semaphore — replenish.
+		existing := raw.(chan struct{})
+		for i := int64(0); i < credits; i++ {
+			select {
+			case existing <- struct{}{}:
+			default:
+				// At capacity — ignore excess credits.
+			}
+		}
 	}
 }
 
@@ -665,6 +735,7 @@ func (b *Backend) handleOutboundConnect(msg protocol.ControlMessage) {
 			Event:    protocol.EventOutboundResult,
 			ClientID: msg.ClientID,
 			Success:  true,
+			Credits:  protocol.DefaultCreditCapacity,
 		}
 		if err := b.SendControlMessage(result); err != nil {
 			log.Printf("WARN: Failed to send outbound success result for %s, cleaning up: %v", msg.ClientID, err)

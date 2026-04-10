@@ -5,34 +5,15 @@ import (
 	"log"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/AtDexters-Lab/nexus-proxy/protocol"
 )
 
-const (
-	// clientWriteBufferSize is the number of write messages buffered per client.
-	// With backpressure, the buffer only fills transiently during pause
-	// propagation — the burst is bounded by the client's writePump drain
-	// rate (~4 msg/turn × RTT). 128 entries with highWater at 48 gives
-	// 80 slots of headroom, absorbing ~500ms of drain at full rate.
-	clientWriteBufferSize = 128
-
-	// Watermarks for reverse backpressure (Nexus → backend).
-	// When the buffer level crosses highWater, onPause is called to tell the
-	// backend to stop sending for this client. When it drains to lowWater,
-	// onResume is called. The gap (80 entries) absorbs in-flight data
-	// during the pause propagation round-trip (~40 messages at 100ms RTT).
-	writeBufferHighWater = 48
-	writeBufferLowWater  = 16
-
-	// pauseResumeCooldown is the minimum time between a pause and the
-	// subsequent resume. Without this, the drain goroutine writes to the
-	// kernel TCP buffer (fast), drops the level to lowWater, and fires
-	// resume before the pause signal has even reached the client. The
-	// client receives pause+resume almost simultaneously, barely pauses,
-	// and in-flight data overflows the headroom.
-	pauseResumeCooldown = 500 * time.Millisecond
-)
+// clientWriteBufferSize is the number of write messages buffered per client.
+// Equals DefaultCreditCapacity — the sender cannot enqueue more than the
+// credits it was granted.
+const clientWriteBufferSize = int(protocol.DefaultCreditCapacity)
 
 // bufferedConn wraps a net.Conn with an asynchronous write buffer.
 //
@@ -42,10 +23,9 @@ const (
 // same backend create a data flow loop (e.g. the self-loop topology where
 // one client carries tunnel ACKs needed to unblock another client's TCP write).
 //
-// Flow control: when the buffer level crosses writeBufferHighWater, the
-// onPause callback signals the backend to stop sending data for this client.
-// When it drains to writeBufferLowWater, onResume signals the backend to
-// resume. This mirrors the existing client→Nexus flow control in reverse.
+// Flow control: the drain goroutine calls onReplenish after every
+// CreditReplenishBatch successful TCP writes, allowing the sender to
+// replenish the receiver's credits and resume sending.
 type bufferedConn struct {
 	net.Conn
 	writeCh      chan []byte
@@ -53,29 +33,22 @@ type bufferedConn struct {
 	done         chan struct{} // closed when drain goroutine exits
 	closeOnce    sync.Once
 	writeTimeout time.Duration
-
-	// Flow control — callbacks must be non-blocking (they run inside
-	// Write and drain, which are on the readPump and drain goroutines).
-	level    atomic.Int64  // current buffer occupancy
-	paused   atomic.Bool   // true if onPause was called and onResume hasn't
-	pausedAt atomic.Int64  // UnixNano timestamp of last pause (for cooldown)
-	onPause  func()        // called when level >= writeBufferHighWater
-	onResume func()        // called when level <= writeBufferLowWater
+	onReplenish  func(int64) // called every CreditReplenishBatch drains; must be non-blocking
 }
 
 // newBufferedConn wraps conn with an asynchronous write buffer.
 // writeTimeout is the deadline applied to each individual TCP write;
-// pass 0 to skip write deadlines. onPause/onResume are optional callbacks
-// for reverse backpressure; pass nil to disable.
-func newBufferedConn(conn net.Conn, writeTimeout time.Duration, onPause, onResume func()) *bufferedConn {
+// pass 0 to skip write deadlines. onReplenish is called from the drain
+// goroutine after every CreditReplenishBatch successful writes; pass nil
+// to disable credit replenishment.
+func newBufferedConn(conn net.Conn, writeTimeout time.Duration, onReplenish func(int64)) *bufferedConn {
 	bc := &bufferedConn{
 		Conn:         conn,
 		writeCh:      make(chan []byte, clientWriteBufferSize),
 		quit:         make(chan struct{}),
 		done:         make(chan struct{}),
 		writeTimeout: writeTimeout,
-		onPause:      onPause,
-		onResume:     onResume,
+		onReplenish:  onReplenish,
 	}
 	go bc.drain()
 	return bc
@@ -98,30 +71,14 @@ func (bc *bufferedConn) Write(data []byte) (int, error) {
 	default:
 	}
 
-	// Increment level BEFORE enqueuing so drain's decrement never causes
-	// level to go negative (drain can dequeue between our send and Add).
-	lvl := bc.level.Add(1)
-
 	// Non-blocking enqueue. readPump must never block here — any blocking
 	// recreates the self-loop deadlock for the duration of the block.
 	select {
 	case bc.writeCh <- buf:
-		// Check high watermark — signal backend to pause sending for this client.
-		if bc.onPause != nil && lvl >= writeBufferHighWater {
-			if bc.paused.CompareAndSwap(false, true) {
-				bc.pausedAt.Store(time.Now().UnixNano())
-				bc.onPause()
-				// Schedule a resume check after the cooldown, in case the
-				// drain goroutine has no more data to trigger a check.
-				time.AfterFunc(pauseResumeCooldown, bc.tryResume)
-			}
-		}
 		return len(data), nil
 	case <-bc.quit:
-		bc.level.Add(-1)
 		return 0, net.ErrClosed
 	default:
-		bc.level.Add(-1)
 		return 0, fmt.Errorf("client write buffer full (%d pending)", clientWriteBufferSize)
 	}
 }
@@ -131,11 +88,11 @@ func (bc *bufferedConn) Write(data []byte) (int, error) {
 // On quit signal, flushes any remaining buffered data before exiting.
 func (bc *bufferedConn) drain() {
 	defer close(bc.done)
+	var consumed int64
 	for {
 		select {
 		case <-bc.quit:
 			bc.flushRemaining()
-			bc.resumeIfPaused()
 			return
 		case data := <-bc.writeCh:
 			if bc.writeTimeout > 0 {
@@ -143,7 +100,6 @@ func (bc *bufferedConn) drain() {
 			}
 			if _, err := bc.Conn.Write(data); err != nil {
 				log.Printf("WARN: bufferedConn drain write failed: %v", err)
-				bc.resumeIfPaused()
 				// Signal quit so Write() returns immediately instead of
 				// enqueuing data that will never be drained. Close the
 				// underlying conn so the read side (Client.Start) gets an
@@ -152,45 +108,18 @@ func (bc *bufferedConn) drain() {
 				_ = bc.Conn.Close()
 				return
 			}
-			lvl := bc.level.Add(-1)
-			if bc.onResume != nil && lvl <= writeBufferLowWater {
-				bc.tryResume()
+			consumed++
+			if bc.onReplenish != nil && consumed >= protocol.CreditReplenishBatch {
+				bc.onReplenish(consumed)
+				consumed = 0
 			}
 		}
 	}
 }
 
-// tryResume sends a resume signal if the backend was paused AND the
-// cooldown has elapsed. The cooldown prevents premature resume: without
-// it, the drain goroutine writes to the kernel TCP buffer (fast), drops
-// the level, and fires resume before the pause signal has reached the
-// client. Also called by a timer scheduled when pause fires, to handle
-// the case where the drain goroutine is idle after the cooldown.
-func (bc *bufferedConn) tryResume() {
-	if !bc.paused.Load() {
-		return
-	}
-	if time.Since(time.Unix(0, bc.pausedAt.Load())) < pauseResumeCooldown {
-		return
-	}
-	if bc.level.Load() <= writeBufferLowWater {
-		if bc.paused.CompareAndSwap(true, false) {
-			bc.onResume()
-		}
-	}
-}
-
-// resumeIfPaused sends a resume signal unconditionally (no cooldown).
-// Used on drain exit paths (error, quit) where the connection is being
-// torn down and we must not leave the backend permanently paused.
-func (bc *bufferedConn) resumeIfPaused() {
-	if bc.onResume != nil && bc.paused.CompareAndSwap(true, false) {
-		bc.onResume()
-	}
-}
-
 // flushRemaining best-effort drains any data still in writeCh.
-// Stops on the first write error or empty channel.
+// Stops on the first write error or empty channel. Does not count
+// toward replenishment (connection is being torn down).
 func (bc *bufferedConn) flushRemaining() {
 	for {
 		select {
@@ -201,7 +130,6 @@ func (bc *bufferedConn) flushRemaining() {
 			if _, err := bc.Conn.Write(data); err != nil {
 				return
 			}
-			bc.level.Add(-1)
 		default:
 			return
 		}

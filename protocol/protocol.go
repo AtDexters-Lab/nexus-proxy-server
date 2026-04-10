@@ -88,7 +88,24 @@ type ControlMessage struct {
 	// Success indicates whether the outbound connection was established
 	// (used with EventOutboundResult).
 	Success bool `json:"success,omitempty"`
+	// Credits carries flow control credits for per-client backpressure.
+	// Sent with EventConnect/EventOutboundResult to grant initial credits,
+	// and with EventResumeStream to replenish. Credits=0 (or absent via
+	// omitempty) means the sender does not support credit-based flow control.
+	Credits int64 `json:"credits,omitempty"`
 }
+
+const (
+	// DefaultCreditCapacity is the initial credit grant per client connection.
+	// Equals the receiver's buffer capacity — the sender cannot exceed this
+	// without receiving replenishment.
+	DefaultCreditCapacity int64 = 64
+
+	// CreditReplenishBatch is the number of consumed messages before the
+	// receiver sends a credit replenishment. Smaller batches reduce stall
+	// time but increase control message overhead.
+	CreditReplenishBatch int64 = 8
+)
 
 // ChallengeType identifies a WebSocket text-frame challenge during authentication.
 type ChallengeType string
