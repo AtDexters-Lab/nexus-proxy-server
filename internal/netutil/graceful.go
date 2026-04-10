@@ -10,15 +10,28 @@ import (
 // The abort channel can be used to skip the grace period; if nil or never
 // closed, the full grace period is used. Falls back to immediate close for
 // non-TCP connections.
+//
+// If conn implements StopWrites(), it is called first so that any buffered
+// write path (e.g. bufferedConn) can flush remaining data before the TCP
+// FIN is sent. This prevents data loss when EventDisconnect arrives shortly
+// after a data message.
 func GracefulCloseConn(conn net.Conn, abort <-chan struct{}, gracePeriod time.Duration) {
 	inner := conn
-	if u, ok := conn.(interface{ Unwrap() net.Conn }); ok {
+	for {
+		u, ok := inner.(interface{ Unwrap() net.Conn })
+		if !ok {
+			break
+		}
 		inner = u.Unwrap()
 	}
 
 	if tc, ok := inner.(*net.TCPConn); ok {
-		_ = tc.CloseWrite()
 		go func() {
+			// Let any buffered write layer flush before TCP half-close.
+			if sw, ok := conn.(interface{ StopWrites() }); ok {
+				sw.StopWrites()
+			}
+			_ = tc.CloseWrite()
 			if abort != nil {
 				select {
 				case <-time.After(gracePeriod):

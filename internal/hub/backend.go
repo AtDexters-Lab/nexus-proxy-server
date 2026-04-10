@@ -209,13 +209,17 @@ func (b *Backend) AddClient(clientConn net.Conn, clientID uuid.UUID, hostname st
 	if err := b.SendControlMessage(msg); err != nil {
 		return fmt.Errorf("failed to send connect message for client %s: %w", clientID, err)
 	}
-	b.clients.Store(clientID, clientConn)
+	b.clients.Store(clientID, newBufferedConn(clientConn, b.config.IdleTimeout()))
 	return nil
 }
 
 func (b *Backend) RemoveClient(clientID uuid.UUID) {
-	if _, ok := b.clients.LoadAndDelete(clientID); ok {
+	if val, ok := b.clients.LoadAndDelete(clientID); ok {
 		b.releaseOutboundSlot(clientID)
+		// Stop the bufferedConn's drain goroutine (Client.Start has already exited).
+		if conn, ok := val.(net.Conn); ok {
+			_ = conn.Close()
+		}
 		msg := protocol.ControlMessage{Event: protocol.EventDisconnect, ClientID: clientID}
 		if err := b.SendControlMessage(msg); err != nil {
 			log.Printf("ERROR: Failed to send disconnect message for client %s: %v", clientID, err)
@@ -241,8 +245,9 @@ func (b *Backend) AddOutboundClient(conn net.Conn, clientID uuid.UUID) error {
 		return fmt.Errorf("backend %s is closing", b.id)
 	}
 	wrapped := proxy.NewPausableConn(conn)
-	if _, loaded := b.clients.LoadOrStore(clientID, wrapped); loaded {
-		_ = conn.Close()
+	buffered := newBufferedConn(wrapped, b.config.OutboundIdleTimeout())
+	if _, loaded := b.clients.LoadOrStore(clientID, buffered); loaded {
+		buffered.Close()
 		return fmt.Errorf("client ID %s already exists", clientID)
 	}
 	b.outboundIDs.Store(clientID, struct{}{})
@@ -426,27 +431,15 @@ func (b *Backend) handleBinaryMessage(message []byte) {
 		}
 
 		if clientConn, ok := rawConn.(net.Conn); ok {
-			// Use outbound idle timeout for outbound connections,
-			// inbound idle timeout for regular client connections.
-			// Short-circuit the map lookup when outbound is not enabled.
-			var writeTimeout time.Duration
-			if b.outboundAllowed {
-				if _, isOutbound := b.outboundIDs.Load(clientID); isOutbound {
-					writeTimeout = b.config.OutboundIdleTimeout()
-				} else {
-					writeTimeout = b.config.IdleTimeout()
-				}
-			} else {
-				writeTimeout = b.config.IdleTimeout()
-			}
-			if writeTimeout > 0 {
-				_ = clientConn.SetWriteDeadline(time.Now().Add(writeTimeout))
-			}
+			// Write is non-blocking: bufferedConn enqueues data for
+			// async delivery, preventing readPump from stalling on
+			// slow clients (which would starve other clients sharing
+			// this backend's WebSocket — the self-loop deadlock).
 			if _, err := clientConn.Write(data); err != nil {
 				log.Printf("WARN: Failed to write to client %s: %v. Closing.", clientID, err)
 				_ = clientConn.Close()
 			} else {
-				// Record successful send
+				// Record successful enqueue for bandwidth accounting.
 				if b.bandwidthScheduler != nil {
 					b.bandwidthScheduler.RecordSent(b.id, len(payload)+1)
 				}
