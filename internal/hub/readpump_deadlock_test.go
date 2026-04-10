@@ -186,6 +186,175 @@ func TestReadPumpDeadlock_SelfLoop(t *testing.T) {
 	}
 }
 
+// TestReadPumpBackpressure_LargePayload verifies that a large response
+// (>64 messages) to a slow client does NOT cause the client to be
+// disconnected. With proper backpressure, the proxy should signal the
+// backend to pause (EventPauseStream) rather than overflowing the buffer.
+//
+// The test simulates the client-side behavior: a writer goroutine sends
+// messages until EventPauseStream is received on the WebSocket, then stops.
+// This mirrors what the real client library does.
+func TestReadPumpBackpressure_LargePayload(t *testing.T) {
+	t.Parallel()
+
+	serverConnCh := make(chan *websocket.Conn, 1)
+	upgrader := websocket.Upgrader{}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		require.NoError(t, err)
+		serverConnCh <- conn
+	}))
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http")
+	clientWS, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer clientWS.Close()
+
+	backendWS := <-serverConnCh
+
+	cfg := &config.Config{
+		BackendsJWTSecret:  "secret",
+		IdleTimeoutSeconds: 10,
+	}
+	meta := &hub.AttestationMetadata{Hostnames: []string{"example.com"}, Weight: 1}
+	b := hub.NewBackend(backendWS, meta, cfg, stubValidator{}, &http.Client{})
+
+	var pumpWg sync.WaitGroup
+	pumpWg.Add(1)
+	go func() {
+		defer pumpWg.Done()
+		b.StartPumps()
+	}()
+	defer func() {
+		b.Close()
+		pumpWg.Wait()
+	}()
+
+	// Client B: "slow client" — net.Pipe is synchronous, we never read
+	// from slowRemote. The drain goroutine blocks on the first write,
+	// so the bufferedConn's channel fills up.
+	clientBID := uuid.New()
+	slowLocal, slowRemote := pipeTCPPair(443)
+	defer slowRemote.Close()
+	defer slowLocal.Close()
+
+	err = b.AddClient(slowLocal, clientBID, "example.com", false)
+	require.NoError(t, err)
+
+	// Client C: "fast client" — actively drained.
+	clientCID := uuid.New()
+	fastLocal, fastRemote := pipeTCPPair(443)
+	defer fastRemote.Close()
+	defer fastLocal.Close()
+
+	err = b.AddClient(fastLocal, clientCID, "example.com", false)
+	require.NoError(t, err)
+
+	fastReceived := make(chan []byte, 256)
+	go func() {
+		buf := make([]byte, 65536)
+		for {
+			n, err := fastRemote.Read(buf)
+			if err != nil {
+				close(fastReceived)
+				return
+			}
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			fastReceived <- data
+		}
+	}()
+
+	buildDataMsg := func(clientID uuid.UUID, payload []byte) []byte {
+		msg := make([]byte, 0, 1+protocol.ClientIDLength+len(payload))
+		msg = append(msg, protocol.ControlByteData)
+		msg = append(msg, clientID[:]...)
+		msg = append(msg, payload...)
+		return msg
+	}
+
+	// Reader goroutine: watches for EventPauseStream from Nexus.
+	// This simulates the client library receiving the pause signal.
+	pauseReceived := make(chan struct{}, 1)
+	go func() {
+		for {
+			_, msg, err := clientWS.ReadMessage()
+			if err != nil {
+				return
+			}
+			if len(msg) < 2 || msg[0] != protocol.ControlByteControl {
+				continue
+			}
+			var ctrl protocol.ControlMessage
+			if err := json.Unmarshal(msg[1:], &ctrl); err != nil {
+				continue
+			}
+			if ctrl.Event == protocol.EventPauseStream && ctrl.ClientID == clientBID {
+				select {
+				case pauseReceived <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}()
+
+	// Send 55 messages for Client B — enough to trigger the pause at
+	// high watermark (48) with headroom to spare. Total 55 < 128
+	// (buffer size), so no overflow. The drain goroutine is stuck
+	// (net.Pipe, slowRemote not reading), so all 55 stay in the channel.
+	payload := []byte("response_chunk")
+	for i := 0; i < 55; i++ {
+		err = clientWS.WriteMessage(websocket.BinaryMessage, buildDataMsg(clientBID, payload))
+		require.NoError(t, err)
+	}
+
+	// Wait for the EventPauseStream to arrive — this proves Nexus detected
+	// the buffer filling and signaled the backend to stop.
+	select {
+	case <-pauseReceived:
+		// Backpressure signal received — Nexus told us to stop.
+	case <-time.After(3 * time.Second):
+		t.Fatal("BACKPRESSURE MISSING: EventPauseStream was never received " +
+			"(expected at high watermark ~48)")
+	}
+
+	// Now send a message for Client C (the tunnel ACK). readPump must not
+	// be blocked — it should process this immediately.
+	marker := []byte("TUNNEL_ACK_DATA")
+	err = clientWS.WriteMessage(websocket.BinaryMessage, buildDataMsg(clientCID, marker))
+	require.NoError(t, err)
+
+	// Verify Client C receives its data (readPump not blocked).
+	deadline := time.After(3 * time.Second)
+	received := false
+	for !received {
+		select {
+		case data, ok := <-fastReceived:
+			if !ok {
+				t.Fatal("fast client connection closed unexpectedly")
+			}
+			if string(data) == string(marker) {
+				received = true
+			}
+		case <-deadline:
+			t.Fatal("Client C (tunnel) data was not delivered within 3s")
+		}
+	}
+
+	// Verify Client B was NOT disconnected.
+	time.Sleep(100 * time.Millisecond)
+	slowRemote.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	_, readErr := slowRemote.Read(make([]byte, 1))
+	if readErr != nil {
+		if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+			// Timeout = pipe still open = Client B alive. Good.
+		} else {
+			t.Fatalf("BACKPRESSURE MISSING: Client B was disconnected after buffer overflow: %v", readErr)
+		}
+	}
+}
+
 // TestReadPumpDeadlock_ControlMessages verifies that control messages
 // (like EventPingClient) are still processed while a client write is blocked.
 func TestReadPumpDeadlock_ControlMessages(t *testing.T) {

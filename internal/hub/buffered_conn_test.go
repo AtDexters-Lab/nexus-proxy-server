@@ -17,7 +17,7 @@ func TestBufferedConn_DrainWriteError_SignalsQuit(t *testing.T) {
 	t.Parallel()
 
 	s, c := net.Pipe()
-	bc := newBufferedConn(s, 5*time.Second)
+	bc := newBufferedConn(s, 5*time.Second, nil, nil)
 
 	// Close the remote end so the drain goroutine's Write fails.
 	c.Close()
@@ -52,7 +52,7 @@ func TestBufferedConn_FlushOnClose(t *testing.T) {
 	t.Parallel()
 
 	s, c := net.Pipe()
-	bc := newBufferedConn(s, 5*time.Second)
+	bc := newBufferedConn(s, 5*time.Second, nil, nil)
 
 	// Enqueue data that the drain goroutine hasn't written yet.
 	// net.Pipe is synchronous, so drain blocks on Write until we read.
@@ -86,6 +86,68 @@ func TestBufferedConn_FlushOnClose(t *testing.T) {
 	c.Close()
 }
 
+// TestBufferedConn_PauseResumeCallbacks verifies that the onPause callback
+// fires when the buffer level reaches the high watermark, and onResume fires
+// when it drains to the low watermark. Also verifies no duplicate signals.
+func TestBufferedConn_PauseResumeCallbacks(t *testing.T) {
+	t.Parallel()
+
+	s, c := net.Pipe()
+
+	pauseCount := make(chan struct{}, 10)
+	resumeCount := make(chan struct{}, 10)
+
+	bc := newBufferedConn(s, 5*time.Second,
+		func() { pauseCount <- struct{}{} },
+		func() { resumeCount <- struct{}{} })
+
+	// Fill to high watermark. The drain goroutine blocks on the first
+	// write (net.Pipe, nobody reading c), so all writes go to the channel.
+	for i := 0; i < writeBufferHighWater; i++ {
+		_, err := bc.Write([]byte("x"))
+		require.NoError(t, err)
+	}
+
+	// Verify onPause was called exactly once.
+	select {
+	case <-pauseCount:
+	case <-time.After(1 * time.Second):
+		t.Fatal("onPause was not called at high watermark")
+	}
+	// No duplicate pause.
+	select {
+	case <-pauseCount:
+		t.Fatal("onPause was called more than once")
+	default:
+	}
+
+	// Start draining the pipe so the drain goroutine can write.
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := c.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Wait for onResume (buffer drains to low watermark).
+	select {
+	case <-resumeCount:
+	case <-time.After(3 * time.Second):
+		t.Fatal("onResume was not called when buffer drained to low watermark")
+	}
+	// No duplicate resume.
+	select {
+	case <-resumeCount:
+		t.Fatal("onResume was called more than once")
+	default:
+	}
+
+	bc.Close()
+	c.Close()
+}
+
 // TestBufferedConn_WriteNonBlocking verifies that Write returns immediately
 // when the buffer has room (fast path, no timer allocation).
 func TestBufferedConn_WriteNonBlocking(t *testing.T) {
@@ -93,7 +155,7 @@ func TestBufferedConn_WriteNonBlocking(t *testing.T) {
 
 	s, c := net.Pipe()
 	defer c.Close()
-	bc := newBufferedConn(s, 5*time.Second)
+	bc := newBufferedConn(s, 5*time.Second, nil, nil)
 	defer bc.Close()
 
 	// Drain so writes to the pipe don't block.
