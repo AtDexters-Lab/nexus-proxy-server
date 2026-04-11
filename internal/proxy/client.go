@@ -92,31 +92,32 @@ func (c *Client) Start() {
 
 	for {
 		var readDeadline time.Time
+		var deadlineStart time.Time
 		if c.config != nil && c.config.IdleTimeout() > 0 {
-			readDeadline = time.Now().Add(c.config.IdleTimeout())
+			deadlineStart = time.Now()
+			readDeadline = deadlineStart.Add(c.config.IdleTimeout())
 		}
 		c.conn.SetReadDeadline(readDeadline)
 
 		n, err := c.conn.Read(buf)
-		// No need to explicitly clean the buffer before each read.
-		// The io.Reader (here, net.Conn) will only fill up to n bytes,
-		// and you only use buf[:n] for further processing.
-		// Any leftover bytes from previous reads in buf[n:] are ignored.
-		// So, it's safe to reuse pooled buffers without zeroing them.
 		if err != nil {
 			if err != io.EOF {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					// Check if the backend has been writing data to this
+					// client since the deadline was set (e.g. download in
+					// progress). If so, the connection is not truly idle.
+					if !deadlineStart.IsZero() && c.backend.HasRecentActivity(c.id, deadlineStart) {
+						continue // write-side active, reset deadline
+					}
 					log.Printf("INFO: Client %s idle timeout reached. Closing connection.", c.id)
 					c.conn.Close()
 				} else {
 					log.Printf("ERROR: Failed to read from client %s: %v", c.id, err)
 				}
 			}
-			// If we hit EOF or an error, we stop processing this client.
 			break
 		}
 
-		// It is important to only read upto n bytes to avoid sending leftover data from previous reads.
 		err = c.backend.SendData(c.id, buf[:n])
 		if err != nil {
 			log.Printf("ERROR: Failed to send data to backend %s for client %s: %v\nTerminating client connection", c.backend.ID(), c.id, err)

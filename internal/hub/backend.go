@@ -241,6 +241,17 @@ func (b *Backend) RemoveClient(clientID uuid.UUID) {
 	}
 }
 
+func (b *Backend) HasRecentActivity(clientID uuid.UUID, since time.Time) bool {
+	raw, ok := b.clients.Load(clientID)
+	if !ok {
+		return false
+	}
+	if bc, ok := raw.(*bufferedConn); ok {
+		return bc.HasRecentWrite(since)
+	}
+	return false
+}
+
 // replenishCallbackFor returns a non-blocking callback that sends credit
 // replenishment (EventResumeStream with Credits) to the backend for the
 // given client. Called by bufferedConn's drain goroutine after every

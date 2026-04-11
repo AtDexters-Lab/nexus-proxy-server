@@ -41,4 +41,8 @@ type Backend interface {
 	AddClient(clientConn net.Conn, clientID uuid.UUID, hostname string, isTLS bool) error
 	RemoveClient(clientID uuid.UUID)
 	SendData(clientID uuid.UUID, data []byte) error
+	// HasRecentActivity reports whether data has been written to the given
+	// client since the specified time. Used by the idle timeout logic to
+	// avoid killing connections during active downloads.
+	HasRecentActivity(clientID uuid.UUID, since time.Time) bool
 }

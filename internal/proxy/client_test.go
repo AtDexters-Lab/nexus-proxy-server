@@ -26,6 +26,8 @@ func (b *failingBackend) RemoveClient(uuid.UUID) { b.removeCalled = true }
 
 func (b *failingBackend) SendData(uuid.UUID, []byte) error { return nil }
 
+func (b *failingBackend) HasRecentActivity(uuid.UUID, time.Time) bool { return false }
+
 func TestClientStartClosesConnOnAddClientError(t *testing.T) {
 	backend := &failingBackend{}
 	clientConn, backendConn := net.Pipe()

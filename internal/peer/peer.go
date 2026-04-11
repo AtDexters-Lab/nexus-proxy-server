@@ -3,11 +3,13 @@ package peer
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"log"
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
@@ -26,6 +28,15 @@ const (
 	tcpCloseGracePeriod  = 2 * time.Second
 )
 
+// tunnelState tracks per-tunnel credit state at the origin peer.
+type tunnelState struct {
+	sendCh       chan struct{} // direction 1 credits: origin → destination
+	sendActive   atomic.Bool  // true after first PeerTunnelCredits received
+	recvConsumed atomic.Int32 // direction 2 consumption counter for replenishment
+	done         chan struct{} // closed when tunnel should exit (e.g. PeerTunnelClose received)
+	doneOnce     sync.Once
+}
+
 type peerImpl struct {
 	addr            string
 	conn            *websocket.Conn
@@ -34,6 +45,8 @@ type peerImpl struct {
 	send            chan []byte
 	activeTunnels   sync.Map
 	tunnelHostnames sync.Map // clientID (uuid.UUID) → hostname (string) for bandwidth tracking
+	tunnelStates    sync.Map // clientID (uuid.UUID) → *tunnelState (credit tracking at origin)
+	peerDone        atomic.Pointer[chan struct{}] // closed when handleConnection exits; detects peer death
 }
 
 // NewPeer creates a new Peer instance.
@@ -105,6 +118,12 @@ func (p *peerImpl) Connect(ctx context.Context) {
 
 // handleConnection starts the read/write pumps for the peer connection.
 func (p *peerImpl) handleConnection(ctx context.Context) {
+	// peerDone is closed when this connection ends, allowing StartTunnel
+	// goroutines to detect peer death and unblock credit waits.
+	done := make(chan struct{})
+	p.peerDone.Store(&done)
+	defer close(done)
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -227,6 +246,21 @@ func (p *peerImpl) readPump() {
 									bandwidthScheduler.RecordSent(backendID, len(message))
 								}
 							}
+							// Direction 2 credit replenishment: we consumed a
+							// message from the destination, send credits back
+							// so the destination can keep sending.
+							if raw, ok := p.tunnelStates.Load(clientID); ok {
+								st := raw.(*tunnelState)
+								if consumed := st.recvConsumed.Add(1); consumed >= int32(protocol.CreditReplenishBatch) {
+									actual := st.recvConsumed.Swap(0)
+									msg := makeTunnelCreditMessage(clientID, int64(actual))
+									if !p.Send(msg) {
+										// Channel full — retry async. Without this,
+										// the destination blocks on credits with no retrigger.
+										go retryCreditSend(p, msg, p.manager.Done())
+									}
+								}
+							}
 						}
 					}
 				} else {
@@ -250,6 +284,11 @@ func (p *peerImpl) readPump() {
 						log.Printf("INFO: [PEER-TUNNEL] Peer signaled close for our outbound tunnel %s. Closing client connection.", clientID)
 						clientConn.Close() // Immediate close — peer explicitly signaled tunnel end.
 						p.activeTunnels.Delete(clientID)
+						// Signal tunnelState.done to unblock StartTunnel if it's
+						// waiting on credit acquisition.
+						if raw, ok := p.tunnelStates.Load(clientID); ok {
+							raw.(*tunnelState).doneOnce.Do(func() { close(raw.(*tunnelState).done) })
+						}
 					}
 				} else {
 					// Otherwise, it may be an outbound UDP flow.
@@ -289,6 +328,38 @@ func (p *peerImpl) readPump() {
 				} else {
 					log.Printf("WARN: [PEER] resume_tunnel for unknown client %s (ignored)", clientID)
 				}
+
+			case protocol.PeerTunnelCredits:
+				if len(message) < 1+protocol.ClientIDLength+8 {
+					log.Printf("WARN: [PEER] Received tunnel credits with insufficient length from %s", p.addr)
+					continue
+				}
+				var clientID uuid.UUID
+				copy(clientID[:], message[1:1+protocol.ClientIDLength])
+				credits := int64(binary.BigEndian.Uint64(message[1+protocol.ClientIDLength:]))
+				// Cap to prevent CPU-burn DoS from a malicious peer sending
+				// a huge credit value (the loop below would spin billions of
+				// times on the readPump goroutine).
+				if credits <= 0 || credits > protocol.DefaultCreditCapacity {
+					credits = protocol.DefaultCreditCapacity
+				}
+
+				// Origin side: credits for direction 1 (we can send more to destination).
+				if raw, ok := p.tunnelStates.Load(clientID); ok {
+					st := raw.(*tunnelState)
+					if !st.sendActive.Load() {
+						st.sendActive.Store(true)
+					}
+					for i := int64(0); i < credits; i++ {
+						select {
+						case st.sendCh <- struct{}{}:
+						default:
+						}
+					}
+					continue
+				}
+				// Destination side: credits for direction 2 (TunneledConn can send more to origin).
+				p.manager.AddTunnelCredits(clientID, credits)
 
 			default:
 				log.Printf("WARN: [PEER] Received unknown binary control byte from %s", p.addr)
@@ -364,12 +435,31 @@ func (p *peerImpl) StartTunnel(conn net.Conn, hostname string, isTLS bool) {
 	payload, _ := json.Marshal(req)
 	p.Send(payload)
 
+	// Capture peer-done at entry so we can detect peer WebSocket death
+	// while blocked on credit acquisition.
+	var peerDone <-chan struct{}
+	if ptr := p.peerDone.Load(); ptr != nil {
+		peerDone = *ptr
+	}
+
 	// Wrap in PausableConn for flow control
 	pausableConn := proxy.NewPausableConn(conn)
 	p.activeTunnels.Store(clientID, pausableConn)
 	p.tunnelHostnames.Store(clientID, hostname) // Track hostname for bandwidth accounting
 	defer p.activeTunnels.Delete(clientID)
 	defer p.tunnelHostnames.Delete(clientID)
+
+	// Initialize credit state for this tunnel (origin side).
+	state := &tunnelState{
+		sendCh: make(chan struct{}, protocol.DefaultCreditCapacity),
+		done:   make(chan struct{}),
+	}
+	p.tunnelStates.Store(clientID, state)
+	defer p.tunnelStates.Delete(clientID)
+
+	// Grant initial credits for direction 2 (destination → origin) so the
+	// destination's TunneledConn.Write() can start sending response data.
+	p.Send(makeTunnelCreditMessage(clientID, protocol.DefaultCreditCapacity))
 
 	// Get bandwidth scheduler for this tunnel and register the synthetic backend
 	// Use RegisterShared for reference counting since multiple tunnels may share the same hostname
@@ -386,6 +476,22 @@ func (p *peerImpl) StartTunnel(conn net.Conn, hostname string, isTLS bool) {
 	buf := *bufPtr
 
 	for {
+		// Acquire a direction-1 credit before reading, if flow control is
+		// active. Blocking here is safe (dedicated goroutine) and applies
+		// TCP backpressure to the end-user when the destination is slow.
+		if state.sendActive.Load() {
+			select {
+			case <-state.sendCh:
+				// credit acquired
+			case <-state.done:
+				return // tunnel closed (e.g. PeerTunnelClose received)
+			case <-peerDone:
+				return // peer WebSocket connection died
+			case <-p.manager.Done():
+				return // manager shutting down
+			}
+		}
+
 		n, err := pausableConn.Read(buf)
 		if err != nil {
 			// Connection closed or error from client side.
@@ -419,6 +525,17 @@ func (p *peerImpl) StartTunnel(conn net.Conn, hostname string, isTLS bool) {
 		copy(header[1:], clientID[:])
 		message := append(header, buf[:n]...)
 		sent := p.Send(message)
+
+		if !sent {
+			// Data dropped — refund the direction-1 credit so repeated
+			// drops don't ratchet available credits down to zero.
+			if state.sendActive.Load() {
+				select {
+				case state.sendCh <- struct{}{}:
+				default:
+				}
+			}
+		}
 
 		if bandwidthScheduler != nil {
 			backendID := "tunnel:" + hostname

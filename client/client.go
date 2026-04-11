@@ -356,9 +356,10 @@ type clientConn struct {
 	lastActivity atomic.Int64 // Unix timestamp of the last activity.
 	pingSent     atomic.Bool  // True if an inactivity ping has been sent.
 	// pending      atomic.Bool  // Removed: replaced by state machine (ConnStatePending)
-	quit    chan struct{}
-	drained chan struct{} // Closed by writePump when per-connection outbound queue is fully drained after close
-	writeCh chan []byte   // Buffered channel for non-blocking writes to local conn
+	quit         chan struct{}
+	drained      chan struct{} // Closed by writePump when per-connection outbound queue is fully drained after close
+	localFlushed chan struct{} // Closed by writeToLocal after flushing writeCh on quit
+	writeCh      chan []byte   // Buffered channel for non-blocking writes to local conn
 	// Flow control
 	flow flowControl
 
@@ -413,13 +414,25 @@ func (cc *clientConn) safeClose() {
 		// Cancel pong timer first to prevent timer callback from racing with close
 		cc.cancelPongTimer()
 		close(cc.quit)
-		// Use mutex to safely read conn (may be concurrently assigned by establishLocalConnection)
-		cc.connMu.Lock()
-		conn := cc.conn
-		cc.connMu.Unlock()
-		if conn != nil {
-			conn.Close()
-		}
+		// Flush + close in a goroutine to avoid blocking the caller, which
+		// may be the WebSocket readPump processing a batch of disconnects.
+		go func() {
+			// Best-effort flush window: give writeToLocal up to 50ms to drain
+			// remaining writeCh data before we close the connection.
+			if cc.localFlushed != nil {
+				select {
+				case <-cc.localFlushed:
+				case <-time.After(50 * time.Millisecond):
+				}
+			}
+			// Use mutex to safely read conn (may be concurrently assigned by establishLocalConnection)
+			cc.connMu.Lock()
+			conn := cc.conn
+			cc.connMu.Unlock()
+			if conn != nil {
+				conn.Close()
+			}
+		}()
 	})
 }
 
@@ -1147,13 +1160,14 @@ func (c *Client) handleControlMessage(payload []byte) {
 
 		// Create pending connection immediately to buffer early data while dial is in progress
 		pendingClient := &clientConn{
-			id:       msg.ClientID,
-			conn:     nil, // Set after dial completes
-			hostname: normalizedHost,
-			session:  c.activeSession.Load(),
-			quit:     make(chan struct{}),
-			drained:  make(chan struct{}),
-			writeCh:  make(chan []byte, localConnWriteBuffer),
+			id:           msg.ClientID,
+			conn:         nil, // Set after dial completes
+			hostname:     normalizedHost,
+			session:      c.activeSession.Load(),
+			quit:         make(chan struct{}),
+			drained:      make(chan struct{}),
+			localFlushed: make(chan struct{}),
+			writeCh:      make(chan []byte, localConnWriteBuffer),
 			flow: flowControl{
 				lowWaterMark:  c.config.FlowControl.LowWaterMark,
 				highWaterMark: c.config.FlowControl.HighWaterMark,
@@ -1226,6 +1240,9 @@ func (c *Client) handleControlMessage(payload []byte) {
 						conn.(*clientConn).availableCredits.Store(math.MaxInt64) // old server
 					}
 				}
+				// Send forward credits so the hub can self-limit before
+				// our writeCh overflows (mirrors EventConnect at line 1181).
+				c.enqueueControl(creditMessage(msg.ClientID, int64(c.config.FlowControl.MaxBuffer)))
 			} else {
 				reason := msg.Reason
 				if reason == "" {
@@ -1548,9 +1565,12 @@ func (c *Client) cleanupConnectionQueue(clientID uuid.UUID) {
 func (c *Client) writeToLocal(client *clientConn) {
 	defer c.transitionToClosed(client, DisconnectNormal)
 
+	defer close(client.localFlushed)
+
 	for {
 		select {
 		case <-client.quit:
+			c.flushWriteCh(client)
 			return
 		case data := <-client.writeCh:
 			// Set write deadline based on transport type
@@ -1613,6 +1633,29 @@ func (c *Client) writeToLocal(client *clientConn) {
 					return
 				}
 			}
+		}
+	}
+}
+
+// flushWriteCh best-effort drains any remaining data in writeCh to the local
+// connection. Called by writeToLocal on quit before exiting. Stops on the
+// first write error or empty channel. Mirrors bufferedConn.flushRemaining().
+func (c *Client) flushWriteCh(client *clientConn) {
+	for {
+		select {
+		case data := <-client.writeCh:
+			writeTimeout := localWriteTimeout
+			if client.isUDP {
+				writeTimeout = 1 * time.Millisecond
+			}
+			if tc, ok := client.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+				tc.SetWriteDeadline(time.Now().Add(writeTimeout))
+			}
+			if _, err := client.conn.Write(data); err != nil {
+				return
+			}
+		default:
+			return
 		}
 	}
 }
@@ -2433,12 +2476,13 @@ func (c *Client) handleSocks5Conn(conn net.Conn) {
 
 	// Create pending clientConn to buffer any early data from the proxy.
 	pendingClient := &clientConn{
-		id:      clientID,
-		conn:    conn,
-		session: sess,
-		quit:    make(chan struct{}),
-		drained: make(chan struct{}),
-		writeCh: make(chan []byte, localConnWriteBuffer),
+		id:           clientID,
+		conn:         conn,
+		session:      sess,
+		quit:         make(chan struct{}),
+		drained:      make(chan struct{}),
+		localFlushed: make(chan struct{}),
+		writeCh:      make(chan []byte, localConnWriteBuffer),
 		flow: flowControl{
 			lowWaterMark:  c.config.FlowControl.LowWaterMark,
 			highWaterMark: c.config.FlowControl.HighWaterMark,

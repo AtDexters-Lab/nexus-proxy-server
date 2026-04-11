@@ -598,6 +598,10 @@ func (m *Manager) HandleTunnelRequest(p iface.Peer, hostname string, clientID uu
 	tunneledConn := NewTunneledConn(clientID, p, clientIP, connPort)
 	m.tunnels.Store(clientID, tunneledConn)
 
+	// Grant initial credits for direction 1 (origin → destination) so the
+	// origin's StartTunnel can start sending request data to us.
+	p.Send(makeTunnelCreditMessage(clientID, protocol.DefaultCreditCapacity))
+
 	// This looks like a regular client connection to the backend.
 	// We pass a nil config because idle timeouts for tunneled connections are
 	// managed by the originating proxy.
@@ -620,6 +624,18 @@ func (m *Manager) HandleTunnelData(clientID uuid.UUID, payload []byte) {
 			if _, err := tunnel.WriteToPipe(payload); err != nil {
 				log.Printf("WARN: Failed to write to tunnel pipe for client %s: %v", clientID, err)
 				tunnel.Close()
+			} else {
+				// Direction 1 credit replenishment: we consumed a message
+				// from the origin, send credits back so it can keep sending.
+				if consumed := tunnel.forwardConsumed.Add(1); consumed >= int32(protocol.CreditReplenishBatch) {
+					actual := tunnel.forwardConsumed.Swap(0)
+					msg := makeTunnelCreditMessage(clientID, int64(actual))
+					if !tunnel.peer.Send(msg) {
+						// Channel full — retry async. Without this, the
+						// origin blocks on credits with no retrigger.
+						go retryCreditSend(tunnel.peer, msg, m.Done())
+					}
+				}
 			}
 		case *udpInboundTunnel:
 			if max := m.config.UDPMaxDatagramBytesOrDefault(); max > 0 && len(payload) > max {
@@ -649,6 +665,16 @@ func (m *Manager) HandleTunnelClose(clientID uuid.UUID) {
 			if tunnel.conn != nil {
 				_ = tunnel.conn.Close()
 			}
+		}
+	}
+}
+
+// AddTunnelCredits grants send credits to a TunneledConn on the destination side.
+// Called from readPump when the origin peer sends PeerTunnelCredits for direction 2.
+func (m *Manager) AddTunnelCredits(clientID uuid.UUID, credits int64) {
+	if raw, ok := m.tunnels.Load(clientID); ok {
+		if tc, ok := raw.(*TunneledConn); ok {
+			tc.AddCredits(credits)
 		}
 	}
 }

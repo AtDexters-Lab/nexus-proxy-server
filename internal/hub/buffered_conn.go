@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AtDexters-Lab/nexus-proxy/protocol"
@@ -34,6 +35,7 @@ type bufferedConn struct {
 	closeOnce    sync.Once
 	writeTimeout time.Duration
 	onReplenish  func(int64) // called every CreditReplenishBatch drains; must be non-blocking
+	lastWriteAt  atomic.Int64 // UnixNano of last successful TCP write; used for bidirectional idle detection
 }
 
 // newBufferedConn wraps conn with an asynchronous write buffer.
@@ -108,6 +110,7 @@ func (bc *bufferedConn) drain() {
 				_ = bc.Conn.Close()
 				return
 			}
+			bc.lastWriteAt.Store(time.Now().UnixNano())
 			consumed++
 			if bc.onReplenish != nil && consumed >= protocol.CreditReplenishBatch {
 				bc.onReplenish(consumed)
@@ -181,4 +184,12 @@ func (bc *bufferedConn) Resume() {
 	if p, ok := bc.Conn.(interface{ Resume() }); ok {
 		p.Resume()
 	}
+}
+
+// HasRecentWrite reports whether the drain goroutine has successfully written
+// data to the underlying connection since the given time. Used by the idle
+// timeout logic to avoid killing connections during active downloads.
+func (bc *bufferedConn) HasRecentWrite(since time.Time) bool {
+	lastWrite := bc.lastWriteAt.Load()
+	return lastWrite > 0 && lastWrite > since.UnixNano()
 }

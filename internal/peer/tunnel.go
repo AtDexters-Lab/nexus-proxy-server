@@ -1,12 +1,14 @@
 package peer
 
 import (
+	"encoding/binary"
 	"errors"
 	"io"
 	"log"
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
@@ -34,6 +36,18 @@ type TunneledConn struct {
 	mu     sync.Mutex
 	paused bool
 	closed bool
+
+	// Credit-based flow control for the destination → origin direction.
+	// sendCredits is a counting semaphore: Write() acquires one credit before
+	// sending data back to the origin peer. Credits are granted by the origin
+	// via PeerTunnelCredits messages. Eagerly initialized to avoid data races.
+	closeCh     chan struct{} // closed by Close(), unblocks Write's credit wait
+	sendCredits chan struct{} // counting semaphore for outbound data
+	creditActive atomic.Bool  // true after first AddCredits; gates blocking in Write
+
+	// Tracks consumed direction-1 (origin → destination) messages for
+	// credit replenishment back to the origin.
+	forwardConsumed atomic.Int32
 }
 
 // NewTunneledConn creates a new virtual connection for a tunneled client.
@@ -47,12 +61,14 @@ func NewTunneledConn(clientID uuid.UUID, peer iface.Peer, clientIp string, connP
 	}
 	pr, pw := io.Pipe()
 	return &TunneledConn{
-		clientID:   clientID,
-		remoteAddr: addr,
-		connPort:   connPort,
-		peer:       peer,
-		pipe:       pr,
-		pipeW:      pw,
+		clientID:    clientID,
+		remoteAddr:  addr,
+		connPort:    connPort,
+		peer:        peer,
+		pipe:        pr,
+		pipeW:       pw,
+		closeCh:     make(chan struct{}),
+		sendCredits: make(chan struct{}, protocol.DefaultCreditCapacity),
 	}
 }
 
@@ -110,7 +126,27 @@ func (c *TunneledConn) WriteToPipe(b []byte) (n int, err error) {
 
 // Write writes data back to the originating peer.
 // Returns ErrPeerSendFailed if the peer send queue is full.
+// When credit-based flow control is active (creditActive is true), Write
+// blocks until a credit is available. This is safe because Write is called
+// from bufferedConn.drain(), which is a per-connection goroutine.
 func (c *TunneledConn) Write(b []byte) (n int, err error) {
+	// Fail fast if already closed.
+	select {
+	case <-c.closeCh:
+		return 0, net.ErrClosed
+	default:
+	}
+
+	// Block on credits if flow control is active.
+	if c.creditActive.Load() {
+		select {
+		case <-c.sendCredits:
+			// credit acquired
+		case <-c.closeCh:
+			return 0, net.ErrClosed
+		}
+	}
+
 	header := make([]byte, 1+protocol.ClientIDLength)
 	header[0] = protocol.PeerTunnelData
 	copy(header[1:], c.clientID[:])
@@ -124,6 +160,7 @@ func (c *TunneledConn) Write(b []byte) (n int, err error) {
 
 // Close signals to the peer that this end of the tunnel is closed.
 // Safe to call multiple times - only sends close message once.
+// Closes closeCh to unblock any Write waiting on credit acquisition.
 func (c *TunneledConn) Close() error {
 	c.mu.Lock()
 	if c.closed {
@@ -131,6 +168,7 @@ func (c *TunneledConn) Close() error {
 		return nil
 	}
 	c.closed = true
+	close(c.closeCh) // unblock any Write waiting on credits
 	c.mu.Unlock()
 
 	// Send close signal to peer
@@ -201,3 +239,52 @@ func (c *TunneledConn) RemoteAddr() net.Addr {
 func (c *TunneledConn) SetDeadline(t time.Time) error      { return nil }
 func (c *TunneledConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *TunneledConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// AddCredits grants send credits to this tunnel (direction 2: destination → origin).
+// Called from readPump when the origin peer sends PeerTunnelCredits.
+// Activates credit-based flow control on the first call.
+func (c *TunneledConn) AddCredits(credits int64) {
+	// Cap to prevent CPU-burn from a malicious credit value.
+	if credits > protocol.DefaultCreditCapacity {
+		credits = protocol.DefaultCreditCapacity
+	}
+	if credits <= 0 {
+		return
+	}
+	c.creditActive.Store(true)
+	for i := int64(0); i < credits; i++ {
+		select {
+		case c.sendCredits <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// makeTunnelCreditMessage builds a PeerTunnelCredits binary message.
+// Wire format: [PeerTunnelCredits][clientID 16B][credits 8B big-endian].
+func makeTunnelCreditMessage(clientID uuid.UUID, credits int64) []byte {
+	msg := make([]byte, 1+protocol.ClientIDLength+8)
+	msg[0] = protocol.PeerTunnelCredits
+	copy(msg[1:], clientID[:])
+	binary.BigEndian.PutUint64(msg[1+protocol.ClientIDLength:], uint64(credits))
+	return msg
+}
+
+// retryCreditSend retries a failed credit replenishment send with exponential
+// backoff. Without this, a dropped credit message permanently stalls the
+// tunnel because the sender blocks on credits and no new data arrives to
+// retrigger the batch threshold. Gives up after 5 attempts (~1.5s total).
+func retryCreditSend(peer iface.Peer, msg []byte, done <-chan struct{}) {
+	backoff := 50 * time.Millisecond
+	for range 5 {
+		select {
+		case <-time.After(backoff):
+			if peer.Send(msg) {
+				return
+			}
+			backoff *= 2
+		case <-done:
+			return
+		}
+	}
+}

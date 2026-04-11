@@ -25,8 +25,9 @@ func (b *failingBackend) AddClient(net.Conn, uuid.UUID, string, bool) error {
 	return errors.New("boom")
 }
 
-func (b *failingBackend) RemoveClient(uuid.UUID)           {}
-func (b *failingBackend) SendData(uuid.UUID, []byte) error { return nil }
+func (b *failingBackend) RemoveClient(uuid.UUID)                {}
+func (b *failingBackend) SendData(uuid.UUID, []byte) error     { return nil }
+func (b *failingBackend) HasRecentActivity(uuid.UUID, time.Time) bool { return false }
 
 type stubHub struct {
 	backend iface.Backend
