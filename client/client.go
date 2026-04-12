@@ -1559,6 +1559,18 @@ func (c *Client) cleanupConnectionQueue(clientID uuid.UUID) {
 	}
 }
 
+// forwardCreditRetryInterval is the period at which writeToLocal retries a
+// previously-failed forward credit flush. Sized for IoT/interactive latency
+// sensitivity (matches the hub-side replenishTickerInterval). The timer is
+// only armed AFTER a failed batch flush — sub-batch credits are not
+// opportunistically flushed because doing so would create a control-plane
+// storm at fan-out (every connection draining 1-7 frames in a 50ms window
+// emitting its own credit frame, saturating the 64-slot controlSend queue
+// and crowding out pause_stream / resume_stream / disconnect messages).
+// Stranded sub-batch credits self-correct via the next burst on the same
+// client.
+const forwardCreditRetryInterval = 50 * time.Millisecond
+
 // writeToLocal reads from the connection's write channel and writes to the local service.
 // This runs in a dedicated goroutine per connection to avoid blocking readPump.
 // Note: Cleanup (safeClose, localConns.Delete, disconnect message) is handled by copyLocalToNexus.
@@ -1567,11 +1579,63 @@ func (c *Client) writeToLocal(client *clientConn) {
 
 	defer close(client.localFlushed)
 
+	// Lazy credit-flush retry timer: nil channel disables the select case
+	// while no failed-batch retry is pending. The timer is ONLY armed after
+	// a failed batch flush — sub-batch credits are not opportunistically
+	// flushed (mirrors the hub-side bufferedConn.drain pattern, and avoids
+	// the control-plane storm at fan-out).
+	var creditFlushTimer *time.Timer
+	var creditFlushTimerCh <-chan time.Time
+	defer func() {
+		if creditFlushTimer != nil {
+			creditFlushTimer.Stop()
+		}
+	}()
+	armCreditFlushTimer := func() {
+		if creditFlushTimer == nil {
+			creditFlushTimer = time.NewTimer(forwardCreditRetryInterval)
+			creditFlushTimerCh = creditFlushTimer.C
+			return
+		}
+		if !creditFlushTimer.Stop() {
+			select {
+			case <-creditFlushTimer.C:
+			default:
+			}
+		}
+		creditFlushTimer.Reset(forwardCreditRetryInterval)
+		creditFlushTimerCh = creditFlushTimer.C
+	}
+	disarmCreditFlushTimer := func() {
+		if creditFlushTimer != nil {
+			if !creditFlushTimer.Stop() {
+				select {
+				case <-creditFlushTimer.C:
+				default:
+				}
+			}
+		}
+		creditFlushTimerCh = nil
+	}
+
 	for {
 		select {
 		case <-client.quit:
 			c.flushWriteCh(client)
 			return
+		case <-creditFlushTimerCh:
+			// Opportunistic flush of any pending forward credits. Without
+			// this, a stream that crosses the batch threshold and pauses
+			// leaves credits stranded — drifting the hub-side semaphore
+			// and adding latency on the next burst.
+			c.flushForwardCredits(client)
+			// Re-arm if credits are still pending after the flush attempt
+			// (e.g., enqueue failed and credits were restored).
+			if client.forwardConsumed.Load() > 0 {
+				armCreditFlushTimer()
+			} else {
+				disarmCreditFlushTimer()
+			}
 		case data := <-client.writeCh:
 			// Set write deadline based on transport type
 			// UDP: short timeout (1ms) - drop if blocked
@@ -1620,11 +1684,17 @@ func (c *Client) writeToLocal(client *clientConn) {
 			}
 
 			// Forward credit replenishment (both TCP and UDP): tell Nexus
-			// it can send more data for this connection.
-			consumed := client.forwardConsumed.Add(1)
-			if int64(consumed) >= protocol.CreditReplenishBatch {
-				actual := client.forwardConsumed.Swap(0)
-				c.enqueueControl(creditMessage(client.id, int64(actual)))
+			// it can send more data for this connection. Only flush at
+			// batch boundaries — sub-batch credits stay until the next
+			// batch boundary or until the connection closes.
+			if int64(client.forwardConsumed.Add(1)) >= protocol.CreditReplenishBatch {
+				c.flushForwardCredits(client)
+				if client.forwardConsumed.Load() > 0 {
+					// Flush failed (credits restored). Arm retry timer.
+					armCreditFlushTimer()
+				} else {
+					disarmCreditFlushTimer()
+				}
 			}
 
 			// Optimized Drain Check: If draining and no more data, exit immediately
@@ -1634,6 +1704,38 @@ func (c *Client) writeToLocal(client *clientConn) {
 				}
 			}
 		}
+	}
+}
+
+// flushForwardCredits sends any pending forward credits to Nexus. The send
+// is non-blocking: a full controlSend queue or inactive session causes the
+// pending count to be restored so the next batch (or the next ticker fire)
+// retries delivery — preventing silent credit loss without ever blocking
+// writeToLocal. The non-blocking semantics matter because writeToLocal is
+// called from a per-client goroutine that must not stall on control plane
+// backpressure.
+//
+// Liveness check uses the connection's OWNING session (client.session), not
+// the global active session, so a late retry from a torn-down connection
+// cannot leak a stale credit frame onto a successor session after reconnect.
+// This matches the pattern used by the disconnect paths in client.go.
+func (c *Client) flushForwardCredits(client *clientConn) {
+	pending := client.forwardConsumed.Swap(0)
+	if pending <= 0 {
+		return
+	}
+	if !client.session.IsConnected() {
+		client.forwardConsumed.Add(pending)
+		return
+	}
+	msg := creditMessage(client.id, int64(pending))
+	select {
+	case c.controlSend <- msg:
+		// Successfully enqueued.
+	default:
+		// controlSend full — restore credits so the next batch or ticker
+		// tick retries delivery.
+		client.forwardConsumed.Add(pending)
 	}
 }
 

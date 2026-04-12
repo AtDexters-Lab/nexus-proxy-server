@@ -3,9 +3,11 @@ package client
 import (
 	"context"
 	"errors"
+	"net"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -117,6 +119,186 @@ func TestFlowControlLogic(t *testing.T) {
 	}
 	if got := consumeControl(); got != "resume" {
 		t.Errorf("expected resume message, got %s", got)
+	}
+}
+
+// TestFlushForwardCredits_PreservesCreditsOnInactiveSession is the
+// regression test for the symmetric client-side credit-loss bug AND for
+// the stale-session leak: when the owning session is no longer connected,
+// credits must be restored to forwardConsumed (preventing loss) AND must
+// NOT be enqueued onto the shared control channel (preventing leak onto
+// a successor session after reconnect).
+func TestFlushForwardCredits_PreservesCreditsOnInactiveSession(t *testing.T) {
+	// Owning session is constructed but immediately marked inactive,
+	// simulating a torn-down connection whose writeToLocal goroutine is
+	// still finishing.
+	staleSession := &Session{done: make(chan struct{})}
+	staleSession.connected.Store(false)
+
+	conn := &clientConn{
+		id:      uuid.New(),
+		session: staleSession,
+	}
+
+	// Build a Client with a fresh "active" session to verify the stale
+	// retry does NOT leak onto it.
+	c := &Client{
+		controlSend: make(chan outboundMessage, 10),
+	}
+	c.ctx = context.Background()
+	freshSession := &Session{done: make(chan struct{})}
+	freshSession.connected.Store(true)
+	c.activeSession.Store(freshSession)
+
+	conn.forwardConsumed.Store(5)
+
+	c.flushForwardCredits(conn)
+
+	// Credits must be restored.
+	if got := conn.forwardConsumed.Load(); got != 5 {
+		t.Errorf("forwardConsumed not restored after inactive session: got %d, want 5", got)
+	}
+
+	// Crucially: nothing should have leaked onto controlSend.
+	select {
+	case msg := <-c.controlSend:
+		t.Errorf("stale forward credit leaked onto control channel: %x", msg.payload)
+	default:
+	}
+}
+
+// TestFlushForwardCredits_DeliversAndResetsOnSuccess verifies the happy path:
+// when enqueueControl succeeds, forwardConsumed is reset to 0 and a credit
+// message lands on controlSend.
+func TestFlushForwardCredits_DeliversAndResetsOnSuccess(t *testing.T) {
+	s := &Session{done: make(chan struct{})}
+	s.connected.Store(true)
+
+	conn := &clientConn{
+		id:      uuid.New(),
+		session: s,
+	}
+	c := &Client{
+		controlSend: make(chan outboundMessage, 10),
+	}
+	c.ctx = context.Background()
+	c.activeSession.Store(s)
+
+	conn.forwardConsumed.Store(7)
+
+	c.flushForwardCredits(conn)
+
+	if got := conn.forwardConsumed.Load(); got != 0 {
+		t.Errorf("forwardConsumed not reset after successful flush: got %d, want 0", got)
+	}
+
+	select {
+	case msg := <-c.controlSend:
+		// Verify it's a credit message (EventResumeStream with Credits>0).
+		if len(msg.payload) < 2 {
+			t.Fatal("control message too short")
+		}
+		body := string(msg.payload[1:])
+		if !strings.Contains(body, "resume_stream") {
+			t.Errorf("expected resume_stream credit message, got: %s", body)
+		}
+	default:
+		t.Error("controlSend did not receive credit message after successful flush")
+	}
+}
+
+// TestWriteToLocal_BatchFlushDeliversCredits verifies that writeToLocal
+// flushes forward credits at the batch boundary (8 frames). Sub-batch
+// credits are intentionally NOT flushed opportunistically — that would
+// create a control-plane storm at fan-out.
+func TestWriteToLocal_BatchFlushDeliversCredits(t *testing.T) {
+	localServer, localClient := net.Pipe()
+	defer localServer.Close()
+	defer localClient.Close()
+
+	conn := &clientConn{
+		id:           uuid.New(),
+		conn:         localClient,
+		quit:         make(chan struct{}),
+		drained:      make(chan struct{}),
+		localFlushed: make(chan struct{}),
+		writeCh:      make(chan []byte, 64),
+	}
+	conn.state.Store(uint32(ConnStateActive))
+
+	c := &Client{
+		controlSend: make(chan outboundMessage, 16),
+		config:      ClientBackendConfig{Name: "test"},
+	}
+	c.ctx = context.Background()
+	s := &Session{done: make(chan struct{})}
+	s.connected.Store(true)
+	c.activeSession.Store(s)
+	conn.session = s
+
+	// Drain whatever writeToLocal pushes to localClient.
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := localServer.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Run writeToLocal in a goroutine.
+	go c.writeToLocal(conn)
+
+	// Push 8 writes — exactly at the batch threshold, so the flush
+	// fires synchronously from the data path.
+	for i := 0; i < 8; i++ {
+		conn.writeCh <- []byte("x")
+	}
+
+	// Wait for the credit message on controlSend.
+	deadline := time.After(500 * time.Millisecond)
+	for {
+		select {
+		case msg := <-c.controlSend:
+			if len(msg.payload) < 2 {
+				continue
+			}
+			body := string(msg.payload[1:])
+			if !strings.Contains(body, "resume_stream") {
+				continue
+			}
+			return
+		case <-deadline:
+			t.Fatal("batch boundary did not deliver forward credits within 500ms")
+		}
+	}
+}
+
+// TestFlushForwardCredits_NoOpOnZeroPending verifies that flushForwardCredits
+// is a no-op when forwardConsumed is 0 (no enqueue, no state change).
+func TestFlushForwardCredits_NoOpOnZeroPending(t *testing.T) {
+	s := &Session{done: make(chan struct{})}
+	s.connected.Store(true)
+
+	conn := &clientConn{
+		id:      uuid.New(),
+		session: s,
+	}
+	c := &Client{
+		controlSend: make(chan outboundMessage, 10),
+	}
+	c.ctx = context.Background()
+	c.activeSession.Store(s)
+
+	c.flushForwardCredits(conn)
+
+	if got := conn.forwardConsumed.Load(); got != 0 {
+		t.Errorf("forwardConsumed should remain 0: got %d", got)
+	}
+	select {
+	case <-c.controlSend:
+		t.Error("controlSend received a message when forwardConsumed was 0")
+	default:
 	}
 }
 

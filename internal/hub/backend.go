@@ -56,8 +56,13 @@ type Backend struct {
 
 	clients sync.Map
 
-	outgoing     chan outboundMessage
-	reauthTokens chan string
+	// Two-lane outbound channel: control messages (priority) and data messages.
+	// Splitting prevents data backlog from starving credit replenishment, pongs,
+	// reauth challenges, and other control plane traffic. writePump prefers
+	// outgoingControl on every iteration.
+	outgoingControl chan outboundMessage
+	outgoingData    chan outboundMessage
+	reauthTokens    chan string
 
 	quit      chan struct{}
 	closeOnce sync.Once
@@ -92,6 +97,20 @@ type Backend struct {
 	// Each entry is a chan struct{} used as a counting semaphore.
 	// Nil entry = old client, unlimited.
 	forwardCredits sync.Map // uuid.UUID → chan struct{}
+
+	// Observability counters for credit replenishment health. Operators
+	// monitor these to detect control plane degradation before it causes
+	// user-visible stalls.
+	metrics backendMetrics
+}
+
+// backendMetrics holds atomic counters for credit replenishment health.
+// replenishRetryAttempts counts *attempts* (not unique drops): a single
+// stuck batch can contribute many increments under sustained pressure.
+// The ratio against replenishSuccess indicates control lane health.
+type backendMetrics struct {
+	replenishRetryAttempts atomic.Int64
+	replenishSuccess       atomic.Int64
 }
 
 // NewBackend creates a new Backend instance.
@@ -111,7 +130,8 @@ func NewBackend(conn *websocket.Conn, meta *AttestationMetadata, cfg *config.Con
 		udpRoutes:           meta.cloneUDPRoutes(),
 		weight:              meta.Weight,
 		policyVersion:       meta.PolicyVersion,
-		outgoing:            make(chan outboundMessage, 256),
+		outgoingControl:     make(chan outboundMessage, 256),
+		outgoingData:        make(chan outboundMessage, 256),
 		reauthTokens:        make(chan string, 1),
 		quit:                make(chan struct{}),
 		reauthInterval:      meta.ReauthInterval,
@@ -134,6 +154,14 @@ func NewBackend(conn *websocket.Conn, meta *AttestationMetadata, cfg *config.Con
 
 func (b *Backend) ID() string {
 	return b.id
+}
+
+// ReplenishStats returns the lifetime credit replenishment counters for
+// observability. success counts EventResumeStream messages successfully
+// enqueued on the control lane; retryAttempts counts failed enqueue
+// attempts (the same stuck batch can contribute multiple retries).
+func (b *Backend) ReplenishStats() (success, retryAttempts int64) {
+	return b.metrics.replenishSuccess.Load(), b.metrics.replenishRetryAttempts.Load()
 }
 
 func (b *Backend) Close() {
@@ -256,16 +284,25 @@ func (b *Backend) HasRecentActivity(clientID uuid.UUID, since time.Time) bool {
 // replenishment (EventResumeStream with Credits) to the backend for the
 // given client. Called by bufferedConn's drain goroutine after every
 // CreditReplenishBatch successful TCP writes.
-func (b *Backend) replenishCallbackFor(clientID uuid.UUID) func(int64) {
-	return func(credits int64) {
+//
+// Returns nil if the credit message was successfully enqueued onto the
+// control lane. Returns an error if the enqueue failed — the caller (drain)
+// will preserve its consumed counter and retry, ensuring no credit is ever
+// permanently lost. This is the contract that fixes the silent credit-loss
+// bug from v0.3.7/v0.3.8.
+func (b *Backend) replenishCallbackFor(clientID uuid.UUID) func(int64) error {
+	return func(credits int64) error {
 		msg := protocol.ControlMessage{
 			Event:    protocol.EventResumeStream,
 			ClientID: clientID,
 			Credits:  credits,
 		}
 		if err := b.SendControlMessage(msg); err != nil {
-			log.Printf("WARN: Failed to send credit replenishment for client %s on backend %s: %v", clientID, b.id, err)
+			b.metrics.replenishRetryAttempts.Add(1)
+			return err
 		}
+		b.metrics.replenishSuccess.Add(1)
+		return nil
 	}
 }
 
@@ -364,13 +401,13 @@ func (b *Backend) SendData(clientID uuid.UUID, data []byte) error {
 			b.bandwidthScheduler.RefundSend(b.id, messageSize)
 		}
 		return fmt.Errorf("backend %s is closing", b.id)
-	case b.outgoing <- outbound:
+	case b.outgoingData <- outbound:
 	default:
 		// Refund reserved bandwidth since the message is dropped
 		if b.bandwidthScheduler != nil {
 			b.bandwidthScheduler.RefundSend(b.id, messageSize)
 		}
-		return fmt.Errorf("backend %s send channel full, dropping data for client %s", b.id, clientID)
+		return fmt.Errorf("backend %s data channel full, dropping data for client %s", b.id, clientID)
 	}
 
 	// Record successful send
@@ -400,12 +437,44 @@ func (b *Backend) SendControlMessage(msg protocol.ControlMessage) error {
 	header := []byte{protocol.ControlByteControl}
 	outbound := outboundMessage{messageType: websocket.BinaryMessage, data: append(header, payload...)}
 
+	// Lifecycle events that bracket data on a client connection MUST preserve
+	// FIFO ordering with that data:
+	//
+	//   - EventConnect must precede the first data frame, otherwise the
+	//     backend's handleDataMessage sees an unknown clientID and tears
+	//     down the new connection (drops the prelude / first UDP packet).
+	//   - EventDisconnect must follow all queued data, otherwise the backend
+	//     closes the local socket before the tail of the stream is delivered.
+	//   - EventOutboundResult with Success=true must precede data on the
+	//     outbound connection for the same reason as EventConnect.
+	//
+	// Routing these through outgoingData makes them share the same FIFO
+	// lane as the data they bracket. EventOutboundResult with Success=false
+	// has NO subsequent data (no AddOutboundClient, no readOutboundConn),
+	// so it stays on outgoingControl — otherwise a busy data lane would
+	// delay the failure reply and the SOCKS5 caller would hit its
+	// outboundConnectTimeout (~15s) instead of getting the real dial error
+	// promptly. Other control messages (credits, pongs, reauth challenges)
+	// also stay on outgoingControl where they cannot be starved by data.
+	lane := b.outgoingControl
+	laneName := "control"
+	switch msg.Event {
+	case protocol.EventConnect, protocol.EventDisconnect:
+		lane = b.outgoingData
+		laneName = "data"
+	case protocol.EventOutboundResult:
+		if msg.Success {
+			lane = b.outgoingData
+			laneName = "data"
+		}
+	}
+
 	select {
 	case <-b.quit:
 		return fmt.Errorf("backend %s is closing", b.id)
-	case b.outgoing <- outbound:
+	case lane <- outbound:
 	default:
-		return fmt.Errorf("backend %s send channel full, dropping data for client %s", b.id, msg.ClientID)
+		return fmt.Errorf("backend %s %s channel full, dropping %s for client %s", b.id, laneName, msg.Event, msg.ClientID)
 	}
 	select {
 	case <-b.quit:
@@ -509,8 +578,13 @@ func (b *Backend) handleBinaryMessage(message []byte) {
 			// slow clients (which would starve other clients sharing
 			// this backend's WebSocket — the self-loop deadlock).
 			if _, err := clientConn.Write(data); err != nil {
-				log.Printf("WARN: Failed to write to client %s: %v. Closing.", clientID, err)
-				_ = clientConn.Close()
+				// Use RemoveClient (not just Close) so all per-client state
+				// — clients map entry, forwardCredits semaphore, outboundIDs,
+				// EventDisconnect notification — is cleaned up. A bare Close
+				// leaks all of these and leaves the backend dispatching to
+				// a closed conn until the backend itself disconnects.
+				log.Printf("WARN: Failed to write to client %s: %v. Removing.", clientID, err)
+				b.RemoveClient(clientID)
 			} else {
 				// Record successful enqueue for bandwidth accounting.
 				if b.bandwidthScheduler != nil {
@@ -602,6 +676,15 @@ func (b *Backend) handleResumeStream(clientID uuid.UUID, credits int64) {
 
 	// Forward credit replenishment
 	if credits > 0 {
+		// Defensive cap: a malicious or buggy backend that sends Credits=MaxInt64
+		// would otherwise cause `make(chan struct{}, MaxInt64)` to panic and
+		// crash the relay. Sane workloads have credits ≤ ~128 (= 2x default
+		// capacity), so 16384 is >100x more than legitimate use ever needs.
+		if credits > maxForwardCreditCapacity {
+			log.Printf("WARN: Backend %s requested credit capacity %d for client %s; capping at %d",
+				b.id, credits, clientID, maxForwardCreditCapacity)
+			credits = maxForwardCreditCapacity
+		}
 		// Use the larger of credits and DefaultCreditCapacity as semaphore
 		// capacity so both initial grants and replenishments fit.
 		capacity := protocol.DefaultCreditCapacity
@@ -633,6 +716,13 @@ func (b *Backend) handleResumeStream(clientID uuid.UUID, credits int64) {
 		}
 	}
 }
+
+// maxForwardCreditCapacity is a defensive upper bound for credit grants from
+// backends, preventing make(chan, MaxInt64) crashes if a backend sends an
+// adversarial Credits value. Sized large enough (~1M) to never truncate any
+// legitimate FlowControl.MaxBuffer configuration, while still bounding the
+// per-client semaphore allocation to ~8MB worst-case.
+const maxForwardCreditCapacity = 1 << 20
 
 // maxTargetAddrLen limits the length of outbound target addresses.
 const maxTargetAddrLen = 260
@@ -803,18 +893,33 @@ func (b *Backend) writePump() {
 		ticker.Stop()
 		b.Close()
 	}()
+
+	writeOutbound := func(outbound outboundMessage) bool {
+		_ = b.conn.SetWriteDeadline(time.Now().Add(writeWait))
+		if err := b.conn.WriteMessage(outbound.messageType, outbound.data); err != nil {
+			log.Printf("ERROR: Failed to write to backend %s: %v", b.id, err)
+			return false
+		}
+		return true
+	}
+
+	// Fair select across both lanes + ticker + quit. The channel split
+	// (outgoingControl + outgoingData) is what fixes the silent credit-loss
+	// bug — control messages have their own buffer that data cannot exhaust.
+	// We do NOT use strict priority for outgoingControl: a sustained burst of
+	// control messages (e.g., credit replenishment under load) would
+	// otherwise starve outgoingData and the ping ticker, breaking uploads
+	// and triggering pongWait disconnects on otherwise-healthy backends.
 	for {
 		select {
 		case <-b.quit:
 			return
-		case outbound, ok := <-b.outgoing:
-			_ = b.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if !ok {
-				_ = b.conn.WriteMessage(websocket.CloseMessage, []byte{})
+		case outbound := <-b.outgoingControl:
+			if !writeOutbound(outbound) {
 				return
 			}
-			if err := b.conn.WriteMessage(outbound.messageType, outbound.data); err != nil {
-				log.Printf("ERROR: Failed to write to backend %s: %v", b.id, err)
+		case outbound := <-b.outgoingData:
+			if !writeOutbound(outbound) {
 				return
 			}
 		case <-ticker.C:
@@ -889,12 +994,17 @@ func (b *Backend) performReauth() error {
 
 	b.prepareForNonce(nonce)
 
+	// Reauth challenge bypasses SendControlMessage because it uses a TextMessage
+	// frame and the ChallengeMessage schema (not protocol.ControlMessage). It
+	// routes through the priority control lane to avoid being starved by data
+	// backlog — a delayed reauth challenge can cause backend timeout and cascade
+	// 1000+ client disconnects.
 	outbound := outboundMessage{messageType: websocket.TextMessage, data: payload}
 	select {
 	case <-b.quit:
 		b.clearPendingNonce()
 		return errors.New("backend closing during reauth challenge")
-	case b.outgoing <- outbound:
+	case b.outgoingControl <- outbound:
 	default:
 		b.clearPendingNonce()
 		return errors.New("reauth challenge channel full")
