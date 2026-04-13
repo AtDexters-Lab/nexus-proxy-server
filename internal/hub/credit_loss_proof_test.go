@@ -40,7 +40,7 @@ func TestPostFixCreditLoss_NoCreditsLost(t *testing.T) {
 		}
 		totalDelivered.Add(n)
 		return nil
-	})
+	}, nil, nil)
 	defer bc.Close()
 
 	// Drain the pipe so writes go through.

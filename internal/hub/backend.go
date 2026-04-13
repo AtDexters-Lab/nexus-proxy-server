@@ -89,29 +89,59 @@ type Backend struct {
 	inFlightDials        atomic.Int64 // pending dial attempts
 	maxOutboundConns     int          // -1 = no limit
 
-	// Bandwidth management
-	bandwidthState     *bandwidth.BackendBandwidth
-	bandwidthScheduler *bandwidth.Scheduler
+	// Bandwidth management. Set by AttachBandwidthScheduler during
+	// hub.register(), strictly before StartPumps() and before any
+	// AddClient call. Read without synchronization; the field is
+	// effectively immutable after attach because the attach method
+	// panics on double-attach and on attach-after-clients.
+	// bandwidthGateCached is a single shared adapter instance, reused
+	// by every per-client bufferedConn — saves one allocation per
+	// AddClient call vs constructing a fresh adapter each time.
+	bandwidthScheduler  *bandwidth.Scheduler
+	bandwidthGateCached *backendBandwidthGate
 
 	// Forward credit-based flow control (end-user → backend direction).
 	// Each entry is a chan struct{} used as a counting semaphore.
 	// Nil entry = old client, unlimited.
 	forwardCredits sync.Map // uuid.UUID → chan struct{}
 
-	// Observability counters for credit replenishment health. Operators
-	// monitor these to detect control plane degradation before it causes
-	// user-visible stalls.
+	// Observability counters for credit replenishment and bandwidth gate
+	// health. Operators monitor these to detect control plane degradation
+	// (replenish) or bandwidth cap exhaustion (gateBlock) before either
+	// causes user-visible stalls.
 	metrics backendMetrics
 }
 
-// backendMetrics holds atomic counters for credit replenishment health.
+// backendMetrics holds atomic counters for credit replenishment and
+// bandwidth gate health.
+//
 // replenishRetryAttempts counts *attempts* (not unique drops): a single
 // stuck batch can contribute many increments under sustained pressure.
 // The ratio against replenishSuccess indicates control lane health.
+//
+// gateBlockEvents counts frames whose delivery was blocked by the
+// bandwidth gate at least once (Request returned false ≥ 1 time).
+// gateBlockMillisTotal accumulates the wall-clock wait across those
+// blocked frames. The derived metric millisTotal/events approximates
+// average block time per blocked frame — sustained > 500ms suggests
+// cap exhaustion at current load.
 type backendMetrics struct {
 	replenishRetryAttempts atomic.Int64
 	replenishSuccess       atomic.Int64
+	gateBlockEvents        atomic.Int64
+	gateBlockMillisTotal   atomic.Int64
+	// lastWarnedGateMillis is the value of gateBlockMillisTotal at the
+	// time of the most recent WARN log. A new WARN fires each additional
+	// gateBlockWarnDeltaMillis of cumulative block time. Updated via CAS
+	// from observeGateBlock so concurrent drain callers don't double-log.
+	lastWarnedGateMillis atomic.Int64
 }
+
+// gateBlockWarnDeltaMillis is the cumulative-block-time delta (per
+// backend) between WARN logs. Matches v0.3.9's retryStreakWarnThreshold
+// streak-delta pattern so sustained gate pressure produces predictable
+// per-backend log cadence instead of per-event log amplification.
+const gateBlockWarnDeltaMillis int64 = 10_000
 
 // NewBackend creates a new Backend instance.
 func NewBackend(conn *websocket.Conn, meta *AttestationMetadata, cfg *config.Config, validator auth.Validator, httpClient *http.Client) *Backend {
@@ -162,6 +192,148 @@ func (b *Backend) ID() string {
 // attempts (the same stuck batch can contribute multiple retries).
 func (b *Backend) ReplenishStats() (success, retryAttempts int64) {
 	return b.metrics.replenishSuccess.Load(), b.metrics.replenishRetryAttempts.Load()
+}
+
+// BandwidthGateStats returns the lifetime bandwidth gate counters for
+// observability. events counts frames whose delivery was blocked by the
+// per-backend bandwidth gate at least once (Request returned false
+// ≥ 1 time). millisTotal accumulates the wall-clock wait across those
+// blocked frames.
+//
+// Operator guidance:
+//   - Derived metric millisTotal/events approximates average block time
+//     per blocked frame. Alert threshold: sustained > 500ms average
+//     indicates cap exhaustion at current load.
+//   - events rate should be near-zero when totalBandwidthMbps is unset
+//     (scheduler nil → gate nil → no drain-side gate activity). A
+//     non-zero rate under a nil scheduler indicates a bug.
+//   - Use backend-ID correlation from logs to identify noisy-neighbor
+//     clients; per-client histograms are future work.
+func (b *Backend) BandwidthGateStats() (events, millisTotal int64) {
+	return b.metrics.gateBlockEvents.Load(), b.metrics.gateBlockMillisTotal.Load()
+}
+
+// backendBandwidthGate adapts the per-backend bandwidth.Scheduler interface
+// to bufferedConn's bandwidthGate contract for the **downlink** path
+// (drain → TCP client). The uplink path (SendData → backend WS) charges
+// the scheduler directly without going through this adapter; both paths
+// must add protocol.MessageHeaderLength bytes of WS framing overhead so
+// uplink and downlink accounting stay byte-symmetric against the same
+// per-backend deficit.
+type backendBandwidthGate struct {
+	scheduler *bandwidth.Scheduler
+	backendID string
+	overhead  int
+}
+
+func (g *backendBandwidthGate) Request(bytes int) (bool, time.Duration) {
+	return g.scheduler.RequestSend(g.backendID, bytes+g.overhead)
+}
+
+func (g *backendBandwidthGate) Record(bytes int) {
+	g.scheduler.RecordSent(g.backendID, bytes+g.overhead)
+}
+
+// gateForBufferedConn returns a bandwidthGate wired to this backend's
+// scheduler, or nil if no scheduler is attached. Returns the cached
+// adapter instance so every per-client bufferedConn shares one — there
+// is no per-client state inside the adapter.
+//
+// TODO(fairness): the per-client fair share under bandwidth cap now
+// reflects CAS-race on the shared per-backend deficit rather than
+// WS-arrival-order serialization. Large-frame clients under sustained
+// small-frame contention may see higher tail latency. Neither the old
+// nor the new design implements true per-client quantum DRR; fairness
+// guarantees are unchanged at the backend level. If operators begin
+// relying on bandwidth-cap fairness between co-tenant clients, add
+// per-client BackendBandwidth-like state in the scheduler.
+func (b *Backend) gateForBufferedConn() bandwidthGate {
+	if b.bandwidthGateCached == nil {
+		return nil
+	}
+	return b.bandwidthGateCached
+}
+
+// newClientBufferedConn constructs a per-client bufferedConn wired to
+// this backend's credit replenishment, bandwidth gate, and metric
+// observer callbacks. Used by both AddClient (inbound clients,
+// IdleTimeout) and AddOutboundClient (outbound proxy connections,
+// OutboundIdleTimeout) — only the timeout differs.
+func (b *Backend) newClientBufferedConn(conn net.Conn, writeTimeout time.Duration, clientID uuid.UUID) *bufferedConn {
+	return newBufferedConn(
+		conn,
+		writeTimeout,
+		b.replenishCallbackFor(clientID),
+		b.gateForBufferedConn(),
+		b.observeGateBlock,
+	)
+}
+
+// observeGateBlock records a bandwidth gate wait event. Called from the
+// bufferedConn drain goroutine via the gateBlockObserver callback (once
+// per frame that was blocked at least once). Uses atomic ops — safe
+// under concurrent calls from multiple client drain goroutines.
+//
+// WARN log: when cumulative gateBlockMillisTotal crosses each additional
+// gateBlockWarnDeltaMillis (10s) threshold, emit one WARN line per CAS
+// winner. Uses CAS on lastWarnedGateMillis so concurrent drain callers
+// do not emit duplicate warnings at the same crossing. Note: a single
+// elapsed value spanning multiple thresholds (e.g., 25s in one event)
+// produces only ONE WARN, not three. Realistic per-frame waits are
+// sub-second, so this coarsening is harmless in practice.
+func (b *Backend) observeGateBlock(elapsed time.Duration) {
+	b.metrics.gateBlockEvents.Add(1)
+	total := b.metrics.gateBlockMillisTotal.Add(elapsed.Milliseconds())
+
+	for {
+		lastWarned := b.metrics.lastWarnedGateMillis.Load()
+		if total-lastWarned < gateBlockWarnDeltaMillis {
+			return
+		}
+		if b.metrics.lastWarnedGateMillis.CompareAndSwap(lastWarned, total) {
+			log.Printf("WARN: backend %s gate-blocked %ds cumulative (check totalBandwidthMbps cap)",
+				b.id, total/1000)
+			return
+		}
+		// CAS lost — another drain caller beat us to it. Re-read and
+		// re-check; the winning caller's store may have satisfied
+		// the delta already.
+	}
+}
+
+// AttachBandwidthScheduler wires a bandwidth scheduler to this backend.
+// Must be called at most once, strictly before StartPumps or AddClient,
+// from the construction goroutine. The Register() side effect and the
+// field write happen together so the pair cannot be split by refactors.
+//
+// Safeguards (panic on misuse):
+//   - nil scheduler → no-op.
+//   - Called twice → panics. A second Register() would silently reset
+//     deficit / lastActive on a live backend.
+//   - Called after any client is registered → panics. Mixing gated and
+//     ungated clients on the same backend is a debugging hazard.
+func (b *Backend) AttachBandwidthScheduler(s *bandwidth.Scheduler) {
+	if s == nil {
+		return
+	}
+	if b.bandwidthScheduler != nil {
+		panic(fmt.Sprintf("AttachBandwidthScheduler: backend %s already has a scheduler attached", b.id))
+	}
+	hasClient := false
+	b.clients.Range(func(_, _ interface{}) bool {
+		hasClient = true
+		return false
+	})
+	if hasClient {
+		panic(fmt.Sprintf("AttachBandwidthScheduler: backend %s already has clients; attach before StartPumps", b.id))
+	}
+	s.Register(b.id)
+	b.bandwidthScheduler = s
+	b.bandwidthGateCached = &backendBandwidthGate{
+		scheduler: s,
+		backendID: b.id,
+		overhead:  protocol.MessageHeaderLength,
+	}
 }
 
 func (b *Backend) Close() {
@@ -247,8 +419,7 @@ func (b *Backend) AddClient(clientConn net.Conn, clientID uuid.UUID, hostname st
 	if err := b.SendControlMessage(msg); err != nil {
 		return fmt.Errorf("failed to send connect message for client %s: %w", clientID, err)
 	}
-	b.clients.Store(clientID, newBufferedConn(clientConn, b.config.IdleTimeout(),
-		b.replenishCallbackFor(clientID)))
+	b.clients.Store(clientID, b.newClientBufferedConn(clientConn, b.config.IdleTimeout(), clientID))
 	return nil
 }
 
@@ -347,8 +518,7 @@ func (b *Backend) AddOutboundClient(conn net.Conn, clientID uuid.UUID) error {
 		return fmt.Errorf("backend %s is closing", b.id)
 	}
 	wrapped := proxy.NewPausableConn(conn)
-	buffered := newBufferedConn(wrapped, b.config.OutboundIdleTimeout(),
-		b.replenishCallbackFor(clientID))
+	buffered := b.newClientBufferedConn(wrapped, b.config.OutboundIdleTimeout(), clientID)
 	if _, loaded := b.clients.LoadOrStore(clientID, buffered); loaded {
 		buffered.Close()
 		return fmt.Errorf("client ID %s already exists", clientID)
@@ -362,12 +532,12 @@ func (b *Backend) SendData(clientID uuid.UUID, data []byte) error {
 	if b.closed.Load() {
 		return fmt.Errorf("backend %s is already closed", b.id)
 	}
-	header := make([]byte, 1+protocol.ClientIDLength)
+	header := make([]byte, protocol.MessageHeaderLength)
 	header[0] = protocol.ControlByteData
 	copy(header[1:], clientID[:])
 	message := append(header, data...)
 
-	messageSize := len(message)
+	messageSize := len(message) // protocol.MessageHeaderLength + len(data)
 
 	// Forward credit check — blocks until the backend client has buffer
 	// room. This is a per-client goroutine (Client.Start), so blocking
@@ -518,6 +688,11 @@ func (b *Backend) readPump() {
 	}
 }
 
+// handleBinaryMessage runs on the shared readPump goroutine. It MUST
+// NOT block on any per-client state (TCP writes, bandwidth gates,
+// credit semaphores, etc.) — a block here stalls ingress for every
+// client on this backend, including control messages. All per-client
+// synchronous work belongs in bufferedConn.drain.
 func (b *Backend) handleBinaryMessage(message []byte) {
 	if len(message) < 1 {
 		return
@@ -544,39 +719,16 @@ func (b *Backend) handleBinaryMessage(message []byte) {
 		copy(clientID[:], payload[:protocol.ClientIDLength])
 		data := payload[protocol.ClientIDLength:]
 
-		// Check client existence first to avoid blocking on bandwidth
-		// for data destined to already-disconnected clients.
 		rawConn, ok := b.clients.Load(clientID)
 		if !ok {
 			return
 		}
 
-		// Bandwidth check with retry loop BEFORE writing to client
-		// Use full message size (header + payload) for consistent accounting with SendData
-		if b.bandwidthScheduler != nil {
-			fullMessageSize := len(payload) + 1 // control byte + full payload including clientID + data
-			for {
-				allowed, waitTime := b.bandwidthScheduler.RequestSend(b.id, fullMessageSize)
-				if allowed {
-					break
-				}
-				// Block - this blocks readPump, creating backpressure to backend
-				select {
-				case <-b.quit:
-					return
-				case <-time.After(waitTime):
-					// Refresh read deadline so the pong handler doesn't
-					// time out while we're legitimately waiting for bandwidth.
-					b.conn.SetReadDeadline(time.Now().Add(pongWait))
-				}
-			}
-		}
-
 		if clientConn, ok := rawConn.(net.Conn); ok {
-			// Write is non-blocking: bufferedConn enqueues data for
-			// async delivery, preventing readPump from stalling on
-			// slow clients (which would starve other clients sharing
-			// this backend's WebSocket — the self-loop deadlock).
+			// Non-blocking enqueue: bufferedConn.Write returns
+			// immediately. Drain (per-client goroutine) owns the
+			// TCP write, the bandwidth gate wait, and the credit
+			// replenishment — none of which block this readPump.
 			if _, err := clientConn.Write(data); err != nil {
 				// Use RemoveClient (not just Close) so all per-client state
 				// — clients map entry, forwardCredits semaphore, outboundIDs,
@@ -585,11 +737,6 @@ func (b *Backend) handleBinaryMessage(message []byte) {
 				// a closed conn until the backend itself disconnects.
 				log.Printf("WARN: Failed to write to client %s: %v. Removing.", clientID, err)
 				b.RemoveClient(clientID)
-			} else {
-				// Record successful enqueue for bandwidth accounting.
-				if b.bandwidthScheduler != nil {
-					b.bandwidthScheduler.RecordSent(b.id, len(payload)+1)
-				}
 			}
 		} else {
 			log.Printf("ERROR: Client %s is not a net.Conn type in backend %s", clientID, b.id)

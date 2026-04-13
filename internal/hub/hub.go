@@ -832,11 +832,11 @@ func sameUDPRoutes(a, b []UDPRoutePolicy) bool {
 }
 
 func (h *hubImpl) register(b *Backend) {
-	// Register with bandwidth scheduler
-	if h.bandwidthScheduler != nil {
-		b.bandwidthState = h.bandwidthScheduler.Register(b.id)
-		b.bandwidthScheduler = h.bandwidthScheduler
-	}
+	// Register with bandwidth scheduler. AttachBandwidthScheduler
+	// bundles Register() + field write so they cannot be accidentally
+	// separated during refactors. Must run before StartPumps() and
+	// before any AddClient call.
+	b.AttachBandwidthScheduler(h.bandwidthScheduler)
 
 	for _, hn := range b.hostnames {
 		if suffix, ok := hostn.WildcardSuffix(hn); ok {

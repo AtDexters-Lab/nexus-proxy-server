@@ -25,6 +25,29 @@ import (
 // (see backend.go handleBinaryMessage error branch) to fully clean up state.
 const clientWriteBufferSize = 2 * int(protocol.DefaultCreditCapacity)
 
+// bandwidthGate is the contract bufferedConn.drain uses to honor a
+// per-backend bandwidth budget. Implementations must be concurrency-safe
+// because a single backend may have many drain goroutines all calling
+// through the same gate concurrently.
+//
+// Request asks permission to send `bytes` user bytes. Returns (true, 0)
+// if the reservation was made, (false, waitTime) if the caller should
+// wait before retrying. On (false, _) no reservation is held.
+//
+// Record commits metrics for a previously-approved send. Called only
+// after Request returned true (regardless of whether the subsequent
+// downstream write succeeded — see drain for rationale).
+//
+// Note: there is intentionally no Refund method. Bytes that reach drain
+// have already crossed the backend↔proxy WS link, so they must count
+// against the cap regardless of whether the per-client TCP write
+// succeeds. Refunding on TCP write failure would let the backend
+// silently bypass totalBandwidthMbps under slow-client conditions.
+type bandwidthGate interface {
+	Request(bytes int) (bool, time.Duration)
+	Record(bytes int)
+}
+
 // bufferedConn wraps a net.Conn with an asynchronous write buffer.
 //
 // Writes are enqueued to a channel and drained by a dedicated goroutine,
@@ -40,6 +63,12 @@ const clientWriteBufferSize = 2 * int(protocol.DefaultCreditCapacity)
 // the consumed counter and retries on the next opportunity (next data write
 // or replenishTicker fire). This is the contract that prevents silent credit
 // loss — the original bug fixed by this design.
+//
+// Bandwidth gating: if `gate` is non-nil, drain blocks on gate.Request
+// before each TCP write. The wait is localized to this drain goroutine
+// so one throttled client does not stall ingress for siblings on the
+// same backend (the HOL class of bug this gate relocation was designed
+// to fix).
 type bufferedConn struct {
 	net.Conn
 	writeCh      chan []byte
@@ -52,7 +81,28 @@ type bufferedConn struct {
 	// were successfully enqueued (drain may then reset its consumed counter); returns
 	// an error if the enqueue failed (drain preserves the consumed counter for retry).
 	onReplenish func(int64) error
-	lastWriteAt atomic.Int64 // UnixNano of last successful TCP write; used for bidirectional idle detection
+	// gate is the per-backend bandwidth budget. nil = unlimited.
+	gate bandwidthGate
+	// gateBlockObserver, if non-nil, is called from drain with the elapsed
+	// duration of a gate wait, exactly once per frame that was blocked at
+	// least once (Request returned false ≥ 1 time). Frames that passed the
+	// gate on first call do not invoke the observer. Backend uses this to
+	// accumulate gateBlockEvents / gateBlockMillisTotal metrics. Called
+	// synchronously on the drain goroutine — **must not block** and should
+	// avoid unbounded I/O. Atomic ops are fine. Bounded I/O is acceptable
+	// (Backend.observeGateBlock emits at most one WARN log per
+	// gateBlockWarnDeltaMillis of cumulative block time per backend), but
+	// any pattern that could stall drain under load defeats the HOL fix.
+	gateBlockObserver func(time.Duration)
+	lastWriteAt       atomic.Int64 // UnixNano of last successful TCP write; used for bidirectional idle detection
+
+	// innerGateReplenishObserved is a test-only counter incremented
+	// only when the replenish retry timer fires INSIDE drain's inner
+	// gate-wait select branch. The load-bearing assertion in
+	// TestBufferedConn_GateDoesNotBlockReplenishRetry: the test fails
+	// if the inner-loop case <-replenishTimerCh branch is ever removed.
+	// Written from drain, read from tests via export_test.go.
+	innerGateReplenishObserved atomic.Int64
 }
 
 // newBufferedConn wraps conn with an asynchronous write buffer.
@@ -60,15 +110,29 @@ type bufferedConn struct {
 // pass 0 to skip write deadlines. onReplenish is called from the drain
 // goroutine after every CreditReplenishBatch successful writes; pass nil
 // to disable credit replenishment. The callback must return nil on success
-// and an error on transient failure (drain will retry).
-func newBufferedConn(conn net.Conn, writeTimeout time.Duration, onReplenish func(int64) error) *bufferedConn {
+// and an error on transient failure (drain will retry). gate is the
+// per-backend bandwidth gate; pass nil to disable bandwidth gating.
+// gateBlockObs, if non-nil, is called from drain with the cumulative
+// wait duration once per frame that was blocked in the gate at least
+// once (see bufferedConn.gateBlockObserver). All fields are assigned
+// before the drain goroutine is spawned, so there is no publication
+// race on subsequent reads from drain.
+func newBufferedConn(
+	conn net.Conn,
+	writeTimeout time.Duration,
+	onReplenish func(int64) error,
+	gate bandwidthGate,
+	gateBlockObs func(time.Duration),
+) *bufferedConn {
 	bc := &bufferedConn{
-		Conn:         conn,
-		writeCh:      make(chan []byte, clientWriteBufferSize),
-		quit:         make(chan struct{}),
-		done:         make(chan struct{}),
-		writeTimeout: writeTimeout,
-		onReplenish:  onReplenish,
+		Conn:              conn,
+		writeCh:           make(chan []byte, clientWriteBufferSize),
+		quit:              make(chan struct{}),
+		done:              make(chan struct{}),
+		writeTimeout:      writeTimeout,
+		onReplenish:       onReplenish,
+		gate:              gate,
+		gateBlockObserver: gateBlockObs,
 	}
 	go bc.drain()
 	return bc
@@ -119,6 +183,20 @@ const minReplenishRetryBackoff = 25 * time.Millisecond
 // control plane that warrants operator investigation.
 const retryStreakWarnThreshold = 50
 
+// stopAndDrainTimer halts t and discards any pending value on its channel.
+// Canonical "Stop, drain stale firing, ready to Reset" sequence. Caller
+// is responsible for the subsequent Reset. Safe ONLY when the timer is
+// owned by a single goroutine — concurrent receivers on t.C would race
+// the drain.
+func stopAndDrainTimer(t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+}
+
 // drain writes buffered data to the underlying connection. Runs in its
 // own goroutine until the connection is closed or a write error occurs.
 // On quit signal, flushes any remaining buffered data before exiting.
@@ -141,6 +219,19 @@ const retryStreakWarnThreshold = 50
 // flushRemaining (the quit-path drain) does NOT call onReplenish — credits
 // in flight at teardown are intentionally discarded since the client is
 // disconnecting.
+//
+// Bandwidth gate: if bc.gate is non-nil, drain blocks on gate.Request
+// before each TCP write. The wait is localized to this goroutine so
+// sibling clients on the same backend are unaffected (the HOL fix).
+// The inner gate-wait select observes replenishTimerCh so credit
+// replenishment retries are not delayed by bandwidth pressure — see
+// TestBufferedConn_GateDoesNotBlockReplenishRetry.
+//
+// replenishTimerCh may be nil at the moment drain enters the gate loop:
+// intentional, because `consumed` cannot change while drain is
+// suspended in the gate (no Write has happened since gate entry), so
+// no credits are pending replenishment. A future refactor that adds
+// another writer to `consumed` must re-verify this invariant.
 func (bc *bufferedConn) drain() {
 	defer close(bc.done)
 	var consumed int64
@@ -154,9 +245,16 @@ func (bc *bufferedConn) drain() {
 	// storm of a perpetual ticker when many bufferedConns are mostly idle.
 	var replenishTimer *time.Timer
 	var replenishTimerCh <-chan time.Time
+	// Hoisted gate wait timer: reused across iterations of the gate loop
+	// to avoid per-iteration `time.After` allocations under sustained
+	// bandwidth pressure. Canonical Go Stop-drain-Reset pattern.
+	var gateWaitTimer *time.Timer
 	defer func() {
 		if replenishTimer != nil {
 			replenishTimer.Stop()
+		}
+		if gateWaitTimer != nil {
+			gateWaitTimer.Stop()
 		}
 	}()
 
@@ -166,27 +264,30 @@ func (bc *bufferedConn) drain() {
 			replenishTimerCh = replenishTimer.C
 			return
 		}
-		// Drain a stale firing if any, then reset.
-		if !replenishTimer.Stop() {
-			select {
-			case <-replenishTimer.C:
-			default:
-			}
-		}
+		stopAndDrainTimer(replenishTimer)
 		replenishTimer.Reset(replenishTickerInterval)
 		replenishTimerCh = replenishTimer.C
 	}
 
 	disarmReplenishTimer := func() {
 		if replenishTimer != nil {
-			if !replenishTimer.Stop() {
-				select {
-				case <-replenishTimer.C:
-				default:
-				}
-			}
+			stopAndDrainTimer(replenishTimer)
 		}
 		replenishTimerCh = nil
+	}
+
+	// resetGateTimer arms/reuses the hoisted gateWaitTimer for duration d
+	// and returns its channel for selection. Lazily allocates the timer
+	// on first use — drains that never block on the gate (the common
+	// case when no scheduler is configured) pay zero allocation.
+	resetGateTimer := func(d time.Duration) <-chan time.Time {
+		if gateWaitTimer == nil {
+			gateWaitTimer = time.NewTimer(d)
+			return gateWaitTimer.C
+		}
+		stopAndDrainTimer(gateWaitTimer)
+		gateWaitTimer.Reset(d)
+		return gateWaitTimer.C
 	}
 
 	tryReplenish := func() {
@@ -227,10 +328,65 @@ func (bc *bufferedConn) drain() {
 			bc.flushRemaining()
 			return
 		case data := <-bc.writeCh:
+			// Bandwidth gate wait loop. Blocks on a shared per-backend
+			// deficit, but only this drain goroutine blocks — siblings on
+			// the same backend run independently. Observes quit, replenish
+			// retry, and the wait timer. On quit during wait, best-effort
+			// writes the in-flight frame (no Refund needed — all Requests
+			// during the wait returned false, no reservation held).
+			//
+			// gateEntry is stamped lazily on the FIRST denied Request,
+			// not on every entry — frames that pass the gate on their
+			// first call don't pay for a time.Now() syscall.
+			if bc.gate != nil {
+				var gateEntry time.Time
+				blockedAtLeastOnce := false
+			GateLoop:
+				for {
+					allowed, wait := bc.gate.Request(len(data))
+					if allowed {
+						break GateLoop
+					}
+					if !blockedAtLeastOnce {
+						gateEntry = time.Now()
+						blockedAtLeastOnce = true
+					}
+					select {
+					case <-bc.quit:
+						// Teardown during gate wait. No reservation held
+						// (Request returned false every iteration). Best-
+						// effort write the in-flight frame, then flush.
+						if bc.writeTimeout > 0 {
+							_ = bc.Conn.SetWriteDeadline(time.Now().Add(bc.writeTimeout))
+						}
+						_, _ = bc.Conn.Write(data)
+						bc.flushRemaining()
+						return
+					case <-replenishTimerCh:
+						// Credit replenishment retry must make progress
+						// even while drain is bandwidth-blocked.
+						bc.innerGateReplenishObserved.Add(1)
+						tryReplenish()
+					case <-resetGateTimer(wait):
+					}
+				}
+				if blockedAtLeastOnce && bc.gateBlockObserver != nil {
+					bc.gateBlockObserver(time.Since(gateEntry))
+				}
+			}
+
 			if bc.writeTimeout > 0 {
 				_ = bc.Conn.SetWriteDeadline(time.Now().Add(bc.writeTimeout))
 			}
 			if _, err := bc.Conn.Write(data); err != nil {
+				if bc.gate != nil {
+					// Record even on TCP write failure: the bytes have
+					// already crossed the backend↔proxy WS link, so they
+					// must count against the cap regardless of whether
+					// downstream delivery succeeded. NOT refunded — see
+					// the bandwidthGate doc comment.
+					bc.gate.Record(len(data))
+				}
 				log.Printf("WARN: bufferedConn drain write failed: %v", err)
 				// Signal quit so Write() returns immediately instead of
 				// enqueuing data that will never be drained. Close the
@@ -239,6 +395,9 @@ func (bc *bufferedConn) drain() {
 				bc.closeOnce.Do(func() { close(bc.quit) })
 				_ = bc.Conn.Close()
 				return
+			}
+			if bc.gate != nil {
+				bc.gate.Record(len(data))
 			}
 			bc.lastWriteAt.Store(time.Now().UnixNano())
 			consumed++
