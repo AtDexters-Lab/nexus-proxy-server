@@ -213,6 +213,23 @@ func (b *Backend) BandwidthGateStats() (events, millisTotal int64) {
 	return b.metrics.gateBlockEvents.Load(), b.metrics.gateBlockMillisTotal.Load()
 }
 
+// ClientWriteBufferDepth returns the current per-client writeCh depth
+// and true if the client exists on this backend. Exposed so integration
+// tests and observability code can verify that credit-based flow control
+// keeps the async write buffer within the credit window
+// (DefaultCreditCapacity) under sustained load.
+func (b *Backend) ClientWriteBufferDepth(clientID uuid.UUID) (int, bool) {
+	raw, ok := b.clients.Load(clientID)
+	if !ok {
+		return 0, false
+	}
+	bc, ok := raw.(*bufferedConn)
+	if !ok {
+		return 0, false
+	}
+	return bc.Depth(), true
+}
+
 // backendBandwidthGate adapts the per-backend bandwidth.Scheduler interface
 // to bufferedConn's bandwidthGate contract for the **downlink** path
 // (drain → TCP client). The uplink path (SendData → backend WS) charges

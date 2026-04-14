@@ -488,3 +488,11 @@ func (bc *bufferedConn) HasRecentWrite(since time.Time) bool {
 	lastWrite := bc.lastWriteAt.Load()
 	return lastWrite > 0 && lastWrite > since.UnixNano()
 }
+
+// Depth returns the current writeCh occupancy. Credit-obeying senders
+// keep this strictly below the credit window (DefaultCreditCapacity);
+// approaches to the 2× hard cap indicate a credit-contract violation.
+// Exposed for the per-client observability accessor on Backend.
+func (bc *bufferedConn) Depth() int {
+	return len(bc.writeCh)
+}

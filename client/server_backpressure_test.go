@@ -229,29 +229,92 @@ func TestCredits_Reverse_SkipDrainAtZero(t *testing.T) {
 	}
 }
 
-// TestCredits_Reverse_DrainFallsThroughOnClose verifies drain proceeds
-// at credits=0 when quit is closed (connection closing).
-func TestCredits_Reverse_DrainFallsThroughOnClose(t *testing.T) {
+// TestCredits_Reverse_ClosingKickstartFlushesOneBatch verifies the
+// closing-mode kickstart that breaks the proxy-sub-batch-deadlock:
+// when teardown finds credits=0 with queued data, the client grants
+// itself ONE batch (CreditReplenishBatch) of credits and flushes that
+// many frames past the official window. The proxy receives them,
+// crosses its consumed≥8 threshold, fires a real EventResumeStream,
+// and credit-gated drain resumes naturally for the rest of the queue.
+//
+// Without the kickstart: proxy's writeCh empties before reaching 8
+// consumed, no replenish ever fires, client deadlocks until
+// connectionDrainTimeout (Codex P1 from round 3).
+//
+// The kickstart is one-shot per connection-close — repeated drain
+// calls with credits=0 and queue non-empty after the first kickstart
+// just return waiting (verified by TestCredits_Reverse_ClosingKickstartIsOneShot).
+func TestCredits_Reverse_ClosingKickstartFlushesOneBatch(t *testing.T) {
 	c := newTestClient(t)
 	clientWS, _ := newWebsocketPair(t)
 
 	id := uuid.New()
 	cc, queue := makeTestConn(c, id)
 
-	queue <- outboundMessage{
-		messageType: websocket.BinaryMessage,
-		payload:     []byte("should_be_drained"),
+	// Seed exactly CreditReplenishBatch+1 frames so the kickstart batch
+	// drains and one frame remains in the queue (so we can verify the
+	// kickstart is bounded).
+	for i := 0; i < int(protocol.CreditReplenishBatch)+1; i++ {
+		queue <- outboundMessage{
+			messageType: websocket.BinaryMessage,
+			payload:     []byte{byte(i)},
+		}
 	}
-
 	cc.availableCredits.Store(0)
 	close(cc.quit)
 
 	c.drainConnectionQueue(clientWS, id, 4)
+	// drainConnectionQueue only drains maxMessages=4 per call; with the
+	// kickstart adding 8 credits, the first call drains 4. Re-invoke
+	// twice more to flush all 8 kickstart credits.
+	c.drainConnectionQueue(clientWS, id, 4)
+	c.drainConnectionQueue(clientWS, id, 4)
 
-	select {
-	case <-queue:
-		t.Fatal("message still in queue")
-	default:
+	// Exactly CreditReplenishBatch (=8) frames flushed past zero
+	// credits; the 9th frame stays in the queue waiting for a real
+	// EventResumeStream replenishment.
+	if remaining := len(queue); remaining != 1 {
+		t.Fatalf("kickstart drained %d frames — expected exactly CreditReplenishBatch=%d (1 frame should remain queued)",
+			int(protocol.CreditReplenishBatch)+1-remaining, protocol.CreditReplenishBatch)
+	}
+}
+
+// TestCredits_Reverse_ClosingKickstartIsOneShot verifies the
+// kickstart fires AT MOST ONCE per connection-close. If drain is
+// re-invoked after the kickstart is consumed (credits exhausted
+// again), the second call must return waiting — never re-grant
+// another batch — so total over-send is bounded at exactly
+// CreditReplenishBatch frames per close.
+func TestCredits_Reverse_ClosingKickstartIsOneShot(t *testing.T) {
+	c := newTestClient(t)
+	clientWS, _ := newWebsocketPair(t)
+
+	id := uuid.New()
+	cc, queue := makeTestConn(c, id)
+
+	// Seed 100 frames — well over what the kickstart can flush.
+	const seeded = 100
+	for i := 0; i < seeded; i++ {
+		queue <- outboundMessage{
+			messageType: websocket.BinaryMessage,
+			payload:     []byte{byte(i)},
+		}
+	}
+	cc.availableCredits.Store(0)
+	close(cc.quit)
+
+	// Loop drain calls: each pass should drain at most maxMessages=4
+	// from the kickstart budget, then return waiting once the 8
+	// kickstart credits are spent.
+	for i := 0; i < 50; i++ {
+		c.drainConnectionQueue(clientWS, id, 4)
+	}
+
+	drained := seeded - len(queue)
+	if int64(drained) > protocol.CreditReplenishBatch {
+		t.Fatalf("kickstart fired more than once: drained %d frames past credits — "+
+			"expected ≤ CreditReplenishBatch=%d (unbounded kickstart reintroduces writeCh overflow)",
+			drained, protocol.CreditReplenishBatch)
 	}
 }
 

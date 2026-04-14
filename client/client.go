@@ -57,9 +57,18 @@ const (
 	handshakeTimeout = 15 * time.Second
 	maxMessageSize   = 32*1024 + protocol.MessageHeaderLength
 
-	enqueueTimeout         = 5 * time.Second
-	controlQueueSize       = 64
-	connectionDrainTimeout = 5 * time.Second
+	enqueueTimeout   = 5 * time.Second
+	controlQueueSize = 64
+	// connectionDrainTimeout bounds the wait in transitionToClosed for
+	// the per-connection outbound queue to drain before force-closing.
+	// Sized so a slow downstream peer can flush the full 256-slot
+	// queue (4 MB at 16 KB/frame) at residential-grade rates: 30 s ÷
+	// 256 frames = ~120 ms/frame budget, comfortable for any peer
+	// faster than ~130 KB/s. Smaller values truncate large response
+	// tails on every graceful close (Codex P1 from the v0.3.10 review).
+	// Stuck-connection cleanup latency is bounded by this timeout, so
+	// don't push it past the order of "user-tolerable disconnect wait".
+	connectionDrainTimeout = 30 * time.Second
 
 	// Robustness stats keys (for observability, though we don't have metrics struct yet)
 	// We'll log them for now.
@@ -388,9 +397,37 @@ type clientConn struct {
 	forwardConsumed atomic.Int32
 
 	// Watchdog guard: prevents unbounded 10s probe cycles when credits
-	// are exhausted. Only one watchdog timer per connection. Cleared
-	// when a real replenishment (EventResumeStream with Credits > 0) arrives.
+	// are exhausted. At most one watchdog timer in flight per stall
+	// cycle (CAS on watchdogPending bounds concurrent arms).
+	//
+	// watchdogGen is a per-connection monotonic generation counter
+	// that EVERY armReplenishWatchdog call increments. The scheduled
+	// AfterFunc captures the generation at schedule time and checks
+	// it at fire time — if the connection has advanced past that
+	// generation (via a subsequent arm OR via an EventResumeStream
+	// invalidation), the timer body is a no-op. This makes the
+	// watchdog self-gating without depending on stop-vs-fire timing
+	// or atomic publication of a *time.Timer pointer (the previous
+	// pointer-based design had a publication race: AfterFunc was
+	// scheduled before the pointer was stored, so an EventResumeStream
+	// running between AfterFunc and Store would silently fail to stop
+	// the live timer, and a subsequent arm cycle's blind Store would
+	// orphan the stale timer indefinitely).
 	watchdogPending atomic.Bool
+	watchdogGen     atomic.Int64
+
+	// closingKickstartDone is set the first time drainConnectionQueue
+	// flushes a one-shot batch of frames past the credit window during
+	// teardown. The proxy's tryReplenish only fires at consumed >= 8,
+	// so a closing connection sitting at credits=0 with the proxy's
+	// writeCh and consumed counter both empty will deadlock waiting
+	// for a replenish that never comes — stalling teardown until
+	// connectionDrainTimeout. The kickstart sends up to one
+	// CreditReplenishBatch worth of frames past credits, just enough
+	// to push the proxy's consumed counter over the 8-frame threshold
+	// and trigger a real replenish, which restarts the credit-gated
+	// drain. Bounded at exactly one batch per connection-close.
+	closingKickstartDone atomic.Bool
 }
 
 // Atomic state transitions with validation
@@ -406,6 +443,68 @@ const (
 	// Write timeout for local connections
 	localWriteTimeout = 10 * time.Second
 )
+
+// isClosing reports whether the quit channel has been closed. Used by
+// drainConnectionQueue to route to the teardown flush path so pending
+// data can be best-effort delivered before the connection goes away
+// and closeOnDrained can fire to unblock transitionToClosed. Check is
+// non-blocking and safe from any goroutine.
+func (cc *clientConn) isClosing() bool {
+	select {
+	case <-cc.quit:
+		return true
+	default:
+		return false
+	}
+}
+
+// armReplenishWatchdog schedules a one-shot self-grant probe 10s into
+// the future if none is already pending. Called from every site that
+// queues data or fails a drain because availableCredits is exhausted.
+// Provides a single recovery attempt if an EventResumeStream was lost
+// to a transient control-plane drop.
+//
+// At most one timer is in flight per stall cycle: the CAS on
+// watchdogPending bounds concurrent arms. Every arm advances
+// watchdogGen, and every EventResumeStream advances it too — the
+// scheduled AfterFunc captures the generation at schedule time and
+// checks it at fire time, so any subsequent arm OR resume
+// retroactively invalidates the timer. This eliminates the
+// pointer-publication race that an earlier stop-on-resume design had:
+// time.AfterFunc is scheduled before any pointer is stored, so a
+// preempted Store racing against an EventResumeStream Stop could
+// orphan a live timer indefinitely. Generations are atomic by
+// construction — there is no pointer to publish.
+func (c *Client) armReplenishWatchdog(cc *clientConn) {
+	if !cc.watchdogPending.CompareAndSwap(false, true) {
+		return
+	}
+	gen := cc.watchdogGen.Add(1)
+	time.AfterFunc(10*time.Second, func() {
+		if cc.watchdogGen.Load() != gen {
+			return // Stale arm — invalidated by a later arm or by EventResumeStream.
+		}
+		if cc.availableCredits.Load() <= 0 {
+			log.Printf("WARN: [%s] No credit replenishment for %s in 10s, probing", c.config.Name, cc.id)
+			cc.availableCredits.Add(1)
+			c.reSignalDataReady(cc)
+		}
+	})
+}
+
+// clampReverseCredits enforces the maxReverseCreditCapacity ceiling on
+// a Credits value arriving from the proxy. Logs a WARN if the clamp
+// fires, which under a well-behaved proxy should never happen — if it
+// does, either the proxy is buggy, a message is corrupted, or an
+// attacker is attempting to disable the client's self-limit.
+func clampReverseCredits(backendName string, clientID uuid.UUID, credits int64) int64 {
+	if credits <= maxReverseCreditCapacity {
+		return credits
+	}
+	log.Printf("WARN: [%s] proxy credit grant %d for client %s exceeds cap %d; clamping",
+		backendName, credits, clientID, maxReverseCreditCapacity)
+	return maxReverseCreditCapacity
+}
 
 // safeClose closes the connection and quit channel exactly once, preventing double-close panics.
 // Safe to call even if conn is nil (pending dial).
@@ -1178,9 +1277,12 @@ func (c *Client) handleControlMessage(payload []byte) {
 		pendingClient.state.Store(uint32(ConnStatePending))
 		pendingClient.lastActivity.Store(time.Now().Unix())
 
-		// Initialize reverse credits (client → Nexus direction).
+		// Initialize reverse credits (client → Nexus direction). Clamp
+		// against an adversarial or corrupted proxy sending an oversized
+		// Credits value — symmetric defense with the proxy's own
+		// handleResumeStream clamp at maxForwardCreditCapacity.
 		if msg.Credits > 0 {
-			pendingClient.availableCredits.Store(msg.Credits)
+			pendingClient.availableCredits.Store(clampReverseCredits(c.config.Name, msg.ClientID, msg.Credits))
 		} else {
 			pendingClient.availableCredits.Store(math.MaxInt64) // old server, unlimited
 		}
@@ -1233,9 +1335,11 @@ func (c *Client) handleControlMessage(payload []byte) {
 			if msg.Success {
 				ch <- nil
 				// Store initial reverse credits for outbound connections.
+				// Same clamp as EventConnect — symmetric defense against
+				// adversarial proxy Credits field.
 				if conn, ok := c.localConns.Load(msg.ClientID); ok {
 					if msg.Credits > 0 {
-						conn.(*clientConn).availableCredits.Store(msg.Credits)
+						conn.(*clientConn).availableCredits.Store(clampReverseCredits(c.config.Name, msg.ClientID, msg.Credits))
 					} else {
 						conn.(*clientConn).availableCredits.Store(math.MaxInt64) // old server
 					}
@@ -1253,12 +1357,33 @@ func (c *Client) handleControlMessage(payload []byte) {
 		}
 
 	case protocol.EventResumeStream:
-		// Credit replenishment from Nexus (reverse direction).
+		// Credit replenishment from Nexus (reverse direction). Clamp
+		// the per-message grant (see maxReverseCreditCapacity). This
+		// prevents a single adversarial MaxInt64 from wrapping the
+		// atomic negative, and bounds per-grant defense-in-depth.
 		if val, ok := c.localConns.Load(msg.ClientID); ok {
 			conn := val.(*clientConn)
 			if msg.Credits > 0 {
-				conn.availableCredits.Add(msg.Credits)
-				conn.watchdogPending.Store(false) // real replenishment arrived, allow future watchdog
+				conn.availableCredits.Add(clampReverseCredits(c.config.Name, msg.ClientID, msg.Credits))
+				// Real replenishment: the previous stall (if any) is
+				// resolved. Clear watchdogPending so a future stall on
+				// this connection can re-arm, AND advance the watchdog
+				// generation so any in-flight AfterFunc from a previous
+				// arm cycle becomes a no-op when it fires (its captured
+				// generation will no longer match watchdogGen).
+				//
+				// The earlier pointer-based design (Stop-the-timer via
+				// watchdogTimer.Swap) had a publication race: AfterFunc
+				// was scheduled before the timer pointer was stored, so
+				// EventResumeStream could see a nil pointer and skip
+				// Stop(), then armReplenishWatchdog's delayed Store
+				// would install a stale handle that the next arm cycle
+				// blindly overwrote — orphaning the live stale timer,
+				// which would later fire and grant a phantom credit.
+				// The generation counter eliminates the publication
+				// race because there is no pointer to publish.
+				conn.watchdogPending.Store(false)
+				conn.watchdogGen.Add(1)
 				c.reSignalDataReady(conn)
 			}
 		}
@@ -1338,8 +1463,7 @@ func (c *Client) establishLocalConnection(req ConnectRequest, pendingClient *cli
 	}
 
 	// Check if pending connection was closed while we were dialing (e.g., disconnect received, buffer overflow)
-	select {
-	case <-pendingClient.quit:
+	if pendingClient.isClosing() {
 		conn.Close()
 		c.localConns.Delete(req.ClientID) // Ensure stale entry is removed
 		log.Printf("DEBUG: [%s] Pending connection closed during dial for client %s", c.config.Name, req.ClientID)
@@ -1351,7 +1475,6 @@ func (c *Client) establishLocalConnection(req ConnectRequest, pendingClient *cli
 			}
 		}
 		return
-	default:
 	}
 
 	// Complete the pending connection with mutex to prevent data race with safeClose
@@ -1362,13 +1485,11 @@ func (c *Client) establishLocalConnection(req ConnectRequest, pendingClient *cli
 	// Re-check if quit was closed during the conn assignment race window.
 	// If safeClose() ran while conn was nil, closeOnce consumed with nil conn,
 	// so we must close the newly assigned conn here to prevent FD leak.
-	select {
-	case <-pendingClient.quit:
+	if pendingClient.isClosing() {
 		conn.Close()
 		c.localConns.Delete(req.ClientID)
 		log.Printf("DEBUG: [%s] Connection closed during conn assignment for client %s", c.config.Name, req.ClientID)
 		return
-	default:
 	}
 
 	if !pendingClient.transition(ConnStatePending, ConnStateActive) {
@@ -1570,6 +1691,23 @@ func (c *Client) cleanupConnectionQueue(clientID uuid.UUID) {
 // Stranded sub-batch credits self-correct via the next burst on the same
 // client.
 const forwardCreditRetryInterval = 50 * time.Millisecond
+
+// drainBeforeDisconnectLogFmt is shared by the teardown-path and
+// normal-cleanup-path log lines so the messages don't drift if either
+// call site is edited.
+const drainBeforeDisconnectLogFmt = "INFO: [%s] Drained %d messages for ClientID %s before disconnect"
+
+// maxReverseCreditCapacity is the defensive upper bound on a single
+// EventConnect / EventOutboundResult / EventResumeStream Credits value
+// from the proxy. Mirrors the proxy-side maxForwardCreditCapacity clamp
+// at internal/hub/backend.go:handleResumeStream. Protects against a
+// malicious or buggy proxy sending MaxInt64 (which would either wrap
+// availableCredits negative or effectively disable the client's
+// self-limit, defeating the reverse-credit contract entirely).
+// 1<<20 == ~1M credits, far above any legitimate grant (the protocol
+// uses 64 initial + CreditReplenishBatch=8 per replenish).
+const maxReverseCreditCapacity int64 = 1 << 20
+
 
 // writeToLocal reads from the connection's write channel and writes to the local service.
 // This runs in a dedicated goroutine per connection to avoid blocking readPump.
@@ -1958,7 +2096,14 @@ func (c *Client) enqueueData(message outboundMessage) error {
 				if cConn, ok := conn.(*clientConn); ok {
 					// Suppress writePump signaling when out of credits.
 					// Data stays in the queue until credits are replenished.
+					// Arm the replenishment watchdog so a silently-dropped
+					// EventResumeStream can't strand this just-queued data
+					// indefinitely. The watchdog's CAS bounds concurrent
+					// timers; if a real replenishment arrives later the
+					// EventResumeStream handler clears the flag, allowing
+					// future stalls on the same connection to re-arm.
 					if cConn.availableCredits.Load() <= 0 {
+						c.armReplenishWatchdog(cConn)
 						return nil
 					}
 					if cConn.signaled.CompareAndSwap(false, true) {
@@ -1980,17 +2125,9 @@ func (c *Client) enqueueData(message outboundMessage) error {
 			// If out of credits, the queue is intentionally not draining.
 			// Loop back and wait rather than killing the connection.
 			if conn, ok := c.localConns.Load(clientID); ok {
-				if cConn, ok := conn.(*clientConn); ok {
-					// Check if connection is closing — exit immediately
-					// instead of waiting for the 30s auto-resume.
-					select {
-					case <-cConn.quit:
-					default:
-						if cConn.availableCredits.Load() <= 0 {
-							timer.Reset(enqueueTimeout)
-							continue
-						}
-					}
+				if cConn, ok := conn.(*clientConn); ok && !cConn.isClosing() && cConn.availableCredits.Load() <= 0 {
+					timer.Reset(enqueueTimeout)
+					continue
 				}
 			}
 			c.stats.enqueueTimeouts.Add(1)
@@ -2181,90 +2318,227 @@ func (c *Client) writePump(s *Session) {
 	}
 }
 
+// drainConnectionQueue drains the per-connection outbound queue, honoring
+// the reverse credit window. Called by writePump when dataReady fires and
+// by transitionToClosed's drain kick on teardown.
+//
+// Credit accounting invariants this function MUST preserve (an earlier
+// entry-only credit check allowed the main loop to push maxMessages−1
+// frames past zero and the race branch silently skipped the decrement,
+// jointly blowing the proxy's per-client writeCh — the v0.3.10 "client
+// write buffer full (128 pending)" incident):
+//
+//   - Every ws.WriteMessage for a data frame is paired with exactly one
+//     cConn.availableCredits.Add(-1) on the same send path.
+//   - Every site that returns early because credits are exhausted arms
+//     the replenishment watchdog (non-closing only) so a silently-dropped
+//     EventResumeStream cannot strand the connection.
+//   - Every closing-mode exit either (a) calls closeOnDrained when the
+//     queue has been fully drained, or (b) clears signaled so the next
+//     EventResumeStream will re-signal and resume draining. Otherwise
+//     transitionToClosed stalls on connectionDrainTimeout.
+//
+// Teardown is credit-gated, NOT a special "flush past credits" path.
+// The proxy's drain processes in-flight frames during the close
+// window (connectionDrainTimeout) and sends EventResumeStream back as
+// it makes progress; the
+// client's EventResumeStream handler calls reSignalDataReady, which
+// re-invokes drainConnectionQueue, which drains more. This is the
+// ONLY safe shape — a bounded-flush-past-credits teardown truncates
+// the tail of large responses (Codex P1), and an unbounded-flush-past-
+// credits teardown reproduces the original v0.3.10 writeCh overflow.
 func (c *Client) drainConnectionQueue(ws *websocket.Conn, clientID uuid.UUID, maxMessages int) {
 	queue := c.getQueue(clientID)
 	if queue == nil {
-		// Stale notification - connection was already cleaned up
+		// No per-connection queue. If the connection still exists and
+		// is in teardown, signal drained so transitionToClosed's wait
+		// doesn't stall the full connectionDrainTimeout — there's no
+		// data to flush. Without this, queue-less closes (e.g., a
+		// connection torn down before any data was queued) hang for
+		// 30 s on each disconnect (Codex round-5 P1).
+		if rawConn, ok := c.localConns.Load(clientID); ok {
+			if cConn, ok := rawConn.(*clientConn); ok && cConn.isClosing() {
+				cConn.closeOnDrained()
+			}
+		}
 		return
 	}
 
-	// Skip drain when out of credits — data stays in the queue, which
-	// fills and applies TCP backpressure to the local service.
-	// Exception: if the connection is closing (quit closed), fall through
-	// to the normal drain path so closeOnDrained fires and transitionToClosed
-	// doesn't stall on the drain timeout.
-	if conn, ok := c.localConns.Load(clientID); ok {
-		if cConn, ok := conn.(*clientConn); ok && cConn.availableCredits.Load() <= 0 {
-			select {
-			case <-cConn.quit:
-				// Connection closing — fall through to normal drain/cleanup
-			default:
-				cConn.signaled.Store(false) // allow re-signal on replenishment
-				// Watchdog: if no replenishment in 10s (dropped by
-				// SendControlMessage), self-grant 1 credit to probe.
-				// Guard: only one watchdog per connection to prevent
-				// infinite 10s probe cycles.
-				if cConn.watchdogPending.CompareAndSwap(false, true) {
-					time.AfterFunc(10*time.Second, func() {
-						if cConn.availableCredits.Load() <= 0 {
-							log.Printf("WARN: [%s] No credit replenishment for %s in 10s, probing", c.config.Name, cConn.id)
-							cConn.availableCredits.Add(1)
-							c.reSignalDataReady(cConn)
-						}
-						// Don't clear watchdogPending here — only a real
-						// replenishment (EventResumeStream) clears it.
-					})
+	rawConn, ok := c.localConns.Load(clientID)
+	if !ok {
+		return
+	}
+	cConn := rawConn.(*clientConn)
+
+	// Entry credit guard. No credits → clear signaled, return. In
+	// closing mode, also signal drained if the queue is already empty
+	// so transitionToClosed doesn't stall waiting for replenishment we
+	// don't need.
+	//
+	// Closing-mode kickstart (one-shot per connection): when credits
+	// hit zero AND the queue still has data AND we haven't already
+	// kickstarted, grant ourselves CreditReplenishBatch credits
+	// (matching the proxy's tryReplenish threshold). This unsticks the
+	// "client at credits=0, proxy at consumed<8 with empty writeCh"
+	// deadlock that would otherwise stall teardown until
+	// connectionDrainTimeout (Codex P1 from round 3): the proxy never
+	// emits a sub-batch replenishment, so we have to push it over the
+	// threshold ourselves. Bounded at one batch per connection-close,
+	// so total over-send is ≤ CreditReplenishBatch frames. The proxy
+	// drains those, crosses 8, fires a real replenishment, and
+	// credit-gated drain resumes naturally for the rest of the queue.
+	//
+	// Watchdog arm is non-closing only — a closing connection relies
+	// on the kickstart + natural replenishments, not a self-probe.
+	if cConn.availableCredits.Load() <= 0 {
+		cConn.signaled.Store(false)
+		if cConn.isClosing() {
+			// Race-check: enqueueData may push a final FIN frame
+			// between our len() observation and closeOnDrained.
+			// The atomic select-pull pattern catches the race; if a
+			// last frame raced in, fall through so the kickstart can
+			// pick it up. The frame goes back into the queue via the
+			// fall-through path's main loop only because we can't
+			// un-pull from a channel — so we have to handle this
+			// pulled message inline.
+			if len(queue) == 0 {
+				select {
+				case msg := <-queue:
+					// Last-moment FIN: send past credits as a
+					// one-frame race exception. Bounded at 1 frame
+					// per drain call (and only on this exact race),
+					// far under the writeCh hard cap. Same idea as
+					// the kickstart but for a 1-frame race window.
+					ws.SetWriteDeadline(time.Now().Add(writeWait))
+					_ = c.writeMessage(ws, msg)
+					cConn.availableCredits.Add(-1)
+				default:
+					cConn.closeOnDrained()
+					return
 				}
+				cConn.closeOnDrained()
 				return
 			}
+			if cConn.closingKickstartDone.CompareAndSwap(false, true) {
+				cConn.availableCredits.Add(protocol.CreditReplenishBatch)
+				// Fall through to the main loop to drain the kickstart batch.
+			} else {
+				return
+			}
+		} else {
+			// Arm the watchdog ONLY if there's actually queued data
+			// waiting on credits. An idle drain on an empty queue
+			// (e.g., the round-robin re-signal at drained==maxMessages
+			// firing on a connection whose queue just emptied) would
+			// otherwise burn the connection's one-shot recovery probe
+			// and leak a phantom credit 10s later — Codex P2.
+			if len(queue) > 0 {
+				c.armReplenishWatchdog(cConn)
+			}
+			return
 		}
 	}
 
 	drained := 0
-	queueEmpty := false
 	for i := 0; i < maxMessages; i++ {
+		if cConn.availableCredits.Load() <= 0 {
+			break
+		}
 		select {
 		case msg := <-queue:
 			ws.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.writeMessage(ws, msg); err != nil {
 				return // Write error will be caught by main loop ping or next write
 			}
-			// Consume one reverse credit per WebSocket write.
-			if conn, ok := c.localConns.Load(clientID); ok {
-				conn.(*clientConn).availableCredits.Add(-1)
-			}
+			cConn.availableCredits.Add(-1)
 			drained++
 		default:
-			queueEmpty = true
-			goto cleanup // P0 fix: Don't return early, go through signaling cleanup
+			goto mainLoopDone
 		}
 	}
+mainLoopDone:
 
-cleanup:
-	conn, ok := c.localConns.Load(clientID)
-	if !ok {
-		return // Connection gone
-	}
-	cConn := conn.(*clientConn)
-
-	// Log when drain actually flushed data for a closing connection (observability).
 	if drained > 0 && cConn.state.Load() == uint32(ConnStateClosed) {
-		log.Printf("INFO: [%s] Drained %d messages for ClientID %s before disconnect", c.config.Name, drained, clientID)
+		log.Printf(drainBeforeDisconnectLogFmt, c.config.Name, drained, clientID)
 	}
 
-	if queueEmpty || drained < maxMessages {
-		// Queue is empty - clear signaled flag so we can be notified again
+	// Re-check isClosing here — quit may have been closed mid-drain by
+	// transitionToClosed while the main loop was running. Without this
+	// re-check, a drain that enters the non-closing path and then
+	// completes after quit closes would fall through to the non-closing
+	// cleanup branch and never call closeOnDrained, stalling
+	// transitionToClosed for the full connectionDrainTimeout (Codex P2).
+	if cConn.isClosing() {
+		cConn.signaled.Store(false)
+		// Race-check: enqueueData may push a final frame between our
+		// len() observation and closeOnDrained — same race as the
+		// entry-guard closing branch. Atomic select-pull catches it.
+		if len(queue) == 0 {
+			select {
+			case msg := <-queue:
+				ws.SetWriteDeadline(time.Now().Add(writeWait))
+				_ = c.writeMessage(ws, msg)
+				cConn.availableCredits.Add(-1)
+			default:
+				cConn.closeOnDrained()
+				return
+			}
+			cConn.closeOnDrained()
+			return
+		}
+		// Queue still has data. Clear signaled so the next
+		// EventResumeStream arrival re-invokes drain; or, if we still
+		// have credits after the main loop, re-signal immediately to
+		// continue draining in this close window.
+		if cConn.availableCredits.Load() > 0 {
+			select {
+			case c.dataReady <- clientID:
+				cConn.signaled.Store(true)
+			default:
+				go func(id uuid.UUID) {
+					select {
+					case c.dataReady <- id:
+					case <-c.ctx.Done():
+					}
+				}(clientID)
+				cConn.signaled.Store(true)
+			}
+		}
+		return
+	}
+
+	// Normal cleanup (non-closing). `drained < maxMessages` implies we
+	// exited the main loop early — either the queue emptied or credits
+	// were exhausted mid-drain.
+	if drained < maxMessages {
 		cConn.signaled.Store(false)
 
-		// Race check: Use select to safely check if data arrived after we thought queue was empty
+		// Credits were exhausted mid-loop. Arm the watchdog ONLY if
+		// the queue still has data to drain. Burning the one-shot
+		// watchdog on a credit-exhaustion that happens to coincide
+		// with an empty queue (a normal burst that finishes on a
+		// credit boundary) wastes the connection's only recovery
+		// probe — a later real stall would have no recovery path.
+		if cConn.availableCredits.Load() <= 0 {
+			if len(queue) > 0 {
+				c.armReplenishWatchdog(cConn)
+			}
+			return
+		}
+
+		// Race check: enqueueData may have pushed a new message into the
+		// queue between the main loop's default-branch exit and our
+		// signaled.Store(false) above. Drain exactly one message if so.
+		// This branch MUST decrement credits and MUST honor the credit
+		// guard above — omitting the decrement was the other root cause
+		// of the v0.3.10 prod writeCh overflow.
 		select {
 		case msg := <-queue:
-			// Race: new data arrived - send it immediately to preserve ordering
 			ws.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.writeMessage(ws, msg); err != nil {
-				return // Write error will be caught by main loop
+				return
 			}
-			// Re-signal since there might be more data
+			cConn.availableCredits.Add(-1)
 			if cConn.signaled.CompareAndSwap(false, true) {
 				select {
 				case c.dataReady <- clientID:
@@ -2278,25 +2552,29 @@ cleanup:
 				}
 			}
 		default:
-			// Truly empty, signaled flag is cleared.
-			// If connection is closed, signal that drain is complete.
-			if cConn.state.Load() == uint32(ConnStateClosed) {
-				cConn.closeOnDrained()
+		}
+		return
+	}
+
+	// Filled maxMessages — queue may have more, re-signal for fair
+	// round-robin. The re-signal is unconditional (even if the queue
+	// happens to be empty right now) because returning here without
+	// clearing signaled or re-signaling creates a missed-wakeup race:
+	// enqueueData would see signaled==true and skip its own push, so
+	// the connection wedges until an unrelated event clears signaled.
+	// The next drainConnectionQueue call handles the empty-queue case
+	// gracefully via the entry credit guard, which only arms the
+	// watchdog when credits are exhausted AND data is actually queued
+	// — see the entry-guard `len(queue) > 0` condition.
+	select {
+	case c.dataReady <- clientID:
+	default:
+		go func(id uuid.UUID) {
+			select {
+			case c.dataReady <- id:
+			case <-c.ctx.Done():
 			}
-		}
-	} else {
-		// Processed maxMessages but queue may have more - re-queue for round-robin fairness
-		select {
-		case c.dataReady <- clientID:
-		default:
-			// Must not drop continuation signal
-			go func(id uuid.UUID) {
-				select {
-				case c.dataReady <- id:
-				case <-c.ctx.Done():
-				}
-			}(clientID)
-		}
+		}(clientID)
 	}
 }
 
