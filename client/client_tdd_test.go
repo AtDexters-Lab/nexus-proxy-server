@@ -152,6 +152,7 @@ func TestWritePumpDoesNotReplayStaleMessages(t *testing.T) {
 		session:  session1, // Bind to dead session 1
 		quit:     make(chan struct{}),
 	}
+	cc.credits = newCreditLedger(staleID, 0, maxReverseCreditCapacity, c.ledgerNotify(cc))
 	c.localConns.Store(staleID, cc)
 	go c.copyLocalToNexus(cc)
 
@@ -207,6 +208,7 @@ func TestTransitionToClosedNoStaleDisconnect(t *testing.T) {
 		quit:     make(chan struct{}),
 		drained:  make(chan struct{}),
 	}
+	cc.credits = newCreditLedger(staleID, 0, maxReverseCreditCapacity, c.ledgerNotify(cc))
 	c.localConns.Store(staleID, cc)
 
 	// transitionToClosed should NOT enqueue a disconnect (session is dead).
@@ -252,6 +254,7 @@ func TestTransitionToClosedNoStaleDisconnectAfterReconnect(t *testing.T) {
 		quit:     make(chan struct{}),
 		drained:  make(chan struct{}),
 	}
+	cc.credits = newCreditLedger(staleID, 0, maxReverseCreditCapacity, c.ledgerNotify(cc))
 	c.localConns.Store(staleID, cc)
 
 	c.transitionToClosed(cc, DisconnectNormal)
@@ -292,6 +295,7 @@ func TestTransitionToClosedDrainPathNoStaleDisconnectAfterReconnect(t *testing.T
 		quit:     make(chan struct{}),
 		drained:  make(chan struct{}),
 	}
+	cc.credits = newCreditLedger(staleID, 0, maxReverseCreditCapacity, c.ledgerNotify(cc))
 	cc.state.Store(uint32(ConnStateActive))
 	c.localConns.Store(staleID, cc)
 	c.getOrCreateQueue(staleID)

@@ -18,7 +18,7 @@ import (
 // credits were 1, 2, or 3, the loop over-sent by 3, 2, or 1 frames — every
 // frame an uncounted send that showed up on the proxy's per-client writeCh.
 //
-// Sets availableCredits to each of 1, 2, 3 (the overshoot-triggering values)
+// Sets the ledger credit count to each of 1, 2, 3 (the overshoot-triggering values)
 // and asserts that drainConnectionQueue sends exactly the granted number,
 // never more. Runs fast so CI catches any revert of the per-iteration check
 // long before the 12-second e2e reproducer would.
@@ -34,7 +34,7 @@ func TestDrainConnectionQueue_PerIterationCreditGuard(t *testing.T) {
 
 			id := uuid.New()
 			cc, queue := makeTestConn(c, id)
-			cc.availableCredits.Store(credits)
+			cc.credits.SetAvailableForTest(credits)
 
 			// Saturate the queue so the main loop never exits via the
 			// "queue empty" default branch — any overshoot therefore has
@@ -57,8 +57,8 @@ func TestDrainConnectionQueue_PerIterationCreditGuard(t *testing.T) {
 				t.Fatalf("drained %d messages with %d credits — expected exactly %d (over-send of %d frames exposes the prod writeCh overflow bug)",
 					drained, credits, credits, drained-credits)
 			}
-			if remaining := cc.availableCredits.Load(); remaining != 0 {
-				t.Fatalf("availableCredits = %d after drain — expected 0 (credit accounting drifted)",
+			if remaining := cc.credits.Available(); remaining != 0 {
+				t.Fatalf("credits.Available() = %d after drain — expected 0 (credit accounting drifted)",
 					remaining)
 			}
 			_ = serverWS
@@ -81,7 +81,7 @@ func TestDrainConnectionQueue_MidLoopExhaustionArmsWatchdog(t *testing.T) {
 
 	id := uuid.New()
 	cc, queue := makeTestConn(c, id)
-	cc.availableCredits.Store(2) // drain 2 → credits=0 mid-loop
+	cc.credits.SetAvailableForTest(2) // drain 2 → credits=0 mid-loop
 
 	// Seed 5 messages so the queue is non-empty when we run out of credits.
 	for i := 0; i < 5; i++ {
@@ -93,12 +93,12 @@ func TestDrainConnectionQueue_MidLoopExhaustionArmsWatchdog(t *testing.T) {
 
 	c.drainConnectionQueue(clientWS, id, 4)
 
-	if !cc.watchdogPending.Load() {
-		t.Fatal("watchdog was not armed after mid-loop credit exhaustion — " +
+	if !cc.credits.ProbeFiredForTest() {
+		t.Fatal("stall probe was not armed after mid-loop credit exhaustion — " +
 			"a dropped EventResumeStream will now strand this connection forever")
 	}
-	if remaining := cc.availableCredits.Load(); remaining != 0 {
-		t.Fatalf("availableCredits = %d after drain — expected 0", remaining)
+	if remaining := cc.credits.Available(); remaining != 0 {
+		t.Fatalf("credits.Available() = %d after drain — expected 0", remaining)
 	}
 	if drained := int64(5) - int64(len(queue)); drained != 2 {
 		t.Fatalf("drained %d messages with 2 credits — expected exactly 2", drained)
@@ -132,7 +132,7 @@ func TestDrainConnectionQueue_ClosingDrainsWithinCreditWindow(t *testing.T) {
 
 	// Plenty of credits (mirroring the active-phase state at the moment
 	// the close arrived). state=Closed + quit closed = teardown.
-	cc.availableCredits.Store(protocol.DefaultCreditCapacity)
+	cc.credits.SetAvailableForTest(protocol.DefaultCreditCapacity)
 	cc.state.Store(uint32(ConnStateClosed))
 	close(cc.quit)
 
@@ -179,9 +179,12 @@ func TestDrainConnectionQueue_ClosingDrainBoundedAfterKickstart(t *testing.T) {
 		}
 	}
 
-	cc.availableCredits.Store(0)
 	cc.state.Store(uint32(ConnStateClosed))
 	close(cc.quit)
+	cc.credits.KickstartAndClose(protocol.CreditReplenishBatch)
+	// Simulate a would-be second kickstart (e.g., a racing teardown
+	// path in a future refactor). The closed CAS must make it a no-op.
+	cc.credits.KickstartAndClose(protocol.CreditReplenishBatch)
 
 	// Drain repeatedly. Each call should drain at most maxMessages from
 	// the kickstart budget; once the 8-credit kickstart is exhausted,
@@ -200,7 +203,7 @@ func TestDrainConnectionQueue_ClosingDrainBoundedAfterKickstart(t *testing.T) {
 
 // TestReverseCredits_ClampOnAdversarialGrant is the regression guard
 // for security Finding 1: the client must clamp adversarial Credits
-// values from the proxy to prevent (a) wrapping availableCredits
+// values from the proxy to prevent (a) wrapping the ledger credit counter
 // negative via back-to-back MaxInt64 Adds and (b) effectively
 // disabling the reverse-credit self-limit. Mirrors the proxy-side
 // maxForwardCreditCapacity clamp at
@@ -214,7 +217,6 @@ func TestReverseCredits_ClampOnAdversarialGrant(t *testing.T) {
 
 	id := uuid.New()
 	cc, _ := makeTestConn(c, id)
-	cc.availableCredits.Store(0)
 
 	c.wg.Add(1)
 	go c.readPump()
@@ -232,13 +234,13 @@ func TestReverseCredits_ClampOnAdversarialGrant(t *testing.T) {
 	})
 	time.Sleep(50 * time.Millisecond)
 
-	got := cc.availableCredits.Load()
+	got := cc.credits.Available()
 	if got > maxReverseCreditCapacity {
-		t.Fatalf("availableCredits = %d after adversarial MaxInt64 grant — expected clamp to ≤ %d",
+		t.Fatalf("credits.Available() = %d after adversarial MaxInt64 grant — expected clamp to ≤ %d",
 			got, maxReverseCreditCapacity)
 	}
 	if got <= 0 {
-		t.Fatalf("availableCredits = %d — expected positive clamped value, not wrapped-negative or zero",
+		t.Fatalf("credits.Available() = %d — expected positive clamped value, not wrapped-negative or zero",
 			got)
 	}
 }
@@ -264,35 +266,36 @@ func TestWatchdog_GenerationInvalidatesStaleTimers(t *testing.T) {
 
 	id := uuid.New()
 	cc, _ := makeTestConn(c, id)
-	cc.availableCredits.Store(0)
 
-	gen0 := cc.watchdogGen.Load()
+	gen0 := cc.credits.ProbeGenForTest()
 
-	c.armReplenishWatchdog(cc)
-	gen1 := cc.watchdogGen.Load()
+	// Arming the stall probe is driven by NotifyEnqueue (enqueueData
+	// path) or DrainYielded (drain-loop path). TryAcquire itself does
+	// not arm — an empty-queue drain call must not burn the one-shot
+	// probe (see TestDrainConnectionQueue_MidLoopExhaustionEmptyQueueSkipsWatchdog).
+	cc.credits.NotifyEnqueue()
+	gen1 := cc.credits.ProbeGenForTest()
 	if gen1 == gen0 {
-		t.Fatalf("first arm did not advance watchdogGen (still %d)", gen1)
+		t.Fatalf("first arm did not advance probeGen (still %d)", gen1)
 	}
 
-	// Simulate EventResumeStream: clear pending + advance gen.
-	// (Mirrors the production handler at the EventResumeStream case.)
-	cc.watchdogPending.Store(false)
-	cc.watchdogGen.Add(1)
-	gen2 := cc.watchdogGen.Load()
+	// Simulate EventResumeStream: clear probe + advance gen.
+	cc.credits.ResetStallCycleForTest()
+	gen2 := cc.credits.ProbeGenForTest()
 	if gen2 == gen1 {
-		t.Fatalf("EventResumeStream did not advance watchdogGen (still %d)", gen2)
+		t.Fatalf("EventResumeStream did not advance probeGen (still %d)", gen2)
 	}
 
-	// New stall cycle: re-arm. Should advance gen again.
-	c.armReplenishWatchdog(cc)
-	gen3 := cc.watchdogGen.Load()
+	// New stall cycle: re-arm via NotifyEnqueue at available=0.
+	cc.credits.NotifyEnqueue()
+	gen3 := cc.credits.ProbeGenForTest()
 	if gen3 == gen2 {
-		t.Fatalf("re-arm after EventResumeStream did not advance watchdogGen (still %d)", gen3)
+		t.Fatalf("re-arm after EventResumeStream did not advance probeGen (still %d)", gen3)
 	}
 
 	// Verify the chain: each step advanced.
 	if !(gen0 < gen1 && gen1 < gen2 && gen2 < gen3) {
-		t.Fatalf("watchdogGen did not advance monotonically: %d → %d → %d → %d", gen0, gen1, gen2, gen3)
+		t.Fatalf("probeGen did not advance monotonically: %d → %d → %d → %d", gen0, gen1, gen2, gen3)
 	}
 }
 
@@ -311,22 +314,25 @@ func TestWatchdog_SingleProbePerLifetime(t *testing.T) {
 
 	id := uuid.New()
 	cc, _ := makeTestConn(c, id)
-	cc.availableCredits.Store(0)
 
-	c.armReplenishWatchdog(cc)
-	if !cc.watchdogPending.Load() {
-		t.Fatal("first arm did not set watchdogPending")
+	// NotifyEnqueue (enqueueData path) is the arming entry point.
+	// TryAcquire intentionally does not arm — empty-queue drains must
+	// not burn the one-shot probe (see
+	// TestDrainConnectionQueue_MidLoopExhaustionEmptyQueueSkipsWatchdog).
+	cc.credits.NotifyEnqueue()
+	if !cc.credits.ProbeFiredForTest() {
+		t.Fatal("first arm did not set probeFired")
 	}
 
-	// Simulate multiple subsequent drain-exhaustion calls. Every
-	// single one MUST hit the CAS-fail path and not schedule a new
-	// AfterFunc — otherwise we accumulate probe timers that each leak
-	// a frame on fire, reproducing the Codex P2 finding.
+	// Simulate multiple subsequent enqueueData calls hitting
+	// credits=0. Every single one MUST hit the CAS-fail path and not
+	// schedule a new AfterFunc — otherwise we accumulate probe timers
+	// that each leak a frame on fire, reproducing the Codex P2 finding.
 	for i := 0; i < 10; i++ {
-		c.armReplenishWatchdog(cc)
+		cc.credits.NotifyEnqueue()
 	}
-	if !cc.watchdogPending.Load() {
-		t.Fatal("watchdogPending cleared after repeated arm calls — " +
+	if !cc.credits.ProbeFiredForTest() {
+		t.Fatal("probeFired cleared after repeated arm calls — " +
 			"the single-probe invariant is broken and a legitimate stall " +
 			"will escalate to disconnect over ~21 minutes")
 	}
@@ -363,7 +369,7 @@ func TestDrainConnectionQueue_ClosingDrainsFullQueueAcrossReplenishCycles(t *tes
 			payload:     []byte{byte(i)},
 		}
 	}
-	cc.availableCredits.Store(int64(seeded))
+	cc.credits.SetAvailableForTest(int64(seeded))
 	cc.state.Store(uint32(ConnStateClosed))
 	close(cc.quit)
 
@@ -414,7 +420,7 @@ func TestDrainConnectionQueue_NoQueueClosingSignalsDrained(t *testing.T) {
 	cc.state.Store(uint32(ConnStateActive))
 	cc.session.connected.Store(true)
 	cc.session.done = make(chan struct{})
-	cc.availableCredits.Store(64)
+	cc.credits = newCreditLedger(id, 64, maxReverseCreditCapacity, c.ledgerNotify(cc))
 	c.localConns.Store(id, cc)
 	close(cc.quit)
 
@@ -430,15 +436,17 @@ func TestDrainConnectionQueue_NoQueueClosingSignalsDrained(t *testing.T) {
 
 // TestDrainConnectionQueue_FullDrainNeverWedges is the regression
 // guard for the Codex round-4 finding: when drain finishes with
-// drained==maxMessages, the round-robin re-signal must always push
-// dataReady (or otherwise ensure enqueueData can re-signal). An
-// earlier optimization that returned early on len(queue)==0 left
-// signaled=true, so a frame enqueued just after the check would see
-// signaled==true via enqueueData's CAS and skip its own dataReady
-// push — wedging the connection until an unrelated event cleared
-// signaled. After the fix, even an empty-queue round-robin re-signal
-// must result in either a dataReady push OR signaled cleared so that
-// enqueueData can re-signal.
+// drained==maxMessages on a now-empty queue, an enqueueData push
+// that races in MUST be able to re-wake the drainer. Under the
+// ledger design (RFC §3), DrainYielded clears signaled BEFORE
+// sampling hasMoreFn — that ordering closes the race because any
+// enqueueData CAS landing after the clear will CAS false→true and
+// push dataReady.
+//
+// Post-cutover assertion: after the drain returns on a now-empty
+// queue, signaled MUST be observable as false. If it isn't, a
+// concurrent enqueueData's CAS would fail and its dataReady push
+// would be skipped — wedging the connection.
 func TestDrainConnectionQueue_FullDrainNeverWedges(t *testing.T) {
 	c := newTestClient(t)
 	clientWS, _ := newWebsocketPair(t)
@@ -458,32 +466,15 @@ func TestDrainConnectionQueue_FullDrainNeverWedges(t *testing.T) {
 			payload:     []byte{byte(i)},
 		}
 	}
-	cc.availableCredits.Store(int64(maxMessages))
-
-	// Pre-set signaled to true (matching the state writePump set when
-	// it scheduled this drain call).
-	cc.signaled.Store(true)
+	cc.credits.SetAvailableForTest(int64(maxMessages))
+	cc.credits.ForceSignaledForTest(true)
 
 	c.drainConnectionQueue(clientWS, id, maxMessages)
 
-	// After drain, EITHER dataReady must contain a fresh signal (the
-	// round-robin re-signal fired) OR signaled must be cleared so
-	// enqueueData can re-signal on the next message. Both are
-	// acceptable wakeup-preserving behaviors; both prevent the wedge.
-	dataReadyHasSignal := false
-	select {
-	case gotID := <-c.dataReady:
-		if gotID == id {
-			dataReadyHasSignal = true
-		}
-	default:
-	}
-	signaledCleared := !cc.signaled.Load()
-
-	if !dataReadyHasSignal && !signaledCleared {
-		t.Fatal("after full-batch drain on now-empty queue, neither dataReady was re-signaled " +
-			"nor signaled was cleared — a frame enqueued now would see signaled=true via " +
-			"enqueueData's CAS and skip dataReady, wedging the connection (Codex round-4 P1)")
+	if cc.credits.SignaledForTest() {
+		t.Fatal("after full-batch drain on now-empty queue, signaled is still true — " +
+			"a racing enqueueData would see signaled=true via its CAS and skip the " +
+			"dataReady push, wedging the connection (Codex round-4 P1)")
 	}
 }
 
@@ -520,12 +511,12 @@ func TestDrainConnectionQueue_MidLoopExhaustionEmptyQueueSkipsWatchdog(t *testin
 			payload:     []byte{byte(i)},
 		}
 	}
-	cc.availableCredits.Store(int64(seeded))
+	cc.credits.SetAvailableForTest(int64(seeded))
 
 	c.drainConnectionQueue(clientWS, id, maxMessages)
 
-	if cc.watchdogPending.Load() {
-		t.Fatal("watchdog armed even though the queue was already empty after drain — " +
+	if cc.credits.ProbeFiredForTest() {
+		t.Fatal("stall probe armed even though the queue was already empty after drain — " +
 			"the connection's one-shot recovery probe is now burned without a real stall to recover from")
 	}
 }
@@ -559,7 +550,7 @@ func TestDrainConnectionQueue_MidDrainQuitCloseSignalsDrained(t *testing.T) {
 		messageType: websocket.BinaryMessage,
 		payload:     []byte{0},
 	}
-	cc.availableCredits.Store(protocol.DefaultCreditCapacity)
+	cc.credits.SetAvailableForTest(protocol.DefaultCreditCapacity)
 
 	// Simulate the race: quit is not closed when drain enters, but IS
 	// closed by the time cleanup re-checks isClosing. Since the unit
@@ -584,6 +575,55 @@ func TestDrainConnectionQueue_MidDrainQuitCloseSignalsDrained(t *testing.T) {
 	}
 }
 
+// TestDrainConnectionQueue_SmallQueueClosingSynchronousTeardown is the
+// regression guard for the RFC v3→v4 N1 fix: when a small queue
+// (smaller than CreditReplenishBatch) is flushed during teardown, the
+// defer-based closeOnDrained in drainConnectionQueue must fire
+// immediately once the queue empties. Without the defer (as in the
+// v3 design), the drain exits via an early-return branch that was
+// missing the closeOnDrained call, stalling transitionToClosed for
+// the full connectionDrainTimeout (30s) on every graceful close.
+// This test asserts cc.drained is selectable within 10ms — 3000x
+// below the 30s regression signal.
+func TestDrainConnectionQueue_SmallQueueClosingSynchronousTeardown(t *testing.T) {
+	c := newTestClient(t)
+	clientWS, _ := newWebsocketPair(t)
+	c.wsMu.Lock()
+	c.ws = clientWS
+	c.wsMu.Unlock()
+
+	id := uuid.New()
+	cc, queue := makeTestConn(c, id)
+
+	// Seed a queue SMALLER than the kickstart batch so the drain
+	// empties the queue mid-batch and the early-return `default`
+	// branch fires with room left on the kickstart budget.
+	const seeded = 5
+	for i := 0; i < seeded; i++ {
+		queue <- outboundMessage{
+			messageType: websocket.BinaryMessage,
+			payload:     []byte{byte(i)},
+		}
+	}
+	cc.state.Store(uint32(ConnStateClosed))
+	close(cc.quit)
+	cc.credits.KickstartAndClose(protocol.CreditReplenishBatch) // 8 credits
+
+	// First drain call consumes maxMessages=4. Second call empties.
+	c.drainConnectionQueue(clientWS, id, 4)
+	c.drainConnectionQueue(clientWS, id, 4)
+
+	if len(queue) != 0 {
+		t.Fatalf("small-queue teardown left %d frames undrained", len(queue))
+	}
+	select {
+	case <-cc.drained:
+	case <-time.After(10 * time.Millisecond):
+		t.Fatal("closeOnDrained was not called on small-queue teardown within 10ms — " +
+			"drainConnectionQueue early-return branch is missing the defer guard (RFC v3 N1 regression)")
+	}
+}
+
 // TestDrainConnectionQueue_ClosingSignalsDrainedEvenWithEmptyQueue is a
 // narrower variant of the above that catches the case where the queue
 // is already empty at teardown entry. The teardown path must still call
@@ -598,7 +638,6 @@ func TestDrainConnectionQueue_ClosingSignalsDrainedEvenWithEmptyQueue(t *testing
 
 	id := uuid.New()
 	cc, _ := makeTestConn(c, id)
-	cc.availableCredits.Store(0)
 	cc.state.Store(uint32(ConnStateClosed))
 	close(cc.quit)
 

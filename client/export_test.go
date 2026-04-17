@@ -13,8 +13,8 @@ func (l *creditLedger) UnlimitedForTest() bool     { return l.unlimited.Load() }
 func (l *creditLedger) ForceSignaledForTest(v bool) { l.signaled.Store(v) }
 func (l *creditLedger) SetAvailableForTest(n int64) { l.available.Store(n) }
 
-// ResetStallCycleForTest simulates the side effect of Replenish(n>0)
-// on stall-cycle state. Used by tests that mid-test poke
-// watchdogPending.Store(false) + watchdogGen.Add(1) against today's
-// clientConn to simulate post-EventResumeStream state.
+// ResetStallCycleForTest simulates the stall-cycle side effect of
+// Replenish(n>0) — clears probeFired and advances probeGen — so
+// tests can force a post-replenishment state without running the
+// full Replenish path.
 func (l *creditLedger) ResetStallCycleForTest() { l.clearStallCycle() }

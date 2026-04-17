@@ -106,6 +106,11 @@ func newCreditLedger(id uuid.UUID, initial, maxCap int64, notify func()) *credit
 // TryAcquire attempts to spend one credit. Never blocks. Does not
 // gate on closed — per I5, kickstart credits added by
 // KickstartAndClose must be spendable after Close.
+//
+// Stall-probe arming is NOT done here: an empty-queue drain call that
+// returns early on credits==0 must not burn the one-shot probe.
+// DrainYielded and NotifyEnqueue decide whether to arm based on
+// whether there is actually queued data waiting on credits.
 func (l *creditLedger) TryAcquire() bool {
 	if l.unlimited.Load() {
 		return true
@@ -113,9 +118,6 @@ func (l *creditLedger) TryAcquire() bool {
 	for {
 		cur := l.available.Load()
 		if cur <= 0 {
-			if !l.closed.Load() {
-				l.armStallProbe()
-			}
 			return false
 		}
 		if l.available.CompareAndSwap(cur, cur-1) {

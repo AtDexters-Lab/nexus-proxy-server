@@ -30,6 +30,7 @@ func makeTestConn(c *Client, id uuid.UUID) (*clientConn, chan outboundMessage) {
 	cc.state.Store(uint32(ConnStateActive))
 	cc.session.connected.Store(true)
 	cc.session.done = make(chan struct{})
+	cc.credits = newCreditLedger(id, 0, maxReverseCreditCapacity, c.ledgerNotify(cc))
 	c.localConns.Store(id, cc)
 	c.getOrCreateQueue(id)
 	return cc, c.getQueue(id)
@@ -80,7 +81,7 @@ func setupTestListener(t *testing.T, c *Client) int {
 }
 
 // TestCredits_Reverse_InitialFromConnect verifies that Credits in
-// EventConnect are stored as initial availableCredits.
+// EventConnect seed the ledger's initial credit grant.
 func TestCredits_Reverse_InitialFromConnect(t *testing.T) {
 	c := newTestClient(t)
 	port := setupTestListener(t, c)
@@ -112,9 +113,9 @@ func TestCredits_Reverse_InitialFromConnect(t *testing.T) {
 		t.Fatal("connection not created")
 	}
 	cc := val.(*clientConn)
-	got := cc.availableCredits.Load()
+	got := cc.credits.Available()
 	if got != 42 {
-		t.Fatalf("availableCredits = %d, want 42", got)
+		t.Fatalf("credits.Available() = %d, want 42", got)
 	}
 
 	c.cancel()
@@ -155,9 +156,9 @@ func TestCredits_Reverse_UnlimitedWhenZero(t *testing.T) {
 		t.Fatal("connection not created")
 	}
 	cc := val.(*clientConn)
-	got := cc.availableCredits.Load()
+	got := cc.credits.Available()
 	if got != math.MaxInt64 {
-		t.Fatalf("availableCredits = %d, want MaxInt64", got)
+		t.Fatalf("credits.Available() = %d, want MaxInt64", got)
 	}
 
 	c.cancel()
@@ -166,13 +167,12 @@ func TestCredits_Reverse_UnlimitedWhenZero(t *testing.T) {
 }
 
 // TestCredits_Reverse_SuppressSignalingAtZero verifies that enqueueData
-// does NOT signal dataReady when availableCredits <= 0.
+// does NOT signal dataReady when credits are exhausted (<= 0).
 func TestCredits_Reverse_SuppressSignalingAtZero(t *testing.T) {
 	c := newTestClient(t)
 
 	id := uuid.New()
-	cc, queue := makeTestConn(c, id)
-	cc.availableCredits.Store(0)
+	_, queue := makeTestConn(c, id)
 
 	header := make([]byte, 1+protocol.ClientIDLength)
 	header[0] = protocol.ControlByteData
@@ -213,8 +213,7 @@ func TestCredits_Reverse_SkipDrainAtZero(t *testing.T) {
 		payload:     []byte("should_not_be_drained"),
 	}
 
-	cc.availableCredits.Store(0)
-	cc.signaled.Store(true)
+	cc.credits.ForceSignaledForTest(true)
 
 	c.drainConnectionQueue(clientWS, id, 4)
 
@@ -224,7 +223,7 @@ func TestCredits_Reverse_SkipDrainAtZero(t *testing.T) {
 		t.Fatal("drainConnectionQueue dequeued data despite credits=0")
 	}
 
-	if cc.signaled.Load() {
+	if cc.credits.SignaledForTest() {
 		t.Fatal("signaled flag not cleared")
 	}
 }
@@ -260,8 +259,8 @@ func TestCredits_Reverse_ClosingKickstartFlushesOneBatch(t *testing.T) {
 			payload:     []byte{byte(i)},
 		}
 	}
-	cc.availableCredits.Store(0)
 	close(cc.quit)
+	cc.credits.KickstartAndClose(protocol.CreditReplenishBatch)
 
 	c.drainConnectionQueue(clientWS, id, 4)
 	// drainConnectionQueue only drains maxMessages=4 per call; with the
@@ -300,8 +299,12 @@ func TestCredits_Reverse_ClosingKickstartIsOneShot(t *testing.T) {
 			payload:     []byte{byte(i)},
 		}
 	}
-	cc.availableCredits.Store(0)
 	close(cc.quit)
+	cc.credits.KickstartAndClose(protocol.CreditReplenishBatch)
+	// A second KickstartAndClose must be a no-op — the closed CAS
+	// gates the grant. This guards I6's at-most-one-per-lifetime
+	// bound against a future refactor that loses the CAS.
+	cc.credits.KickstartAndClose(protocol.CreditReplenishBatch)
 
 	// Loop drain calls: each pass should drain at most maxMessages=4
 	// from the kickstart budget, then return waiting once the 8
@@ -319,7 +322,7 @@ func TestCredits_Reverse_ClosingKickstartIsOneShot(t *testing.T) {
 }
 
 // TestCredits_Reverse_Replenish verifies EventResumeStream with Credits
-// adds to availableCredits and re-signals dataReady.
+// adds to the ledger's credit count and re-signals dataReady.
 func TestCredits_Reverse_Replenish(t *testing.T) {
 	c := newTestClient(t)
 	clientWS, serverWS := newWebsocketPair(t)
@@ -329,7 +332,6 @@ func TestCredits_Reverse_Replenish(t *testing.T) {
 
 	id := uuid.New()
 	cc, _ := makeTestConn(c, id)
-	cc.availableCredits.Store(0)
 
 	c.wg.Add(1)
 	go c.readPump()
@@ -342,9 +344,9 @@ func TestCredits_Reverse_Replenish(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	got := cc.availableCredits.Load()
+	got := cc.credits.Available()
 	if got != 16 {
-		t.Fatalf("availableCredits = %d, want 16", got)
+		t.Fatalf("credits.Available() = %d, want 16", got)
 	}
 
 	select {
@@ -426,8 +428,6 @@ func TestCredits_Reverse_RetryEnqueueAtZero(t *testing.T) {
 		queue <- outboundMessage{payload: []byte("filler")}
 	}
 
-	cc.availableCredits.Store(0)
-
 	header := make([]byte, 1+protocol.ClientIDLength)
 	header[0] = protocol.ControlByteData
 	copy(header[1:], id[:])
@@ -447,7 +447,7 @@ func TestCredits_Reverse_RetryEnqueueAtZero(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 
-	cc.availableCredits.Store(10)
+	cc.credits.Replenish(10)
 	<-queue
 
 	select {

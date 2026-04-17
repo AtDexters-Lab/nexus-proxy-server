@@ -2,7 +2,11 @@ package client
 
 import (
 	"math"
+	"os"
+	"path/filepath"
+	"regexp"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -252,22 +256,21 @@ func TestCreditLedger_ConcurrentTryAcquireNeverOverSpends(t *testing.T) {
 func TestCreditLedger_StallProbeOneShotArming(t *testing.T) {
 	// The stall-probe interval is 10s, too long for a unit test to
 	// observe a real fire. Instead we validate the one-shot arming
-	// semantics via the observable probeFired/probeGen state.
+	// semantics via the observable probeFired/probeGen state. Probe
+	// arming is driven by NotifyEnqueue (or DrainYielded with hasMore),
+	// not TryAcquire — TryAcquire cannot distinguish an empty-queue
+	// drain from a credit-exhausted drain with queued data.
 	l := newCreditLedger(uuid.New(), 0, testMaxCap, noopNotify)
 	defer l.Close()
 
-	if l.TryAcquire() {
-		t.Fatal("TryAcquire should fail on empty ledger")
-	}
+	l.NotifyEnqueue()
 	if !l.ProbeFiredForTest() {
-		t.Fatal("probeFired should be set after first TryAcquire on 0 credits")
+		t.Fatal("probeFired should be set after NotifyEnqueue on 0 credits")
 	}
 	gen1 := l.ProbeGenForTest()
 
-	// Second TryAcquire on empty: CAS fails, no new arm.
-	if l.TryAcquire() {
-		t.Fatal("TryAcquire should fail")
-	}
+	// Second NotifyEnqueue on empty: CAS fails, no new arm.
+	l.NotifyEnqueue()
 	if gen := l.ProbeGenForTest(); gen != gen1 {
 		t.Fatalf("probeGen advanced on redundant arm: gen1=%d cur=%d", gen1, gen)
 	}
@@ -281,13 +284,11 @@ func TestCreditLedger_StallProbeOneShotArming(t *testing.T) {
 		t.Fatalf("probeGen did not advance after Replenish: gen1=%d cur=%d", gen1, gen)
 	}
 
-	// Spend the Replenish, then empty-TryAcquire arms a fresh cycle.
+	// Spend the Replenish, then NotifyEnqueue arms a fresh cycle.
 	if !l.TryAcquire() {
 		t.Fatal("TryAcquire should succeed after Replenish")
 	}
-	if l.TryAcquire() {
-		t.Fatal("TryAcquire should fail on exhausted ledger")
-	}
+	l.NotifyEnqueue()
 	if !l.ProbeFiredForTest() {
 		t.Fatal("probeFired should be set for the new stall cycle")
 	}
@@ -296,9 +297,7 @@ func TestCreditLedger_StallProbeOneShotArming(t *testing.T) {
 func TestCreditLedger_StallProbeClosedGate(t *testing.T) {
 	l := newCreditLedger(uuid.New(), 0, testMaxCap, noopNotify)
 	l.Close()
-	if l.TryAcquire() {
-		t.Fatal("TryAcquire should fail on empty ledger")
-	}
+	l.NotifyEnqueue()
 	if l.ProbeFiredForTest() {
 		t.Fatal("closed ledger should not arm a stall probe")
 	}
@@ -316,10 +315,10 @@ func TestCreditLedger_StallProbeFalseAlarmClearsProbeFired(t *testing.T) {
 	l := newCreditLedger(uuid.New(), 0, testMaxCap, noopNotify)
 	defer l.Close()
 
-	// Arm the probe.
-	if l.TryAcquire() {
-		t.Fatal("TryAcquire should fail on empty ledger")
-	}
+	// Arm the probe via NotifyEnqueue on an empty ledger (mirrors the
+	// production path where enqueueData pushes a frame and sees
+	// credits==0).
+	l.NotifyEnqueue()
 	if !l.ProbeFiredForTest() {
 		t.Fatal("probeFired should be set after arm")
 	}
@@ -347,9 +346,9 @@ func TestCreditLedger_StallProbeFiresOnceAndSelfGrantsOne(t *testing.T) {
 	l := newCreditLedger(uuid.New(), 0, testMaxCap, notify)
 	defer l.Close()
 
-	if l.TryAcquire() {
-		t.Fatal("TryAcquire should fail on empty ledger")
-	}
+	// NotifyEnqueue arms the probe on credits==0 (mirrors a production
+	// enqueueData push onto an empty-credit ledger).
+	l.NotifyEnqueue()
 	time.Sleep(50 * time.Millisecond)
 	if got := l.Available(); got != 1 {
 		t.Fatalf("Available=%d after probe fire, want exactly 1", got)
@@ -690,10 +689,9 @@ func TestCreditLedger_InitCreditsClearsProbeState(t *testing.T) {
 	l := newCreditLedger(uuid.New(), 0, testMaxCap, noopNotify)
 	defer l.Close()
 
-	// Arm the probe during pending.
-	if l.TryAcquire() {
-		t.Fatal("TryAcquire should fail during pending")
-	}
+	// Arm the probe during pending via NotifyEnqueue (mirrors an
+	// enqueueData push landing while outboundConnect is still pending).
+	l.NotifyEnqueue()
 	if !l.ProbeFiredForTest() {
 		t.Fatal("probeFired should be set during pending")
 	}
@@ -708,7 +706,8 @@ func TestCreditLedger_InitCreditsClearsProbeState(t *testing.T) {
 		t.Fatalf("probeGen did not advance: gen1=%d cur=%d", gen1, gen)
 	}
 
-	// Spend the 2 credits, exhaust, and verify a fresh probe arms.
+	// Spend the 2 credits, exhaust, and verify a fresh probe arms via
+	// NotifyEnqueue (mirrors the production path).
 	for i := 0; i < 2; i++ {
 		if !l.TryAcquire() {
 			t.Fatalf("iter %d: TryAcquire should succeed post-init", i)
@@ -717,6 +716,7 @@ func TestCreditLedger_InitCreditsClearsProbeState(t *testing.T) {
 	if l.TryAcquire() {
 		t.Fatal("TryAcquire should fail on exhausted post-init ledger")
 	}
+	l.NotifyEnqueue()
 	if !l.ProbeFiredForTest() {
 		t.Fatal("probeFired should be set on post-init exhaustion (clearStallCycle allowed re-arm)")
 	}
@@ -913,5 +913,149 @@ func TestCreditLedger_InitCreditsHappensBefore(t *testing.T) {
 	if got := spent.Load(); got != 32 {
 		t.Fatalf("spent=%d, want 32", got)
 	}
+}
+
+// ---------------------------------------------------------------------
+// DrainYielded: missed-wakeup race ordering
+// ---------------------------------------------------------------------
+
+// TestCreditLedger_DrainYieldedClearsSignaledBeforeHasMore actively
+// exercises the RFC §3 ordering invariant: DrainYielded MUST clear
+// signaled before sampling hasMoreFn. Without this ordering, an
+// enqueueData push that races between drain's queue-sample and
+// signaled-clear would slip through both ends of the CAS and wedge
+// the connection.
+//
+// The test passes a hasMoreFn that asserts signaled is already false
+// when invoked. If a future refactor inverts the ordering (sample
+// queue THEN clear signaled), the assertion fires from inside
+// hasMoreFn and the test fails. Previously,
+// TestDrainConnectionQueue_FullDrainNeverWedges passed vacuously
+// against this design because DrainYielded unconditionally cleared
+// signaled; strengthening that test to catch the ordering regression
+// was RFC-mandated.
+func TestCreditLedger_DrainYieldedClearsSignaledBeforeHasMore(t *testing.T) {
+	l := newCreditLedger(uuid.New(), 4, testMaxCap, noopNotify)
+	defer l.Close()
+
+	// Pre-condition: pretend drain was scheduled (signaled=true) —
+	// matches the state writePump leaves after pushing to dataReady.
+	l.ForceSignaledForTest(true)
+
+	var observedSignaled bool
+	hasMoreObserved := false
+	hasMore := func() bool {
+		// This runs inside DrainYielded, AFTER Store(false) and
+		// BEFORE any other branch. If the ordering is inverted,
+		// observedSignaled is true (refactor regression).
+		observedSignaled = l.SignaledForTest()
+		hasMoreObserved = true
+		return false // simulate empty queue → no re-notify
+	}
+
+	l.DrainYielded(hasMore)
+
+	if !hasMoreObserved {
+		t.Fatal("hasMoreFn was never called — DrainYielded short-circuited unexpectedly")
+	}
+	if observedSignaled {
+		t.Fatal("hasMoreFn observed signaled=true — DrainYielded sampled queue BEFORE clearing signaled. " +
+			"This reintroduces the missed-wakeup race the RFC §3 ordering was designed to close.")
+	}
+}
+
+// TestCreditLedger_DrainYieldedRenotifiesOnHasMore is the complementary
+// guard for the re-notify branch: when hasMoreFn reports work and
+// credits remain, DrainYielded must re-signal the drainer so the
+// caller loop re-enters drainConnectionQueue. Without this, a
+// drained==maxMessages exit with queue still full would stall until
+// the next producer or replenish.
+func TestCreditLedger_DrainYieldedRenotifiesOnHasMore(t *testing.T) {
+	notify, notifyCount := countingNotify()
+	l := newCreditLedger(uuid.New(), 4, testMaxCap, notify)
+	defer l.Close()
+
+	l.DrainYielded(func() bool { return true })
+
+	if got := notifyCount.Load(); got != 1 {
+		t.Fatalf("notify fired %d times on hasMore=true + credits>0, want 1", got)
+	}
+	if !l.SignaledForTest() {
+		t.Fatal("signaled should be re-latched after re-notify")
+	}
+}
+
+// ---------------------------------------------------------------------
+// Call-site audits: I6 and I8 caller-uniqueness regression guards
+// ---------------------------------------------------------------------
+
+// TestCreditLedger_KickstartAndCloseHasExactlyOneCallSite pins the
+// per-lifetime one-batch bound (I6) to a single production caller.
+// A refactor that adds a second KickstartAndClose call would silently
+// double the over-send bound; this grep-based audit catches that
+// regression at test time.
+func TestCreditLedger_KickstartAndCloseHasExactlyOneCallSite(t *testing.T) {
+	assertSingleCallSite(t, "KickstartAndClose")
+}
+
+// TestCreditLedger_InitCreditsHasExactlyOneCallSite pins the
+// one-shot init contract (I8) to a single production caller. A second
+// InitCredits call would panic at runtime, but this grep-based audit
+// catches the regression earlier — at test time, before a release
+// ever sees the panic.
+func TestCreditLedger_InitCreditsHasExactlyOneCallSite(t *testing.T) {
+	assertSingleCallSite(t, "InitCredits")
+}
+
+func assertSingleCallSite(t *testing.T, method string) {
+	t.Helper()
+	matches, err := grepCallSites(method)
+	if err != nil {
+		t.Fatalf("grep failed: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected exactly 1 production call site of .credits.%s(), got %d: %v",
+			method, len(matches), matches)
+	}
+}
+
+// callSitePattern matches `.credits.<method>(` — anchored to the
+// ledger receiver so a hypothetical future method with a similar
+// suffix (e.g., `FooInitCredits`) cannot false-match. Whitespace
+// around `.credits.` permits formatter preferences without weakening
+// the anchor.
+func callSitePattern(method string) *regexp.Regexp {
+	return regexp.MustCompile(`\.credits\.` + regexp.QuoteMeta(method) + `\(`)
+}
+
+// grepCallSites returns one match per invocation of
+// `.credits.<method>(` in the package's non-test `.go` files, skipping
+// leading `//` comment lines.
+func grepCallSites(method string) ([]string, error) {
+	entries, err := filepath.Glob("*.go")
+	if err != nil {
+		return nil, err
+	}
+	pattern := callSitePattern(method)
+	var matches []string
+	for _, path := range entries {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "//") {
+				continue
+			}
+			if pattern.MatchString(line) {
+				matches = append(matches, path+": "+trimmed)
+			}
+		}
+	}
+	return matches, nil
 }
 
