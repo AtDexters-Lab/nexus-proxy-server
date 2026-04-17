@@ -249,8 +249,14 @@ done:
 	t.Logf("bytes delivered to slow consumer: %d / %d", totalRead.Load(), fileSize)
 	t.Logf("writeCh depth peak: %d (credit window: %d, hard cap: %d) across %d samples",
 		peakDepth.Load(), protocol.DefaultCreditCapacity, 2*protocol.DefaultCreditCapacity, sampleCount.Load())
-	if int64(peakDepth.Load()) > protocol.DefaultCreditCapacity {
-		t.Fatalf("writeCh peak %d exceeded credit window %d — prod overflow reproduced",
-			peakDepth.Load(), protocol.DefaultCreditCapacity)
+	// Peak writeCh depth must not exceed credit_window + one
+	// replenish batch. A batch of CreditReplenishBatch frames can
+	// legitimately arrive at the hub before its drain has processed
+	// the pre-replenish backlog, so the soft cap sits strictly below
+	// the 2*credit_window hard cap that triggered the prod overflow.
+	const maxAcceptablePeak = protocol.DefaultCreditCapacity + protocol.CreditReplenishBatch
+	if int64(peakDepth.Load()) > maxAcceptablePeak {
+		t.Fatalf("writeCh peak %d exceeded credit window + one replenish batch (%d) — prod overflow reproduced",
+			peakDepth.Load(), maxAcceptablePeak)
 	}
 }
