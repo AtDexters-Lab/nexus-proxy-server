@@ -105,8 +105,17 @@ func (l *Listener) handleConnection(conn net.Conn) {
 		localPort = tcpAddr.Port
 	}
 
+	// Shared absolute deadline bounds total peek duration per connection,
+	// including the TLS-then-HTTP fallback. Prevents per-phase budgets from
+	// compounding into 2×AbsoluteMax socket holdtime.
+	peekTimeouts := PeekTimeouts{
+		FirstByte:     l.config.PeekFirstByteTimeout(),
+		IdleExtension: l.config.PeekIdleExtension(),
+		AbsDeadline:   time.Now().Add(l.config.PeekAbsoluteMax()),
+	}
+
 	// Try TLS SNI first using a robust aborted handshake.
-	sni, tlsPrelude, tlsErr := PeekSNIAndPrelude(conn, 5*time.Second, 32<<10)
+	sni, tlsPrelude, tlsErr := PeekSNIAndPrelude(conn, peekTimeouts, 32<<10)
 	tlsDetected := errors.Is(tlsErr, ErrMissingSNI)
 	if tlsErr == nil && sni != "" {
 		routeKey = hn.Normalize(sni)
@@ -118,7 +127,7 @@ func (l *Listener) handleConnection(conn net.Conn) {
 			conn = WithPrelude(conn, tlsPrelude)
 		}
 		// Fallback to HTTP Host sniffing on plaintext.
-		host, path, httpPrelude, httpErr := PeekHTTPHostAndPrelude(conn, 5*time.Second, 64<<10)
+		host, path, httpPrelude, httpErr := PeekHTTPHostAndPrelude(conn, peekTimeouts, 64<<10)
 		if httpErr == nil && host != "" {
 			routeKey = host
 			prelude = httpPrelude

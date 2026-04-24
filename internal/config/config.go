@@ -68,6 +68,21 @@ type Config struct {
 	MaxOutboundConnsPerBackend int   `yaml:"maxOutboundConnsPerBackend"` // 0 → default 100; -1 = no limit
 	OutboundDialTimeoutSeconds int   `yaml:"outboundDialTimeoutSeconds"` // default 10
 	OutboundIdleTimeoutSeconds int   `yaml:"outboundIdleTimeoutSeconds"` // 0 = no deadline
+
+	// PeekTimeouts governs the deadline regime for the TLS/HTTP protocol-sniff
+	// pass on every inbound connection. AbsoluteMaxSeconds is shared across
+	// the TLS-then-HTTP fallback so a single connection's total peek time is
+	// capped, not doubled. See proxy.PeekTimeouts for full semantics.
+	PeekTimeouts PeekTimeoutsConfig `yaml:"peekTimeouts"`
+}
+
+// PeekTimeoutsConfig is the YAML shape for proxy.PeekTimeouts. Any field set
+// to 0 (or omitted) falls back to the default returned by the matching
+// accessor on Config.
+type PeekTimeoutsConfig struct {
+	FirstByteSeconds     int `yaml:"firstByteSeconds"`
+	IdleExtensionSeconds int `yaml:"idleExtensionSeconds"`
+	AbsoluteMaxSeconds   int `yaml:"absoluteMaxSeconds"`
 }
 
 // IdleTimeout returns the idle timeout as a time.Duration.
@@ -161,6 +176,40 @@ func (c *Config) OutboundIdleTimeout() time.Duration {
 		return 0
 	}
 	return time.Duration(c.OutboundIdleTimeoutSeconds) * time.Second
+}
+
+// PeekFirstByteTimeout returns the initial read deadline for protocol sniffing
+// (before any byte is observed). Defaults to 15s — chosen to accommodate
+// embedded clients doing ECDHE keygen between TCP accept and ClientHello.
+// Note: runtime clamps this to PeekAbsoluteMax in proxy.PeekTimeouts, so a
+// hardening config that lowers AbsoluteMax alone effectively lowers the
+// first-byte wait to match.
+func (c *Config) PeekFirstByteTimeout() time.Duration {
+	if c.PeekTimeouts.FirstByteSeconds <= 0 {
+		return 15 * time.Second
+	}
+	return time.Duration(c.PeekTimeouts.FirstByteSeconds) * time.Second
+}
+
+// PeekIdleExtension returns the duration added to the peek read deadline on
+// every successful kernel-level Read. Defaults to 5s — generous enough for
+// legitimate inter-packet gaps on unstable links. Runtime clamps the extended
+// deadline to PeekAbsoluteMax.
+func (c *Config) PeekIdleExtension() time.Duration {
+	if c.PeekTimeouts.IdleExtensionSeconds <= 0 {
+		return 5 * time.Second
+	}
+	return time.Duration(c.PeekTimeouts.IdleExtensionSeconds) * time.Second
+}
+
+// PeekAbsoluteMax returns the hard ceiling on total peek duration per
+// connection. Defaults to 30s, aligning with common client SO_SNDTIMEO and
+// bounding per-connection slowloris exposure.
+func (c *Config) PeekAbsoluteMax() time.Duration {
+	if c.PeekTimeouts.AbsoluteMaxSeconds <= 0 {
+		return 30 * time.Second
+	}
+	return time.Duration(c.PeekTimeouts.AbsoluteMaxSeconds) * time.Second
 }
 
 // validate performs comprehensive validation of the loaded configuration.
@@ -260,6 +309,25 @@ func (c *Config) validate() error {
 	}
 	if c.OutboundIdleTimeoutSeconds < 0 {
 		return fmt.Errorf("outboundIdleTimeoutSeconds cannot be negative")
+	}
+
+	if c.PeekTimeouts.FirstByteSeconds < 0 {
+		return fmt.Errorf("peekTimeouts.firstByteSeconds cannot be negative")
+	}
+	if c.PeekTimeouts.IdleExtensionSeconds < 0 {
+		return fmt.Errorf("peekTimeouts.idleExtensionSeconds cannot be negative")
+	}
+	if c.PeekTimeouts.AbsoluteMaxSeconds < 0 {
+		return fmt.Errorf("peekTimeouts.absoluteMaxSeconds cannot be negative")
+	}
+	// Reject only *explicit* contradictions: operator sets both FirstByte and
+	// AbsoluteMax with First > Abs. A hardening config that lowers AbsoluteMax
+	// alone (leaving FirstByte at default) is permitted — runtime clamping in
+	// PeekTimeouts.initialDeadline handles the asymmetry.
+	if c.PeekTimeouts.FirstByteSeconds > 0 && c.PeekTimeouts.AbsoluteMaxSeconds > 0 &&
+		c.PeekTimeouts.FirstByteSeconds > c.PeekTimeouts.AbsoluteMaxSeconds {
+		return fmt.Errorf("peekTimeouts.firstByteSeconds (%d) cannot exceed peekTimeouts.absoluteMaxSeconds (%d)",
+			c.PeekTimeouts.FirstByteSeconds, c.PeekTimeouts.AbsoluteMaxSeconds)
 	}
 	for _, p := range c.AllowedOutboundPorts {
 		if p < 1 || p > 65535 {

@@ -55,15 +55,20 @@ func (c *limitedCapture) copyBytes() []byte {
 
 // PeekHTTPHostAndPrelude uses net/http to parse the request line and headers
 // to extract the Host and Path, while teeing all bytes read so they can be
-// replayed to the backend as a prelude. It limits time via deadline; maximum
-// header size is enforced by http.ReadRequest and the outer deadline.
-func PeekHTTPHostAndPrelude(conn net.Conn, timeout time.Duration, maxPrelude int) (host string, path string, prelude []byte, err error) {
-	// Apply deadline to protect against slow headers.
-	_ = conn.SetReadDeadline(time.Now().Add(timeout))
-	defer conn.SetReadDeadline(time.Time{})
+// replayed to the backend as a prelude. Deadline behavior is governed by
+// timeouts (see PeekTimeouts); AbsDeadline may be shared with an earlier TLS
+// peek call so a single connection's total peek budget is bounded.
+func PeekHTTPHostAndPrelude(conn net.Conn, timeouts PeekTimeouts, maxPrelude int) (host string, path string, prelude []byte, err error) {
+	_ = conn.SetReadDeadline(timeouts.initialDeadline())
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 
+	rolling := &rollingDeadlineConn{
+		Conn:        conn,
+		idleExt:     timeouts.IdleExtension,
+		absDeadline: timeouts.AbsDeadline,
+	}
 	captured := newLimitedCapture(maxPrelude)
-	tee := io.TeeReader(conn, captured)
+	tee := io.TeeReader(rolling, captured)
 	br := bufio.NewReader(tee)
 
 	req, rerr := http.ReadRequest(br)

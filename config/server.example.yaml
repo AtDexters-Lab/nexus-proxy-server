@@ -38,6 +38,29 @@ relayPorts:
 # Set to 0 to disable idle timeouts.
 idleTimeoutSeconds: 60
 
+# --- Protocol-sniff Peek Timeouts ---
+# Nexus peeks every inbound TCP connection to extract the TLS SNI or HTTP Host
+# before routing. These knobs tune the deadline regime:
+#   - firstByteSeconds: initial wait for the first byte from the client. Must
+#     accommodate slow-start clients (e.g., embedded devices doing ECDHE
+#     keygen between TCP accept and ClientHello emission).
+#   - idleExtensionSeconds: added to the deadline on every successful read,
+#     so a steadily-transmitting client stays patient; bounded by absolute
+#     max.
+#   - absoluteMaxSeconds: hard ceiling on total peek time per connection. This
+#     ceiling is SHARED across TLS peek + HTTP sniff fallback — it does not
+#     double. Bounds slowloris-style socket holdtime exposure.
+# Any field set to 0 (or omitted) falls back to the default shown below.
+# Defaults trade slowloris exposure (~30s/conn vs prior ~10s) for embedded
+# client compatibility. For internet-facing deployments without upstream DDoS
+# protection AND where clients are not expected to be slow-start (no embedded
+# devices, no high-latency/lossy networks), tighten absoluteMaxSeconds to
+# 5–10 to restore the pre-rolling-deadline posture.
+# peekTimeouts:
+#   firstByteSeconds: 15
+#   idleExtensionSeconds: 5
+#   absoluteMaxSeconds: 30
+
 # --- Port Claims (TCP/UDP) ---
 # Backends may optionally "claim" whole ports (e.g. 53) via JWT claims.
 # For safety, claims are only accepted for ports explicitly allowlisted here.

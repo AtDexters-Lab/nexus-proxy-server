@@ -25,7 +25,11 @@ func TestPeekSNIAndPrelude_Success(t *testing.T) {
 		_ = tlsClient.Handshake()
 	}()
 
-	sni, prelude, err := proxy.PeekSNIAndPrelude(server, 2*time.Second, 64<<10)
+	sni, prelude, err := proxy.PeekSNIAndPrelude(server, proxy.PeekTimeouts{
+		FirstByte:     2 * time.Second,
+		IdleExtension: 500 * time.Millisecond,
+		AbsDeadline:   time.Now().Add(2 * time.Second),
+	}, 64<<10)
 	// Close the server side to unblock client goroutine.
 	_ = server.Close()
 	<-done
@@ -49,7 +53,11 @@ func TestPeekSNIAndPrelude_MissingSNI(t *testing.T) {
 		_ = tlsClient.Handshake()
 	}()
 
-	sni, prelude, err := proxy.PeekSNIAndPrelude(server, 2*time.Second, 64<<10)
+	sni, prelude, err := proxy.PeekSNIAndPrelude(server, proxy.PeekTimeouts{
+		FirstByte:     2 * time.Second,
+		IdleExtension: 500 * time.Millisecond,
+		AbsDeadline:   time.Now().Add(2 * time.Second),
+	}, 64<<10)
 	_ = server.Close()
 	<-done
 
@@ -70,7 +78,11 @@ func TestPeekSNIAndPrelude_NotTLS(t *testing.T) {
 		client.Close()
 	}()
 
-	sni, prelude, err := proxy.PeekSNIAndPrelude(server, 2*time.Second, 64<<10)
+	sni, prelude, err := proxy.PeekSNIAndPrelude(server, proxy.PeekTimeouts{
+		FirstByte:     2 * time.Second,
+		IdleExtension: 500 * time.Millisecond,
+		AbsDeadline:   time.Now().Add(2 * time.Second),
+	}, 64<<10)
 	_ = server.Close()
 
 	require.Error(t, err)
