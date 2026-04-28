@@ -1,0 +1,36 @@
+# nexus-proxy-client config for the stress backend.
+#
+# Pairs with scripts/stress/backend (HTTPS server on :18443) to register
+# the test hostname with a nexus dev instance. Replace <DEV_NEXUS_URL>,
+# <STRESS_HOSTNAME>, and the attestation block to match your environment.
+#
+# Run:
+#   ./bin/nexus-proxy-client -config scripts/stress/client.example.yaml
+
+backends:
+  - name: "nexus-stress"
+    hostnames:
+      - "<STRESS_HOSTNAME>"          # e.g. stress.dev.example.com
+    nexusAddresses:
+      - "<DEV_NEXUS_URL>"             # e.g. wss://nexus.dev.example.com/connect
+    weight: 1
+
+    # Use whichever attestation mode your dev nexus accepts.
+    # Example: HMAC (simplest for dev). See client.example.yaml at the
+    # repo root for a CommandTokenProvider variant.
+    attestation:
+      hmacSecretFile: "/etc/nexus/dev-stress-hmac.key"
+      tokenTTLSeconds: 60
+      reauthIntervalSeconds: 600
+      reauthGraceSeconds: 30
+
+    portMappings:
+      443:
+        default: "localhost:18443"   # the stress backend's HTTPS port
+      80:
+        default: "localhost:18080"   # optional: HTTP backend if testing port 80
+
+    healthChecks:
+      enabled: true
+      inactivityTimeout: 60
+      pongTimeout: 5
