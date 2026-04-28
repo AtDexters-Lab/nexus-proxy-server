@@ -20,9 +20,11 @@ import (
 func TestBackendStartPumpsTerminatesWhenConnCloses(t *testing.T) {
 	t.Parallel()
 
+	// Inline scaffolding: this test observes pumps' natural exit when the WS
+	// closes, which is incompatible with newTestBackend's startPumps helper
+	// (whose returned cleanup forces pump shutdown via b.Close).
 	serverConnCh := make(chan *websocket.Conn, 1)
 	upgrader := websocket.Upgrader{}
-
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		require.NoError(t, err)
@@ -46,11 +48,7 @@ func TestBackendStartPumpsTerminatesWhenConnCloses(t *testing.T) {
 		close(done)
 	}()
 
-	// Queue a control message so writePump attempts a write against the closed conn.
-	err = b.SendControlMessage(protocol.ControlMessage{Event: protocol.EventPingClient})
-	require.NoError(t, err)
-
-	// Close the client side to force writePump/readPump errors.
+	require.NoError(t, b.SendControlMessage(protocol.ControlMessage{Event: protocol.EventPingClient}))
 	require.NoError(t, clientConn.Close())
 
 	select {
@@ -67,26 +65,10 @@ func TestBackendStartPumpsTerminatesWhenConnCloses(t *testing.T) {
 func TestSendDataReturnsErrClientGoneWhenClientUnknown(t *testing.T) {
 	t.Parallel()
 
-	serverConnCh := make(chan *websocket.Conn, 1)
-	upgrader := websocket.Upgrader{}
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		require.NoError(t, err)
-		serverConnCh <- conn
-	}))
-	defer ts.Close()
+	b, _, cleanup := startBackend(t)
+	defer cleanup()
 
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http")
-	clientConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	require.NoError(t, err)
-	defer clientConn.Close()
-
-	backendConn := <-serverConnCh
-	cfg := &config.Config{BackendsJWTSecret: "secret"}
-	meta := &hub.AttestationMetadata{Hostnames: []string{"example.com"}, Weight: 1}
-	b := hub.NewBackend(backendConn, meta, cfg, stubValidator{}, &http.Client{})
-
-	err = b.SendData(uuid.New(), []byte("payload"))
+	err := b.SendData(uuid.New(), []byte("payload"))
 	require.Error(t, err)
 	require.True(t, errors.Is(err, iface.ErrClientGone), "expected ErrClientGone, got %v", err)
 }

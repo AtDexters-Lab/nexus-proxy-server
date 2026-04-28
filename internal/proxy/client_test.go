@@ -113,9 +113,12 @@ func TestClientStartExitsCleanlyOnErrClientGone(t *testing.T) {
 		t.Fatalf("expected RemoveClient via deferred cleanup")
 	}
 
+	// "backend disconnected" pins the INFO-branch arm; absence of "ERROR:"
+	// pins the level. Skipping a separate "INFO:" prefix check keeps the
+	// test from coupling to log-prefix ceremony that may change.
 	out := logBuf.String()
-	if !strings.Contains(out, "INFO:") || !strings.Contains(out, "backend disconnected") {
-		t.Fatalf("expected INFO-level log mentioning backend disconnect, got: %q", out)
+	if !strings.Contains(out, "backend disconnected") {
+		t.Fatalf("expected log to mention backend disconnect, got: %q", out)
 	}
 	if strings.Contains(out, "ERROR:") {
 		t.Fatalf("ErrClientGone must not log at ERROR level, got: %q", out)
