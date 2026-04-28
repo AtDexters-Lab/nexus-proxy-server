@@ -74,6 +74,22 @@ type Config struct {
 	// the TLS-then-HTTP fallback so a single connection's total peek time is
 	// capped, not doubled. See proxy.PeekTimeouts for full semantics.
 	PeekTimeouts PeekTimeoutsConfig `yaml:"peekTimeouts"`
+
+	// MaxConcurrentPeeks bounds the number of inbound connections undergoing
+	// the protocol-sniff peek (and the rest of the dispatch handler) at once.
+	// First-line bound against the slow-loris / open-and-idle pattern: each
+	// in-flight peek holds an fd + goroutine + ~96 KB capture buffer for up
+	// to PeekAbsoluteMax (default 30s). 0 → default 256 (≈24 MB peek-buffer
+	// ceiling at saturation, comfortable on a 1 GB VM). -1 → no bound.
+	// In-flight peeks at restart drain on the prior cap; new connections
+	// enforce the new cap immediately.
+	//
+	// The slot is held for the *full handler duration*, not just the peek
+	// phase, so this also caps total in-flight inbound connections at the
+	// same value. Set higher than the expected steady-state concurrent
+	// connection count, or to -1 if the protective intent doesn't outweigh
+	// the throughput cap.
+	MaxConcurrentPeeks int `yaml:"maxConcurrentPeeks"`
 }
 
 // PeekTimeoutsConfig is the YAML shape for proxy.PeekTimeouts. Any field set
@@ -212,6 +228,14 @@ func (c *Config) PeekAbsoluteMax() time.Duration {
 	return time.Duration(c.PeekTimeouts.AbsoluteMaxSeconds) * time.Second
 }
 
+// MaxConcurrentPeeksLimit returns the configured limit; see MaxConcurrentPeeks.
+func (c *Config) MaxConcurrentPeeksLimit() int {
+	if c.MaxConcurrentPeeks == 0 {
+		return 256
+	}
+	return c.MaxConcurrentPeeks
+}
+
 // validate performs comprehensive validation of the loaded configuration.
 func (c *Config) validate() error {
 	if c.BackendListenAddress == "" {
@@ -320,6 +344,9 @@ func (c *Config) validate() error {
 	if c.PeekTimeouts.AbsoluteMaxSeconds < 0 {
 		return fmt.Errorf("peekTimeouts.absoluteMaxSeconds cannot be negative")
 	}
+	if c.MaxConcurrentPeeks < -1 {
+		return fmt.Errorf("maxConcurrentPeeks must be >= -1 (0 = default, -1 = unbounded)")
+	}
 	// Reject only *explicit* contradictions: operator sets both FirstByte and
 	// AbsoluteMax with First > Abs. A hardening config that lowers AbsoluteMax
 	// alone (leaving FirstByte at default) is permitted — runtime clamping in
@@ -336,6 +363,9 @@ func (c *Config) validate() error {
 	}
 	if c.AllowOutbound && c.MaxOutboundConns() == -1 {
 		log.Printf("WARN: outbound connections enabled with no per-backend limit (maxOutboundConnsPerBackend=-1)")
+	}
+	if c.AllowOutbound && len(c.AllowedOutboundPorts) == 0 {
+		log.Printf("WARN: outbound connections enabled with no server-level port allowlist (allowedOutboundPorts empty); authorized backends can dial any TCP port including loopback and cloud metadata")
 	}
 
 	// warnPortMismatch warns about ports present in one config list but absent from another.

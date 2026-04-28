@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -333,4 +334,48 @@ func TestTokenCacheUsesTokenExpiryWhenShorter(t *testing.T) {
 	if tc.expiry.After(time.Now().Add(10 * time.Second)) {
 		t.Fatalf("cache expiry %v should be near token expiry %v, not 1h from now", tc.expiry, shortExpiry)
 	}
+}
+
+// TestHMACTokenProvider_ConcurrentIssueToken exercises the handshake-cache
+// path from many goroutines so the race detector can flag any unsynchronized
+// access. The test only asserts no error and a non-empty token; correctness
+// is verified by the absence of a `-race` report.
+func TestHMACTokenProvider_ConcurrentIssueToken(t *testing.T) {
+	opts := AttestationOptions{
+		HMACSecret:     "concurrent-secret",
+		TokenTTL:       60 * time.Second,
+		CacheHandshake: 500 * time.Millisecond,
+	}
+	provider, err := NewHMACTokenProvider(opts, "backend", []string{"example.com"}, nil, nil, 1)
+	if err != nil {
+		t.Fatalf("failed to build provider: %v", err)
+	}
+
+	const goroutines = 32
+	const iterations = 64
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				tok, err := provider.IssueToken(context.Background(), TokenRequest{
+					Stage:       StageHandshake,
+					BackendName: "backend",
+					Hostnames:   []string{"example.com"},
+					Weight:      1,
+				})
+				if err != nil {
+					t.Errorf("IssueToken failed: %v", err)
+					return
+				}
+				if tok.Value == "" {
+					t.Errorf("IssueToken returned empty token")
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }

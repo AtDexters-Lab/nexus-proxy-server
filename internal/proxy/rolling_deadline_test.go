@@ -23,7 +23,7 @@ func TestPeekSNIAndPrelude_SilentClientFailsAtFirstByte(t *testing.T) {
 
 	firstByte := 200 * time.Millisecond
 	start := time.Now()
-	sni, _, err := proxy.PeekSNIAndPrelude(server, proxy.PeekTimeouts{
+	sni, _, _, err := proxy.PeekSNIAndPrelude(server, proxy.PeekTimeouts{
 		FirstByte:     firstByte,
 		IdleExtension: 50 * time.Millisecond,
 		AbsDeadline:   time.Now().Add(2 * time.Second),
@@ -60,7 +60,7 @@ func TestPeekSNIAndPrelude_SlowFirstByteStillSucceeds(t *testing.T) {
 		_ = tlsClient.Handshake()
 	}()
 
-	sni, prelude, err := proxy.PeekSNIAndPrelude(server, proxy.PeekTimeouts{
+	sni, prelude, _, err := proxy.PeekSNIAndPrelude(server, proxy.PeekTimeouts{
 		FirstByte:     2 * time.Second,
 		IdleExtension: 500 * time.Millisecond,
 		AbsDeadline:   time.Now().Add(3 * time.Second),
@@ -100,7 +100,7 @@ func TestPeekSNIAndPrelude_DripFeedCappedAtAbsDeadline(t *testing.T) {
 
 	absMax := 1500 * time.Millisecond
 	start := time.Now()
-	_, _, err := proxy.PeekSNIAndPrelude(server, proxy.PeekTimeouts{
+	_, _, _, err := proxy.PeekSNIAndPrelude(server, proxy.PeekTimeouts{
 		FirstByte:     absMax,
 		IdleExtension: 1 * time.Second, // generous; cap should win
 		AbsDeadline:   time.Now().Add(absMax),
@@ -132,7 +132,7 @@ func TestPeekSNIAndPrelude_FastClientBurst(t *testing.T) {
 	}()
 
 	start := time.Now()
-	sni, _, err := proxy.PeekSNIAndPrelude(server, proxy.PeekTimeouts{
+	sni, _, _, err := proxy.PeekSNIAndPrelude(server, proxy.PeekTimeouts{
 		FirstByte:     5 * time.Second,
 		IdleExtension: 1 * time.Second,
 		AbsDeadline:   time.Now().Add(10 * time.Second),
@@ -241,7 +241,7 @@ func TestPeekSNIAndPrelude_WithPreludeFallthrough(t *testing.T) {
 	}
 
 	// TLS peek fails fast because first byte is 'G', not 0x16.
-	_, tlsPrelude, tlsErr := proxy.PeekSNIAndPrelude(server, peek, 32<<10)
+	_, tlsPrelude, _, tlsErr := proxy.PeekSNIAndPrelude(server, peek, 32<<10)
 	require.Error(t, tlsErr)
 
 	// Restore captured bytes and re-peek as HTTP with the SAME peek config
@@ -278,7 +278,7 @@ func TestRollingDeadlineConn_DrainFromBufferDoesNotLeakPastAbsDeadline(t *testin
 
 	start := time.Now()
 	// Apply a peek; we don't care about the result, just that it bounds.
-	_, _, _ = proxy.PeekSNIAndPrelude(client, proxy.PeekTimeouts{
+	_, _, _, _ = proxy.PeekSNIAndPrelude(client, proxy.PeekTimeouts{
 		FirstByte:     absMax,
 		IdleExtension: 10 * time.Second,
 		AbsDeadline:   time.Now().Add(absMax),

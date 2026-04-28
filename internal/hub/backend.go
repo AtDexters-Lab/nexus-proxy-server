@@ -31,9 +31,9 @@ const (
 	pingPeriod     = (pongWait * 9) / 10
 	maxMessageSize = 32*1024 + protocol.MessageHeaderLength // This must be sent within writeWait
 
-	defaultReauthGrace   = 10 * time.Second
-	healthCheckTimeout   = 5 * time.Second
-	tcpCloseGracePeriod  = 2 * time.Second
+	defaultReauthGrace  = 10 * time.Second
+	healthCheckTimeout  = 5 * time.Second
+	tcpCloseGracePeriod = 2 * time.Second
 )
 
 type outboundMessage struct {
@@ -78,8 +78,7 @@ type Backend struct {
 	reauthPending bool
 	pendingNonce  string
 
-	httpClient   *http.Client
-	healthClient *http.Client
+	httpClient *http.Client
 
 	// Outbound proxy
 	outboundAllowed      bool
@@ -151,25 +150,24 @@ func NewBackend(conn *websocket.Conn, meta *AttestationMetadata, cfg *config.Con
 	}
 
 	b := &Backend{
-		id:                  uuid.New().String(),
-		conn:                conn,
-		config:              cfg,
-		validator:           validator,
-		hostnames:           meta.cloneHostnames(),
-		tcpPorts:            meta.cloneTCPPorts(),
-		udpRoutes:           meta.cloneUDPRoutes(),
-		weight:              meta.Weight,
-		policyVersion:       meta.PolicyVersion,
-		outgoingControl:     make(chan outboundMessage, 256),
-		outgoingData:        make(chan outboundMessage, 256),
-		reauthTokens:        make(chan string, 1),
-		quit:                make(chan struct{}),
-		reauthInterval:      meta.ReauthInterval,
-		reauthGrace:         meta.ReauthGrace,
-		maintenanceCap:      maintenanceCap,
-		authorizerStatusURI: meta.AuthorizerStatusURI,
+		id:                   uuid.New().String(),
+		conn:                 conn,
+		config:               cfg,
+		validator:            validator,
+		hostnames:            meta.cloneHostnames(),
+		tcpPorts:             meta.cloneTCPPorts(),
+		udpRoutes:            meta.cloneUDPRoutes(),
+		weight:               meta.Weight,
+		policyVersion:        meta.PolicyVersion,
+		outgoingControl:      make(chan outboundMessage, 256),
+		outgoingData:         make(chan outboundMessage, 256),
+		reauthTokens:         make(chan string, 1),
+		quit:                 make(chan struct{}),
+		reauthInterval:       meta.ReauthInterval,
+		reauthGrace:          meta.ReauthGrace,
+		maintenanceCap:       maintenanceCap,
+		authorizerStatusURI:  meta.AuthorizerStatusURI,
 		httpClient:           httpClient,
-		healthClient:         newSSRFSafeClient(httpClient),
 		outboundAllowed:      meta.OutboundAllowed,
 		allowedOutboundPorts: meta.cloneAllowedOutboundPorts(),
 		maxOutboundConns:     cfg.MaxOutboundConns(),
@@ -979,7 +977,8 @@ func (b *Backend) handleOutboundConnect(msg protocol.ControlMessage) {
 			}
 		}()
 
-		conn, err := ssrfSafeDialContext(ctx, "tcp", addr)
+		var dialer net.Dialer
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
 		// Dial phase complete — release the in-flight slot regardless of outcome.
 		// Must happen before readOutboundConn to avoid double-counting established
 		// connections (outboundConnCount already tracks them).
@@ -1305,7 +1304,7 @@ func (b *Backend) authorizerHealthy() (bool, error) {
 		return false, err
 	}
 
-	resp, err := b.healthClient.Do(req)
+	resp, err := b.httpClient.Do(req)
 	if err != nil {
 		return false, err
 	}

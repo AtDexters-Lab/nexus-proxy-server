@@ -25,7 +25,7 @@ func TestPeekSNIAndPrelude_Success(t *testing.T) {
 		_ = tlsClient.Handshake()
 	}()
 
-	sni, prelude, err := proxy.PeekSNIAndPrelude(server, proxy.PeekTimeouts{
+	sni, prelude, _, err := proxy.PeekSNIAndPrelude(server, proxy.PeekTimeouts{
 		FirstByte:     2 * time.Second,
 		IdleExtension: 500 * time.Millisecond,
 		AbsDeadline:   time.Now().Add(2 * time.Second),
@@ -53,7 +53,7 @@ func TestPeekSNIAndPrelude_MissingSNI(t *testing.T) {
 		_ = tlsClient.Handshake()
 	}()
 
-	sni, prelude, err := proxy.PeekSNIAndPrelude(server, proxy.PeekTimeouts{
+	sni, prelude, _, err := proxy.PeekSNIAndPrelude(server, proxy.PeekTimeouts{
 		FirstByte:     2 * time.Second,
 		IdleExtension: 500 * time.Millisecond,
 		AbsDeadline:   time.Now().Add(2 * time.Second),
@@ -78,7 +78,7 @@ func TestPeekSNIAndPrelude_NotTLS(t *testing.T) {
 		client.Close()
 	}()
 
-	sni, prelude, err := proxy.PeekSNIAndPrelude(server, proxy.PeekTimeouts{
+	sni, prelude, _, err := proxy.PeekSNIAndPrelude(server, proxy.PeekTimeouts{
 		FirstByte:     2 * time.Second,
 		IdleExtension: 500 * time.Millisecond,
 		AbsDeadline:   time.Now().Add(2 * time.Second),

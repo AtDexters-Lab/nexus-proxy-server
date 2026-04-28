@@ -117,9 +117,14 @@ func (t PeekTimeouts) initialDeadline() time.Time {
 // PeekSNIAndPrelude reads only as much as needed to obtain the SNI from the
 // incoming TLS ClientHello using crypto/tls, capturing the bytes that were read
 // so they can be replayed to the chosen backend. It returns the server name
-// (lowercased) and the captured prelude. If the connection is not TLS or the
-// handshake is malformed, an error is returned.
-func PeekSNIAndPrelude(conn net.Conn, timeouts PeekTimeouts, maxPrelude int) (string, []byte, error) {
+// (lowercased), the captured prelude, and whether the prelude was truncated
+// at maxPrelude. If the connection is not TLS or the handshake is malformed,
+// an error is returned. The truncation flag is reported regardless of whether
+// SNI extraction succeeded — a fragmented ClientHello whose SNI lives past
+// the cap will set truncated=true and return ErrMissingSNI, so callers can
+// distinguish "no SNI for protocol reasons" from "no SNI because we couldn't
+// see far enough."
+func PeekSNIAndPrelude(conn net.Conn, timeouts PeekTimeouts, maxPrelude int) (string, []byte, bool, error) {
 	rolling := &rollingDeadlineConn{
 		Conn:        conn,
 		idleExt:     timeouts.IdleExtension,
@@ -148,14 +153,14 @@ func PeekSNIAndPrelude(conn net.Conn, timeouts PeekTimeouts, maxPrelude int) (st
 		if !errors.Is(err, errAbortHandshake) {
 			// Not a TLS handshake or malformed; return captured bytes so caller can
 			// reinsert for other protocol sniffing (e.g., HTTP).
-			return "", prelude, err
+			return "", prelude, rc.capped, err
 		}
 		// errAbortHandshake is expected when we intentionally stop after ClientHello.
 	}
 	prelude := make([]byte, rc.buf.Len())
 	copy(prelude, rc.buf.Bytes())
 	if sni == "" {
-		return "", prelude, ErrMissingSNI
+		return "", prelude, rc.capped, ErrMissingSNI
 	}
-	return sni, prelude, nil
+	return sni, prelude, rc.capped, nil
 }

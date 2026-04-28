@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	hn "github.com/AtDexters-Lab/nexus-proxy/hostnames"
@@ -16,6 +17,14 @@ import (
 	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
 	"github.com/AtDexters-Lab/nexus-proxy/protocol"
 )
+
+// truncationWarnInterval throttles ClientHello-truncation WARN logs to at
+// most one per interval per Listener; the message includes the count of
+// truncations since the last warn so operators don't lose volume signal.
+const truncationWarnInterval = 5 * time.Second
+
+// peekDropWarnInterval throttles peek-semaphore-full WARN logs the same way.
+const peekDropWarnInterval = 5 * time.Second
 
 // Listener is responsible for accepting incoming connections from end-users.
 type Listener struct {
@@ -28,11 +37,24 @@ type Listener struct {
 	listeners   []net.Listener
 	udpConns    []net.PacketConn
 	mu          sync.Mutex
+
+	// Truncation WARN rate-limit state. truncationCount accumulates between
+	// log emissions so a sustained burst surfaces as a single throttled WARN
+	// with the cumulative count rather than amplifying into the log stream.
+	truncationLastWarnNanos atomic.Int64
+	truncationCount         atomic.Int64
+
+	// peekSem bounds in-flight inbound handlers (peek + dispatch). nil when
+	// MaxConcurrentPeeks=-1. See gatedHandle for the acquire-inside-goroutine
+	// pattern.
+	peekSem               chan struct{}
+	peekDropLastWarnNanos atomic.Int64
+	peekDropCount         atomic.Int64
 }
 
 // NewListener creates a new Listener instance.
 func NewListener(cfg *config.Config, hub iface.Hub, pm iface.PeerManager, acme http.Handler, acmeTLS *tls.Config) *Listener {
-	return &Listener{
+	l := &Listener{
 		config:      cfg,
 		hub:         hub,
 		peerManager: pm,
@@ -41,6 +63,10 @@ func NewListener(cfg *config.Config, hub iface.Hub, pm iface.PeerManager, acme h
 		listeners:   make([]net.Listener, 0, len(cfg.RelayPorts)),
 		udpConns:    make([]net.PacketConn, 0, len(cfg.UDPRelayPorts)),
 	}
+	if limit := cfg.MaxConcurrentPeeksLimit(); limit > 0 {
+		l.peekSem = make(chan struct{}, limit)
+	}
+	return l
 }
 
 // Run starts listeners on all configured proxy ports.
@@ -91,8 +117,71 @@ func (l *Listener) listenOnPort(port int) {
 			log.Printf("ERROR: Failed to accept new connection on port %d: %v", port, err)
 			continue
 		}
-		go l.handleConnection(conn)
+		go l.gatedHandle(conn)
 	}
+}
+
+// gatedHandle wraps handleConnection with the peek-concurrency bound. The
+// acquire happens inside the goroutine (rather than before `go` in the accept
+// loop) so the acquire and the deferred release live in the same goroutine
+// scope. If goroutine creation itself fails the slot is never acquired, which
+// avoids the silent slot-leak failure mode of acquire-then-spawn.
+func (l *Listener) gatedHandle(conn net.Conn) {
+	if l.peekSem == nil {
+		l.handleConnection(conn)
+		return
+	}
+	select {
+	case l.peekSem <- struct{}{}:
+		defer func() { <-l.peekSem }()
+	default:
+		l.warnPeekDrop()
+		_ = conn.Close()
+		return
+	}
+	l.handleConnection(conn)
+}
+
+// tryClaimWarnSlot bumps the cumulative event count and decides whether the
+// caller is the "winner" responsible for emitting the next WARN. Returns
+// (snapshot, true) on win — snapshot is the count atomically claimed (and
+// reset to zero) for inclusion in the WARN. Returns (0, false) if either
+// the throttle window has not elapsed or another goroutine raced to win
+// the slot first; in those cases the count keeps accumulating for the next
+// emission so no event is lost.
+func (l *Listener) tryClaimWarnSlot(count, lastNanos *atomic.Int64, interval time.Duration) (int64, bool) {
+	count.Add(1)
+	now := time.Now().UnixNano()
+	last := lastNanos.Load()
+	if now-last < int64(interval) {
+		return 0, false
+	}
+	if !lastNanos.CompareAndSwap(last, now) {
+		return 0, false
+	}
+	return count.Swap(0), true
+}
+
+func (l *Listener) warnPeekDrop() {
+	emitted, won := l.tryClaimWarnSlot(&l.peekDropCount, &l.peekDropLastWarnNanos, peekDropWarnInterval)
+	if !won {
+		return
+	}
+	log.Printf("WARN: peek slots full (cap=%d), dropped %d connections since last warn",
+		cap(l.peekSem), emitted)
+}
+
+func (l *Listener) warnTruncatedClientHello(conn net.Conn, sni string) {
+	emitted, won := l.tryClaimWarnSlot(&l.truncationCount, &l.truncationLastWarnNanos, truncationWarnInterval)
+	if !won {
+		return
+	}
+	displaySNI := sni
+	if displaySNI == "" {
+		displaySNI = "<missing>"
+	}
+	log.Printf("WARN: ClientHello prelude truncated at peek cap; closing connection from %s SNI=%s (%d truncations since last warn)",
+		conn.RemoteAddr(), displaySNI, emitted)
 }
 
 func (l *Listener) handleConnection(conn net.Conn) {
@@ -115,7 +204,18 @@ func (l *Listener) handleConnection(conn net.Conn) {
 	}
 
 	// Try TLS SNI first using a robust aborted handshake.
-	sni, tlsPrelude, tlsErr := PeekSNIAndPrelude(conn, peekTimeouts, 32<<10)
+	sni, tlsPrelude, tlsTruncated, tlsErr := PeekSNIAndPrelude(conn, peekTimeouts, 32<<10)
+	if tlsTruncated {
+		// ClientHello exceeded the recorder cap. Whether SNI was extracted
+		// or not, the captured prelude is incomplete and replaying it to a
+		// backend or peer would cause a downstream TLS handshake failure
+		// the operator cannot easily correlate. Close locally with a
+		// rate-limited WARN; the client sees a TCP RST and ops have a
+		// single failure point.
+		l.warnTruncatedClientHello(conn, sni)
+		_ = conn.Close()
+		return
+	}
 	tlsDetected := errors.Is(tlsErr, ErrMissingSNI)
 	if tlsErr == nil && sni != "" {
 		routeKey = hn.Normalize(sni)

@@ -19,18 +19,18 @@ import (
 type TokenStage string
 
 const (
-	StageHandshake     TokenStage = "handshake"
-	StageAttest        TokenStage = "attest"
-	StageReauth        TokenStage = "reauth"
-	attestEnvStage                = "NEXUS_ATTESTATION_STAGE"
-	attestEnvNonce                = "NEXUS_SESSION_NONCE"
-	attestEnvBackend              = "NEXUS_BACKEND_NAME"
-	attestEnvHostnames            = "NEXUS_HOSTNAMES"
-	attestEnvWeight               = "NEXUS_WEIGHT"
-	attestEnvTCPPorts             = "NEXUS_TCP_PORTS"
-	attestEnvUDPRoutes            = "NEXUS_UDP_ROUTES"
-	attestEnvOutboundAllowed      = "NEXUS_OUTBOUND_ALLOWED"
-	attestEnvAllowedOutboundPorts = "NEXUS_ALLOWED_OUTBOUND_PORTS"
+	StageHandshake                TokenStage = "handshake"
+	StageAttest                   TokenStage = "attest"
+	StageReauth                   TokenStage = "reauth"
+	attestEnvStage                           = "NEXUS_ATTESTATION_STAGE"
+	attestEnvNonce                           = "NEXUS_SESSION_NONCE"
+	attestEnvBackend                         = "NEXUS_BACKEND_NAME"
+	attestEnvHostnames                       = "NEXUS_HOSTNAMES"
+	attestEnvWeight                          = "NEXUS_WEIGHT"
+	attestEnvTCPPorts                        = "NEXUS_TCP_PORTS"
+	attestEnvUDPRoutes                       = "NEXUS_UDP_ROUTES"
+	attestEnvOutboundAllowed                 = "NEXUS_OUTBOUND_ALLOWED"
+	attestEnvAllowedOutboundPorts            = "NEXUS_ALLOWED_OUTBOUND_PORTS"
 )
 
 // Token encapsulates the token value and an optional expiry.
@@ -272,13 +272,18 @@ func parseTokenOutput(raw []byte) (Token, error) {
 
 // HMACTokenProvider produces tokens signed with a shared secret.
 type HMACTokenProvider struct {
-	secret         []byte
-	opts           AttestationOptions
-	backendName    string
-	hostnames      []string
-	tcpPorts       []int
-	udpRoutes      []UDPRouteConfig
-	weight         int
+	secret      []byte
+	opts        AttestationOptions
+	backendName string
+	hostnames   []string
+	tcpPorts    []int
+	udpRoutes   []UDPRouteConfig
+	weight      int
+	// mu guards handshakeCache. Held across the entire cache-miss path
+	// (get → sign → set) so concurrent IssueToken callers don't both
+	// re-sign on the same miss. HS256 is microseconds; serializing it
+	// is cheaper than handling the duplicate-sign TOCTOU.
+	mu             sync.Mutex
 	handshakeCache tokenCache
 }
 
@@ -326,7 +331,10 @@ func CopyUDPRoutes(in []UDPRouteConfig) []UDPRouteConfig {
 
 // IssueToken signs a JWT that encodes the attestation claims expected by Nexus.
 func (h *HMACTokenProvider) IssueToken(ctx context.Context, req TokenRequest) (Token, error) {
-	if req.Stage == StageHandshake && h.opts.CacheHandshake > 0 {
+	cacheable := req.Stage == StageHandshake && h.opts.CacheHandshake > 0
+	if cacheable {
+		h.mu.Lock()
+		defer h.mu.Unlock()
 		if tok, ok := h.handshakeCache.get(time.Now()); ok {
 			return tok, nil
 		}
@@ -407,7 +415,7 @@ func (h *HMACTokenProvider) IssueToken(ctx context.Context, req TokenRequest) (T
 	}
 
 	result := Token{Value: signed, Expiry: exp}
-	if req.Stage == StageHandshake && h.opts.CacheHandshake > 0 {
+	if cacheable {
 		h.handshakeCache.set(result, h.opts.CacheHandshake)
 	}
 
