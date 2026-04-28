@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -120,7 +121,15 @@ func (c *Client) Start() {
 
 		err = c.backend.SendData(c.id, buf[:n])
 		if err != nil {
-			log.Printf("ERROR: Failed to send data to backend %s for client %s: %v\nTerminating client connection", c.backend.ID(), c.id, err)
+			if errors.Is(err, iface.ErrClientGone) {
+				// Backend already disconnected this client (typical
+				// post-response close on no-keepalive HTTP). Forward bytes
+				// arriving during the user-side TCP grace window are
+				// expected race noise, not a failure.
+				log.Printf("INFO: Forward path closing for client %s; backend disconnected", c.id)
+			} else {
+				log.Printf("ERROR: Failed to send data to backend %s for client %s: %v\nTerminating client connection", c.backend.ID(), c.id, err)
+			}
 			break
 		}
 	}

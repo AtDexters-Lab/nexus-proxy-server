@@ -18,6 +18,7 @@ import (
 	"github.com/AtDexters-Lab/nexus-proxy/internal/auth"
 	"github.com/AtDexters-Lab/nexus-proxy/internal/bandwidth"
 	"github.com/AtDexters-Lab/nexus-proxy/internal/config"
+	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
 	"github.com/AtDexters-Lab/nexus-proxy/internal/netutil"
 	"github.com/AtDexters-Lab/nexus-proxy/internal/proxy"
 	"github.com/AtDexters-Lab/nexus-proxy/protocol"
@@ -546,6 +547,18 @@ func (b *Backend) AddOutboundClient(conn net.Conn, clientID uuid.UUID) error {
 func (b *Backend) SendData(clientID uuid.UUID, data []byte) error {
 	if b.closed.Load() {
 		return fmt.Errorf("backend %s is already closed", b.id)
+	}
+	// Short-circuit when the client has already been removed (typically because
+	// EventDisconnect arrived and handleControlMessage ran LoadAndDelete).
+	// Without this, the user→backend read loop in proxy/client.go:Start keeps
+	// pumping bytes during the tcpCloseGracePeriod (CloseWrite-only on the
+	// user TCP), each one triggering a "No local connection found" WARN +
+	// redundant disconnect on the backend side. Residual TOCTOU race between
+	// this check and the WS frame landing on the backend remains, but is
+	// bounded to ~1 frame per disconnect rather than every byte the user
+	// sends during the 2s grace window.
+	if _, ok := b.clients.Load(clientID); !ok {
+		return iface.ErrClientGone
 	}
 	header := make([]byte, protocol.MessageHeaderLength)
 	header[0] = protocol.ControlByteData

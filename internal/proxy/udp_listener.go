@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AtDexters-Lab/nexus-proxy/internal/iface"
 	"github.com/AtDexters-Lab/nexus-proxy/protocol"
 	"github.com/google/uuid"
 )
@@ -265,7 +266,11 @@ func (l *Listener) listenOnUDPPort(port int) {
 		key := udpAddr.String()
 		if flow, ok := table.get(key); ok {
 			if err := flow.backend.SendData(flow.clientID, buf[:n]); err != nil {
-				log.Printf("WARN: Failed to forward UDP datagram to backend %s for %s on %s: %v", flow.backend.ID(), udpAddr, listenAddr, err)
+				if errors.Is(err, iface.ErrClientGone) {
+					log.Printf("INFO: UDP flow closing for %s on %s; backend disconnected", udpAddr, listenAddr)
+				} else {
+					log.Printf("WARN: Failed to forward UDP datagram to backend %s for %s on %s: %v", flow.backend.ID(), udpAddr, listenAddr, err)
+				}
 				_, _ = table.remove(key)
 				flow.backend.RemoveClient(flow.clientID)
 				if flow.conn != nil {

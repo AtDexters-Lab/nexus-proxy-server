@@ -1,6 +1,7 @@
 package iface
 
 import (
+	"errors"
 	"net"
 	"time"
 
@@ -8,6 +9,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
+
+// ErrClientGone is returned by Backend.SendData when the target client is no
+// longer registered with the backend (e.g. EventDisconnect already arrived).
+// Callers use this sentinel to suppress error-level logging on forward read
+// loops, since this is expected race noise during normal teardown rather
+// than a real failure.
+var ErrClientGone = errors.New("client no longer registered with backend")
 
 // Hub is an interface that components use to interact with the backend hub.
 type Hub interface {
