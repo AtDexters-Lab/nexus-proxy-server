@@ -75,20 +75,21 @@ type Config struct {
 	// capped, not doubled. See proxy.PeekTimeouts for full semantics.
 	PeekTimeouts PeekTimeoutsConfig `yaml:"peekTimeouts"`
 
-	// MaxConcurrentPeeks bounds the number of inbound connections undergoing
-	// the protocol-sniff peek (and the rest of the dispatch handler) at once.
-	// First-line bound against the slow-loris / open-and-idle pattern: each
-	// in-flight peek holds an fd + goroutine + ~96 KB capture buffer for up
-	// to PeekAbsoluteMax (default 30s). 0 → default 256 (≈24 MB peek-buffer
-	// ceiling at saturation, comfortable on a 1 GB VM). -1 → no bound.
+	// MaxConcurrentPeeks bounds the number of inbound connections in the
+	// protocol-sniff peek phase at once. First-line defense against the
+	// slow-loris / open-and-idle pattern: each in-flight peek holds an fd
+	// + goroutine + ~96 KB capture buffer for up to PeekAbsoluteMax (default
+	// 30s). 0 → default 256 (≈24 MB peek-buffer ceiling at saturation,
+	// comfortable on a 1 GB VM). -1 → no bound.
+	//
+	// The slot is released at the boundary between peek and dispatch, so
+	// long-lived post-peek work (ACME serve, established backend
+	// connections, peer tunnels) runs slot-free and does NOT count against
+	// this cap. Established-connection concurrency is governed by
+	// per-backend / per-peer flow control, not by this knob.
+	//
 	// In-flight peeks at restart drain on the prior cap; new connections
 	// enforce the new cap immediately.
-	//
-	// The slot is held for the *full handler duration*, not just the peek
-	// phase, so this also caps total in-flight inbound connections at the
-	// same value. Set higher than the expected steady-state concurrent
-	// connection count, or to -1 if the protective intent doesn't outweigh
-	// the throughput cap.
 	MaxConcurrentPeeks int `yaml:"maxConcurrentPeeks"`
 }
 

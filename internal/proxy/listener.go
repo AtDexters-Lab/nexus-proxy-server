@@ -26,6 +26,12 @@ const truncationWarnInterval = 5 * time.Second
 // peekDropWarnInterval throttles peek-semaphore-full WARN logs the same way.
 const peekDropWarnInterval = 5 * time.Second
 
+// noopReleasePeekSlot is the release callback handed to handleConnection
+// when the listener has no peek bound. Package-level so the unbounded-path
+// dispatch in gatedHandle reuses one allocation rather than constructing
+// a fresh empty closure per inbound connection.
+var noopReleasePeekSlot = func() {}
+
 // Listener is responsible for accepting incoming connections from end-users.
 type Listener struct {
 	config      *config.Config
@@ -44,9 +50,10 @@ type Listener struct {
 	truncationLastWarnNanos atomic.Int64
 	truncationCount         atomic.Int64
 
-	// peekSem bounds in-flight inbound handlers (peek + dispatch). nil when
-	// MaxConcurrentPeeks=-1. See gatedHandle for the acquire-inside-goroutine
-	// pattern.
+	// peekSem bounds in-flight peeks. Released at the peek→dispatch boundary
+	// so long-lived post-peek work (ACME serve / client.Start / peer tunnel)
+	// runs slot-free. nil when MaxConcurrentPeeks=-1. See gatedHandle for
+	// the acquire-inside-goroutine pattern and the release callback flow.
 	peekSem               chan struct{}
 	peekDropLastWarnNanos atomic.Int64
 	peekDropCount         atomic.Int64
@@ -122,24 +129,33 @@ func (l *Listener) listenOnPort(port int) {
 }
 
 // gatedHandle wraps handleConnection with the peek-concurrency bound. The
-// acquire happens inside the goroutine (rather than before `go` in the accept
-// loop) so the acquire and the deferred release live in the same goroutine
-// scope. If goroutine creation itself fails the slot is never acquired, which
-// avoids the silent slot-leak failure mode of acquire-then-spawn.
+// slot covers only the protocol-sniff peek phase: handleConnection invokes
+// the supplied release callback at the boundary between peek and dispatch
+// (ACME serve / local backend client.Start / peer tunnel) so long-lived
+// post-peek work runs slot-free. The defer is the safety net for early
+// returns and panics that didn't reach an explicit release.
+//
+// Acquire happens inside the goroutine (not before `go` in the accept loop)
+// so the acquire and release live in the same goroutine scope; goroutine
+// creation failures cannot leak slots.
 func (l *Listener) gatedHandle(conn net.Conn) {
 	if l.peekSem == nil {
-		l.handleConnection(conn)
+		l.handleConnection(conn, noopReleasePeekSlot)
 		return
 	}
 	select {
 	case l.peekSem <- struct{}{}:
-		defer func() { <-l.peekSem }()
 	default:
 		l.warnPeekDrop()
 		_ = conn.Close()
 		return
 	}
-	l.handleConnection(conn)
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { <-l.peekSem })
+	}
+	defer release()
+	l.handleConnection(conn, release)
 }
 
 // tryClaimWarnSlot bumps the cumulative event count and decides whether the
@@ -184,7 +200,12 @@ func (l *Listener) warnTruncatedClientHello(conn net.Conn, sni string) {
 		conn.RemoteAddr(), displaySNI, emitted)
 }
 
-func (l *Listener) handleConnection(conn net.Conn) {
+// handleConnection performs the protocol-sniff peek and routing. The
+// releasePeekSlot callback is invoked at the boundary between the bounded
+// peek phase and any long-lived dispatch (ACME serve, local-backend
+// client.Start, peer tunnel) so the peek semaphore is freed before the
+// long phase begins.
+func (l *Listener) handleConnection(conn net.Conn, releasePeekSlot func()) {
 	var routeKey string
 	var prelude []byte
 	var isTLS bool
@@ -239,6 +260,7 @@ func (l *Listener) handleConnection(conn net.Conn) {
 				simpleHttpServer := &http.Server{Handler: l.acmeHandler, ReadHeaderTimeout: 5 * time.Second}
 				// Reinsert the bytes we consumed into the stream for the HTTP server.
 				connWithPrelude := WithPrelude(conn, prelude)
+				releasePeekSlot()
 				err := simpleHttpServer.Serve(NewSingleConnListener(connWithPrelude))
 				log.Printf("INFO: ACME HTTP handler finished for '%s' on :80: %v", routeKey, err)
 				return
@@ -274,6 +296,7 @@ func (l *Listener) handleConnection(conn net.Conn) {
 		pausableConn := NewPausableConn(conn)
 		client := NewClientWithPrelude(pausableConn, backend, l.config, routeKey, prelude, isTLS)
 		log.Printf("INFO: [LOCAL] Routing client %s [%s] for route '%s' to backend %s", conn.RemoteAddr(), client.id, routeKey, backend.ID())
+		releasePeekSlot()
 		client.Start()
 		return
 	}
@@ -284,6 +307,7 @@ func (l *Listener) handleConnection(conn net.Conn) {
 			log.Printf("INFO: [TUNNEL] No local backend for '%s'. Tunneling to peer %s", routeKey, remotePeer.Addr())
 			// Ensure the tunneled peer sees the bytes we consumed during sniffing.
 			connWithPrelude := WithPrelude(conn, prelude)
+			releasePeekSlot()
 			remotePeer.StartTunnel(connWithPrelude, routeKey, isTLS)
 			return
 		}
