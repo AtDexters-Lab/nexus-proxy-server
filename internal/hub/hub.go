@@ -12,7 +12,9 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -339,18 +341,101 @@ func (h *hubImpl) handleBackendConnect(w http.ResponseWriter, r *http.Request) {
 
 	backend, err := h.performHandshake(conn)
 	if err != nil {
+		reason := err.Error()
+		var twr *terminalWithRejected
+		if errors.As(err, &twr) {
+			reason = encodeRejectedReason(twr.kind, twr.rejected, twr.err.Error())
+		} else {
+			reason = truncateBytes(reason, closeReasonByteBudget)
+		}
 		log.Printf("WARN: Backend authentication failed for %s: %v", conn.RemoteAddr(), err)
-		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, err.Error()))
+		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, reason))
 		conn.Close()
 		return
 	}
 
-	log.Printf("INFO: Backend authenticated successfully: hostnames=%v tcp_ports=%v udp_routes=%v from=%s", backend.hostnames, backend.tcpPorts, backend.udpRoutes, conn.RemoteAddr())
+	log.Printf("INFO: Backend authenticated successfully: hostnames=%v tcp_ports=%v udp_routes=%v rejected=%d from=%s",
+		backend.hostnames, backend.tcpPorts, backend.udpRoutes, len(backend.rejected), conn.RemoteAddr())
+	logRejectedCodes(backend.id, backend.rejected, backend.truncated)
 
 	h.register(backend)
 	defer h.unregister(backend)
 
+	// Send AttestationResultMessage post-register, pre-StartPumps. The conn is
+	// live (registered into pools) and no writePump is running yet — safe for
+	// a direct WriteMessage without connWriteMu. Write failure is logged WARN
+	// and tolerated (informational frame; the device sees the session is up
+	// via subsequent traffic and reauth ticks).
+	if err := sendAttestationResult(conn, protocol.AttestationResultHandshake, backend.acceptedClaims(), backend.rejected, backend.truncated); err != nil {
+		log.Printf("WARN: Backend %s: failed to send handshake_result frame: %v", backend.id, err)
+	}
+
 	backend.StartPumps()
+}
+
+// maxAttestationResultPayloadBytes caps the size of the success-path
+// result frame. The client's read limit is 32 KiB (maxMessageSize); we keep
+// the budget tighter so backends with many/long claimed hostnames still
+// produce a deliverable frame. On overflow we drop the frame entirely (with
+// WARN) rather than emit a truncated unparseable payload — the frame is
+// informational, the relay's INFO log retains the full disposition, and
+// the device's session is unaffected.
+const maxAttestationResultPayloadBytes = 16 * 1024
+
+// sendAttestationResult writes an AttestationResultMessage text frame to conn.
+// Used on the handshake success path (pre-StartPumps, single-writer by phase
+// ordering). Reauth uses a sibling Backend method that routes through outgoingControl.
+func sendAttestationResult(conn *websocket.Conn, msgType protocol.AttestationResultType, accepted protocol.AcceptedClaims, rejected []protocol.RejectedClaim, truncated bool) error {
+	msg := protocol.AttestationResultMessage{
+		Type:      msgType,
+		Accepted:  accepted,
+		Rejected:  rejected,
+		Truncated: truncated,
+	}
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("marshal attestation result: %w", err)
+	}
+	if len(payload) > maxAttestationResultPayloadBytes {
+		log.Printf("WARN: %s frame oversize (%d bytes > %d budget); dropping (informational frame). Disposition retained in relay log.", msgType, len(payload), maxAttestationResultPayloadBytes)
+		return nil
+	}
+	if err := conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
+		return fmt.Errorf("set write deadline: %w", err)
+	}
+	return conn.WriteMessage(websocket.TextMessage, payload)
+}
+
+// logRejectedCodes emits an INFO log line summarizing rejected claims at
+// handshake/reauth completion. Cap at first 16 codes + "...+N more" to keep
+// the log line bounded for adversarial-input scenarios.
+//
+// Value is attacker-controlled (it carries the backend's claim string —
+// hostnames in particular survive IDNA fallback with embedded control bytes).
+// %q formatting escapes control bytes so a hostile backend cannot inject log
+// lines or ANSI escapes via the rejected-claim sink. Code is from a closed
+// constant set and is safe.
+func logRejectedCodes(backendID string, rejected []protocol.RejectedClaim, truncated bool) {
+	if len(rejected) == 0 && !truncated {
+		return
+	}
+	const maxCodes = 16
+	codes := make([]string, 0, maxCodes)
+	for i, r := range rejected {
+		if i >= maxCodes {
+			break
+		}
+		codes = append(codes, fmt.Sprintf("%s:%q", r.Code, r.Value))
+	}
+	more := len(rejected) - len(codes)
+	suffix := ""
+	if more > 0 {
+		suffix = fmt.Sprintf(" ...+%d more", more)
+	}
+	if truncated {
+		suffix += " (truncated)"
+	}
+	log.Printf("INFO: Backend %s rejected claims (%d): %v%s", backendID, len(rejected), codes, suffix)
 }
 
 // handlePeerConnect handles a connection from another Nexus node (mTLS Auth).
@@ -375,13 +460,26 @@ func (h *hubImpl) handlePeerConnect(w http.ResponseWriter, r *http.Request) {
 
 
 type stage0Info struct {
-	Hostnames            []string
-	TCPPorts             []int
-	UDPRoutes            []UDPRoutePolicy
-	Weight               int
-	OutboundAllowed      bool
-	AllowedOutboundPorts []int
+	Hostnames             []string
+	TCPPorts              []int
+	UDPRoutes             []UDPRoutePolicy
+	Weight                int
+	OutboundAllowed       bool
+	AllowedOutboundPorts  []int
+	OutboundPortsExplicit bool
 }
+
+// terminalWithRejected wraps a terminal handshake error with the soft-rejected
+// list accumulated up to the failure point and the terminal kind. The caller
+// (handleBackendConnect) uses errors.As to extract and encode the close-reason.
+type terminalWithRejected struct {
+	err       error
+	rejected  []protocol.RejectedClaim
+	truncated bool
+	kind      terminalKind
+}
+
+func (e *terminalWithRejected) Error() string { return e.err.Error() }
 
 func (h *hubImpl) performHandshake(conn *websocket.Conn) (*Backend, error) {
 	stage0Token, err := h.readTokenMessage(conn, "stage0")
@@ -448,32 +546,50 @@ func (h *hubImpl) readTokenMessage(conn *websocket.Conn, stage string) (string, 
 }
 
 func (h *hubImpl) validateStage0Claims(claims *auth.Claims) (*stage0Info, error) {
+	var allRejected []protocol.RejectedClaim
+	var anyTruncated bool
+
 	var normalizedHosts []string
 	if len(claims.Hostnames) > 0 {
-		var err error
-		normalizedHosts, err = normalizeHostnames(claims.Hostnames)
+		hosts, rejected, truncated, err := normalizeHostnames(claims.Hostnames)
 		if err != nil {
-			return nil, err
+			return nil, &terminalWithRejected{err: err, kind: terminalInputMalformed}
+		}
+		normalizedHosts = hosts
+		allRejected = append(allRejected, rejected...)
+		anyTruncated = anyTruncated || truncated
+	}
+
+	tcpPorts, tcpRejected, tcpTrunc, err := normalizeTCPPortClaims(h.config, claims.TCPPorts)
+	if err != nil {
+		return nil, &terminalWithRejected{err: err, kind: terminalInputMalformed}
+	}
+	allRejected = append(allRejected, tcpRejected...)
+	anyTruncated = anyTruncated || tcpTrunc
+
+	udpRoutes, udpRejected, udpTrunc, err := normalizeUDPRouteClaims(h.config, claims.UDPRoutes)
+	if err != nil {
+		return nil, &terminalWithRejected{err: err, kind: terminalInputMalformed}
+	}
+	allRejected = append(allRejected, udpRejected...)
+	anyTruncated = anyTruncated || udpTrunc
+
+	if len(normalizedHosts) == 0 && len(tcpPorts) == 0 && len(udpRoutes) == 0 {
+		// Empty-after-filter — policy-shaped terminal; rejected list carries the cause.
+		return nil, &terminalWithRejected{
+			err:       errors.New("stage0 token missing hostnames and port claims"),
+			rejected:  allRejected,
+			truncated: anyTruncated,
+			kind:      terminalPolicyShaped,
 		}
 	}
 
-	tcpPorts, err := normalizeTCPPortClaims(h.config, claims.TCPPorts)
+	outboundPorts, obRejected, obTrunc, err := normalizeOutboundPortClaims(h.config, claims.OutboundAllowed, claims.AllowedOutboundPorts)
 	if err != nil {
-		return nil, err
+		return nil, &terminalWithRejected{err: err, kind: terminalInputMalformed}
 	}
-	udpRoutes, err := normalizeUDPRouteClaims(h.config, claims.UDPRoutes)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(normalizedHosts) == 0 && len(tcpPorts) == 0 && len(udpRoutes) == 0 {
-		return nil, errors.New("stage0 token missing hostnames and port claims")
-	}
-
-	outboundPorts, err := normalizeOutboundPortClaims(h.config, claims.OutboundAllowed, claims.AllowedOutboundPorts)
-	if err != nil {
-		return nil, err
-	}
+	allRejected = append(allRejected, obRejected...)
+	anyTruncated = anyTruncated || obTrunc
 
 	weight := claims.Weight
 	if weight <= 0 {
@@ -490,13 +606,17 @@ func (h *hubImpl) validateStage0Claims(claims *auth.Claims) (*stage0Info, error)
 		}
 	}
 
+	// On the success path, allRejected/anyTruncated are discarded —
+	// buildMetadataFromClaims re-derives the canonical list from stage-1
+	// normalizer calls and populates meta.Rejected from there.
 	return &stage0Info{
-		Hostnames:            normalizedHosts,
-		TCPPorts:             tcpPorts,
-		UDPRoutes:            udpRoutes,
-		Weight:               weight,
-		OutboundAllowed:      claims.OutboundAllowed,
-		AllowedOutboundPorts: outboundPorts,
+		Hostnames:             normalizedHosts,
+		TCPPorts:              tcpPorts,
+		UDPRoutes:             udpRoutes,
+		Weight:                weight,
+		OutboundAllowed:       claims.OutboundAllowed,
+		AllowedOutboundPorts:  outboundPorts,
+		OutboundPortsExplicit: len(claims.AllowedOutboundPorts) > 0,
 	}, nil
 }
 
@@ -505,26 +625,49 @@ func (h *hubImpl) buildMetadataFromClaims(claims *auth.Claims, expected *stage0I
 		return nil, fmt.Errorf("session nonce mismatch: expected %s got %s", nonce, claims.SessionNonce)
 	}
 
+	// Re-derive rejected from stage-1 normalizer calls; this is canonical for meta.Rejected.
+	// Cross-check semantics: accepted-set equality catches device/token tampering on
+	// the accepted (registered) surface. The rejected-set cross-check is intentionally
+	// NOT added — rejected divergence between stages is permitted (a device may submit
+	// different rejection-eligible-but-not-routable claims at each stage), and is
+	// consequence-free given the informational-only contract on AttestationMetadata.Rejected.
+	// If future work signs the result frame (deferred_result_frame_integrity), the signing
+	// PR must re-instate this check or pick a canonical stage explicitly.
+	var stage1Rejected []protocol.RejectedClaim
+	var stage1Truncated bool
+
 	var normalizedHosts []string
 	if len(claims.Hostnames) > 0 {
-		var err error
-		normalizedHosts, err = normalizeHostnames(claims.Hostnames)
+		hosts, rejected, truncated, err := normalizeHostnames(claims.Hostnames)
 		if err != nil {
-			return nil, err
+			return nil, &terminalWithRejected{err: err, kind: terminalInputMalformed}
 		}
+		normalizedHosts = hosts
+		stage1Rejected = append(stage1Rejected, rejected...)
+		stage1Truncated = stage1Truncated || truncated
 	}
 
-	tcpPorts, err := normalizeTCPPortClaims(h.config, claims.TCPPorts)
+	tcpPorts, tcpRejected, tcpTrunc, err := normalizeTCPPortClaims(h.config, claims.TCPPorts)
 	if err != nil {
-		return nil, err
+		return nil, &terminalWithRejected{err: err, kind: terminalInputMalformed}
 	}
-	udpRoutes, err := normalizeUDPRouteClaims(h.config, claims.UDPRoutes)
+	stage1Rejected = append(stage1Rejected, tcpRejected...)
+	stage1Truncated = stage1Truncated || tcpTrunc
+
+	udpRoutes, udpRejected, udpTrunc, err := normalizeUDPRouteClaims(h.config, claims.UDPRoutes)
 	if err != nil {
-		return nil, err
+		return nil, &terminalWithRejected{err: err, kind: terminalInputMalformed}
 	}
+	stage1Rejected = append(stage1Rejected, udpRejected...)
+	stage1Truncated = stage1Truncated || udpTrunc
 
 	if len(normalizedHosts) == 0 && len(tcpPorts) == 0 && len(udpRoutes) == 0 {
-		return nil, errors.New("attested token missing hostnames and port claims")
+		return nil, &terminalWithRejected{
+			err:       errors.New("attested token missing hostnames and port claims"),
+			rejected:  stage1Rejected,
+			truncated: stage1Truncated,
+			kind:      terminalPolicyShaped,
+		}
 	}
 
 	if expected == nil {
@@ -543,12 +686,24 @@ func (h *hubImpl) buildMetadataFromClaims(claims *auth.Claims, expected *stage0I
 	if claims.OutboundAllowed != expected.OutboundAllowed {
 		return nil, errors.New("attested token outbound_allowed differs from handshake token")
 	}
-	outboundPorts, err := normalizeOutboundPortClaims(h.config, claims.OutboundAllowed, claims.AllowedOutboundPorts)
+	outboundPorts, obRejected, obTrunc, err := normalizeOutboundPortClaims(h.config, claims.OutboundAllowed, claims.AllowedOutboundPorts)
 	if err != nil {
-		return nil, err
+		return nil, &terminalWithRejected{err: err, kind: terminalInputMalformed}
 	}
+	stage1Rejected = append(stage1Rejected, obRejected...)
+	stage1Truncated = stage1Truncated || obTrunc
+
 	if !sameIntSets(outboundPorts, expected.AllowedOutboundPorts) {
 		return nil, errors.New("attested token outbound port claims differ from handshake token")
+	}
+	// Cross-check the explicit-list bit: a stage0 token with an all-soft-rejected
+	// explicit list filters to the same empty slice as a stage1 token that omits
+	// the list entirely. Without this check, the filtered sets would compare equal
+	// (both empty) while the explicit-bit silently flips from true→false at the
+	// stage1 site, widening privilege. Compare raw stage1 claim length against
+	// the stage0-derived bit.
+	if (len(claims.AllowedOutboundPorts) > 0) != expected.OutboundPortsExplicit {
+		return nil, errors.New("attested token outbound_ports_explicit differs from handshake token")
 	}
 
 	weight := expected.Weight
@@ -557,14 +712,17 @@ func (h *hubImpl) buildMetadataFromClaims(claims *auth.Claims, expected *stage0I
 	}
 
 	meta := &AttestationMetadata{
-		Hostnames:            append([]string{}, expected.Hostnames...),
-		TCPPorts:             append([]int{}, expected.TCPPorts...),
-		UDPRoutes:            append([]UDPRoutePolicy{}, expected.UDPRoutes...),
-		Weight:               weight,
-		PolicyVersion:        claims.PolicyVersion,
-		AuthorizerStatusURI:  claims.AuthorizerStatusURI,
-		OutboundAllowed:      expected.OutboundAllowed,
-		AllowedOutboundPorts: append([]int{}, expected.AllowedOutboundPorts...),
+		Hostnames:             append([]string{}, expected.Hostnames...),
+		TCPPorts:              append([]int{}, expected.TCPPorts...),
+		UDPRoutes:             append([]UDPRoutePolicy{}, expected.UDPRoutes...),
+		Weight:                weight,
+		PolicyVersion:         claims.PolicyVersion,
+		AuthorizerStatusURI:   claims.AuthorizerStatusURI,
+		OutboundAllowed:       expected.OutboundAllowed,
+		AllowedOutboundPorts:  append([]int{}, expected.AllowedOutboundPorts...),
+		OutboundPortsExplicit: expected.OutboundPortsExplicit,
+		Rejected:              stage1Rejected,
+		Truncated:             stage1Truncated,
 	}
 
 	if claims.ReauthIntervalSeconds != nil && *claims.ReauthIntervalSeconds > 0 {
@@ -612,18 +770,42 @@ func generateNonce() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
-func normalizeHostnames(hosts []string) ([]string, error) {
+// appendRejected appends a rejected entry capped at protocol.RejectedListBound.
+// Each caller (one normalizer) owns its own slice and appends entries of a
+// single Kind, so a plain len() check enforces the per-Kind bound.
+func appendRejected(rejected []protocol.RejectedClaim, truncated *bool, entry protocol.RejectedClaim) []protocol.RejectedClaim {
+	if len(rejected) >= protocol.RejectedListBound {
+		*truncated = true
+		return rejected
+	}
+	return append(rejected, entry)
+}
+
+// normalizeHostnames returns the accepted hostname set, soft-rejected entries,
+// and a terminal error only for malformed input (today: none — empty-after-trim
+// is silent-drop, reserved-route-key is soft-rejected).
+func normalizeHostnames(hosts []string) ([]string, []protocol.RejectedClaim, bool, error) {
 	uniq := make(map[string]struct{}, len(hosts))
 	normalized := make([]string, 0, len(hosts))
+	var rejected []protocol.RejectedClaim
+	var truncated bool
 	for _, hname := range hosts {
 		n := hostn.NormalizeOrWildcard(hname)
 		if n == "" {
+			// Silent-drop sloppy input (whitespace, etc.) — matches today's
+			// behavior; avoids migration noise from benign YAML artifacts.
 			continue
 		}
-		// Prevent backends from claiming reserved route-key strings via hostnames.
-		// Route keys share the same namespace as hostnames in h.pools.
+		// Reserved route-key strings collide with the port-pool namespace in h.pools.
+		// Soft-reject so a single bad entry doesn't kill the session.
 		if strings.HasPrefix(n, protocol.RouteKeyPrefixTCP) || strings.HasPrefix(n, protocol.RouteKeyPrefixUDP) {
-			return nil, fmt.Errorf("reserved route key %q cannot be used as a hostname claim", n)
+			rejected = appendRejected(rejected, &truncated, protocol.RejectedClaim{
+				Kind:   protocol.RejectedKindHostname,
+				Code:   protocol.RejectedCodeHostnameReservedRouteKey,
+				Value:  n,
+				Reason: fmt.Sprintf("reserved route key %q cannot be used as a hostname claim", n),
+			})
+			continue
 		}
 		if _, ok := uniq[n]; ok {
 			continue
@@ -631,27 +813,43 @@ func normalizeHostnames(hosts []string) ([]string, error) {
 		uniq[n] = struct{}{}
 		normalized = append(normalized, n)
 	}
-	if len(normalized) == 0 {
-		return nil, errors.New("no valid hostnames after normalization")
+	if len(normalized) == 0 && len(hosts) > 0 && len(rejected) == 0 {
+		// Today's "no valid hostnames after normalization" terminal — only when
+		// the device sent hostnames but none survived normalization and none
+		// were rejected (e.g., all whitespace). Cross-claim emptiness is the
+		// caller's check; this is per-call empty-with-no-rejection.
+		return nil, nil, false, errors.New("no valid hostnames after normalization")
 	}
-	return normalized, nil
+	return normalized, rejected, truncated, nil
 }
 
-func normalizeTCPPortClaims(cfg *config.Config, ports []int) ([]int, error) {
+// normalizeTCPPortClaims returns the accepted TCP port set, soft-rejected
+// entries (allowlist misses), and a terminal error for syntax/config issues
+// (port out of range; feature disabled at relay).
+func normalizeTCPPortClaims(cfg *config.Config, ports []int) ([]int, []protocol.RejectedClaim, bool, error) {
 	if len(ports) == 0 {
-		return nil, nil
+		return nil, nil, false, nil
 	}
 	if cfg == nil || len(cfg.AllowedTCPPortClaims) == 0 {
-		return nil, errors.New("tcp port claims are disabled (allowedTCPPortClaims is empty)")
+		return nil, nil, false, errors.New("tcp port claims are disabled (allowedTCPPortClaims is empty)")
 	}
 	uniq := make(map[int]struct{}, len(ports))
 	out := make([]int, 0, len(ports))
+	var rejected []protocol.RejectedClaim
+	var truncated bool
 	for _, port := range ports {
 		if port <= 0 || port > 65535 {
-			return nil, fmt.Errorf("invalid tcp port claim: %d", port)
+			// Syntax error — terminal; the device's authorizer is producing malformed claims.
+			return nil, nil, false, fmt.Errorf("invalid tcp port claim: %d", port)
 		}
 		if !portAllowed(cfg.AllowedTCPPortClaims, port) {
-			return nil, fmt.Errorf("tcp port claim %d is not allowed", port)
+			rejected = appendRejected(rejected, &truncated, protocol.RejectedClaim{
+				Kind:   protocol.RejectedKindTCPPort,
+				Code:   protocol.RejectedCodeTCPPortNotAllowed,
+				Value:  strconv.Itoa(port),
+				Reason: fmt.Sprintf("tcp port claim %d is not in allowedTCPPortClaims", port),
+			})
+			continue
 		}
 		if _, ok := uniq[port]; ok {
 			continue
@@ -660,31 +858,42 @@ func normalizeTCPPortClaims(cfg *config.Config, ports []int) ([]int, error) {
 		out = append(out, port)
 	}
 	sort.Ints(out)
-	return out, nil
+	return out, rejected, truncated, nil
 }
 
-func normalizeUDPRouteClaims(cfg *config.Config, routes []protocol.UDPRouteClaim) ([]UDPRoutePolicy, error) {
+// normalizeUDPRouteClaims returns the accepted UDP route set, soft-rejected
+// entries (allowlist misses), and a terminal error for syntax/contradiction
+// issues (port out of range; timeout config inversion; intra-claim conflict).
+func normalizeUDPRouteClaims(cfg *config.Config, routes []protocol.UDPRouteClaim) ([]UDPRoutePolicy, []protocol.RejectedClaim, bool, error) {
 	if len(routes) == 0 {
-		return nil, nil
+		return nil, nil, false, nil
 	}
 	if cfg == nil || len(cfg.AllowedUDPPortClaims) == 0 {
-		return nil, errors.New("udp port claims are disabled (allowedUDPPortClaims is empty)")
+		return nil, nil, false, errors.New("udp port claims are disabled (allowedUDPPortClaims is empty)")
 	}
 
 	minTimeout := cfg.UDPFlowIdleTimeoutMin()
 	maxTimeout := cfg.UDPFlowIdleTimeoutMax()
 	if maxTimeout < minTimeout {
-		return nil, fmt.Errorf("udp flow idle timeout max (%s) cannot be less than min (%s)", maxTimeout, minTimeout)
+		return nil, nil, false, fmt.Errorf("udp flow idle timeout max (%s) cannot be less than min (%s)", maxTimeout, minTimeout)
 	}
 
 	seen := make(map[int]UDPRoutePolicy, len(routes))
+	var rejected []protocol.RejectedClaim
+	var truncated bool
 	for _, route := range routes {
 		port := route.Port
 		if port <= 0 || port > 65535 {
-			return nil, fmt.Errorf("invalid udp route port claim: %d", port)
+			return nil, nil, false, fmt.Errorf("invalid udp route port claim: %d", port)
 		}
 		if !portAllowed(cfg.AllowedUDPPortClaims, port) {
-			return nil, fmt.Errorf("udp port claim %d is not allowed", port)
+			rejected = appendRejected(rejected, &truncated, protocol.RejectedClaim{
+				Kind:   protocol.RejectedKindUDPRoute,
+				Code:   protocol.RejectedCodeUDPRouteNotAllowed,
+				Value:  strconv.Itoa(port),
+				Reason: fmt.Sprintf("udp route port %d is not in allowedUDPPortClaims", port),
+			})
+			continue
 		}
 
 		timeout := cfg.UDPFlowIdleTimeoutDefault()
@@ -700,7 +909,7 @@ func normalizeUDPRouteClaims(cfg *config.Config, routes []protocol.UDPRouteClaim
 
 		if existing, ok := seen[port]; ok {
 			if existing.FlowIdleTimeout != timeout {
-				return nil, fmt.Errorf("conflicting udp route policies for port %d", port)
+				return nil, nil, false, fmt.Errorf("conflicting udp route policies for port %d", port)
 			}
 			continue
 		}
@@ -712,30 +921,41 @@ func normalizeUDPRouteClaims(cfg *config.Config, routes []protocol.UDPRouteClaim
 		out = append(out, route)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Port < out[j].Port })
-	return out, nil
+	return out, rejected, truncated, nil
 }
 
-func normalizeOutboundPortClaims(cfg *config.Config, outboundAllowed bool, ports []int) ([]int, error) {
+// normalizeOutboundPortClaims returns the accepted outbound port set,
+// soft-rejected entries, and a terminal error for intra-claim contradictions
+// (claim mismatch; outbound disabled at relay; port out of range).
+func normalizeOutboundPortClaims(cfg *config.Config, outboundAllowed bool, ports []int) ([]int, []protocol.RejectedClaim, bool, error) {
 	if !outboundAllowed {
 		if len(ports) > 0 {
-			return nil, errors.New("allowed_outbound_ports set but outbound_allowed is false")
+			return nil, nil, false, errors.New("allowed_outbound_ports set but outbound_allowed is false")
 		}
-		return nil, nil
+		return nil, nil, false, nil
 	}
 	if !cfg.AllowOutbound {
-		return nil, errors.New("backend claims outbound_allowed but server has allowOutbound disabled")
+		return nil, nil, false, errors.New("backend claims outbound_allowed but server has allowOutbound disabled")
 	}
 	if len(ports) == 0 {
-		return nil, nil
+		return nil, nil, false, nil
 	}
 	uniq := make(map[int]struct{}, len(ports))
 	out := make([]int, 0, len(ports))
+	var rejected []protocol.RejectedClaim
+	var truncated bool
 	for _, port := range ports {
 		if port <= 0 || port > 65535 {
-			return nil, fmt.Errorf("invalid outbound port claim: %d", port)
+			return nil, nil, false, fmt.Errorf("invalid outbound port claim: %d", port)
 		}
 		if len(cfg.AllowedOutboundPorts) > 0 && !portAllowed(cfg.AllowedOutboundPorts, port) {
-			return nil, fmt.Errorf("outbound port claim %d is not allowed by server config", port)
+			rejected = appendRejected(rejected, &truncated, protocol.RejectedClaim{
+				Kind:   protocol.RejectedKindOutboundPort,
+				Code:   protocol.RejectedCodeOutboundPortNotAllowed,
+				Value:  strconv.Itoa(port),
+				Reason: fmt.Sprintf("outbound port %d is not in allowedOutboundPorts", port),
+			})
+			continue
 		}
 		if _, ok := uniq[port]; ok {
 			continue
@@ -744,7 +964,96 @@ func normalizeOutboundPortClaims(cfg *config.Config, outboundAllowed bool, ports
 		out = append(out, port)
 	}
 	sort.Ints(out)
-	return out, nil
+	return out, rejected, truncated, nil
+}
+
+// terminalKind discriminates close-reason encoding behavior.
+//
+//   - policyShaped: the terminal cause IS the policy disposition (empty-after-filter,
+//     reauth set-drift). The close-reason carries codes from rejected so the device
+//     can recover.
+//   - inputMalformed: the terminal cause is malformed input (port out of range,
+//     UDP timeout config inversion, intra-claim contradiction). The close-reason
+//     carries the fallback error string; any accumulated soft-rejects from earlier
+//     normalizers would misdirect the operator.
+type terminalKind int
+
+const (
+	terminalPolicyShaped terminalKind = iota
+	terminalInputMalformed
+)
+
+// closeReasonByteBudget is the RFC 6455 close-frame reason field limit.
+// gorilla/websocket's FormatCloseMessage builds 2+len(text) bytes; control
+// frames cap at 125, leaving 123 bytes for the reason text.
+const closeReasonByteBudget = 123
+
+// closeReasonValueCharsetRE — Value must match this for inclusion in the
+// close-reason. Non-matching values are replaced with the literal "<elided>"
+// token; full value remains in the relay log. ASCII-only by construction so
+// (a) ':' and ',' separators never collide with content, (b) UTF-8 mid-codepoint
+// truncation is impossible.
+var closeReasonValueCharsetRE = regexp.MustCompile(`^[a-z0-9._-]+$`)
+
+const closeReasonElided = "<elided>"
+
+// encodeRejectedReason builds the WebSocket 1008 close-frame reason string
+// describing why the session is being terminated. See terminalKind for the
+// discrimination semantics. Hard-bounded at closeReasonByteBudget.
+func encodeRejectedReason(kind terminalKind, rejected []protocol.RejectedClaim, fallback string) string {
+	if kind == terminalInputMalformed {
+		// Malformed input — the rejected slice (if any) is not the cause.
+		// Truncate fallback to budget; do not emit codes.
+		return truncateBytes(fallback, closeReasonByteBudget)
+	}
+
+	// terminalPolicyShaped: emit codes; fall back to fallback string if rejected is empty.
+	if len(rejected) == 0 {
+		return truncateBytes(fallback, closeReasonByteBudget)
+	}
+
+	buf := make([]byte, 0, closeReasonByteBudget)
+	buf = append(buf, protocol.ClosePolicyReasonPrefix...)
+	dropped := false
+	for i, r := range rejected {
+		value := r.Value
+		if !closeReasonValueCharsetRE.MatchString(value) {
+			value = closeReasonElided
+		}
+		entry := r.Code + ":" + value
+		sep := ""
+		if i > 0 {
+			sep = ","
+		}
+		// Reserve room for ",..." suffix if dropping further entries becomes necessary.
+		// On the LAST entry we don't need the reserve; but checking unconditionally is simpler
+		// and the small loss is acceptable.
+		need := len(sep) + len(entry)
+		reserve := 0
+		if i+1 < len(rejected) {
+			reserve = len(protocol.ClosePolicyReasonTruncTail)
+		}
+		if len(buf)+need+reserve > closeReasonByteBudget {
+			dropped = true
+			break
+		}
+		buf = append(buf, sep...)
+		buf = append(buf, entry...)
+	}
+	if dropped {
+		buf = append(buf, protocol.ClosePolicyReasonTruncTail...)
+	}
+	return string(buf)
+}
+
+// truncateBytes returns s truncated to at most n bytes. Plain byte-cut; safe
+// here because callers either pass ASCII (fallback path inside encoder) or
+// accept best-effort truncation for raw error strings.
+func truncateBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
 func portAllowed(allowlist []int, port int) bool {

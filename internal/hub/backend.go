@@ -55,6 +55,21 @@ type Backend struct {
 	weight        int
 	policyVersion string
 
+	// rejected holds the soft-rejected claims from the initial handshake.
+	// Informational only — never branched on inside the data path. Read once
+	// in handleBackendConnect for the post-register log line. Reauth does not
+	// mutate this field; the per-reauth rejected list is logged/sent via the
+	// reauth-result frame path and not persisted.
+	rejected  []protocol.RejectedClaim
+	truncated bool
+
+	// connWriteMu serializes writes to conn. Gorilla/websocket requires
+	// "one concurrent writer." writePump (data + ping) and sendPolicyClose
+	// and the writePump-internal control lane all acquire this for the
+	// duration of each WriteMessage call. Pre-StartPumps writes (handshake
+	// terminal at hub.go) do NOT need the mutex — writePump isn't running.
+	connWriteMu sync.Mutex
+
 	clients sync.Map
 
 	// Two-lane outbound channel: control messages (priority) and data messages.
@@ -82,8 +97,9 @@ type Backend struct {
 	httpClient *http.Client
 
 	// Outbound proxy
-	outboundAllowed      bool
-	allowedOutboundPorts []int
+	outboundAllowed       bool
+	allowedOutboundPorts  []int
+	outboundPortsExplicit bool // true if the attestation claim listed allowed_outbound_ports (even if all soft-rejected); see AttestationMetadata doc
 	outboundIDs          sync.Map     // uuid.UUID → struct{}: tracks outbound clientIDs
 	outboundConnCount    atomic.Int64 // established outbound connections
 	inFlightDials        atomic.Int64 // pending dial attempts
@@ -169,9 +185,12 @@ func NewBackend(conn *websocket.Conn, meta *AttestationMetadata, cfg *config.Con
 		maintenanceCap:       maintenanceCap,
 		authorizerStatusURI:  meta.AuthorizerStatusURI,
 		httpClient:           httpClient,
-		outboundAllowed:      meta.OutboundAllowed,
-		allowedOutboundPorts: meta.cloneAllowedOutboundPorts(),
-		maxOutboundConns:     cfg.MaxOutboundConns(),
+		outboundAllowed:       meta.OutboundAllowed,
+		allowedOutboundPorts:  meta.cloneAllowedOutboundPorts(),
+		outboundPortsExplicit: meta.OutboundPortsExplicit,
+		maxOutboundConns:      cfg.MaxOutboundConns(),
+		rejected:             meta.cloneRejected(),
+		truncated:            meta.Truncated,
 	}
 
 	if b.reauthInterval > 0 && b.reauthGrace <= 0 {
@@ -183,6 +202,28 @@ func NewBackend(conn *websocket.Conn, meta *AttestationMetadata, cfg *config.Con
 
 func (b *Backend) ID() string {
 	return b.id
+}
+
+// acceptedClaims builds the wire-format AcceptedClaims from the backend's
+// filtered (registered) sets. Mirrors the structure of AttestationMetadata
+// but reads from Backend's stable post-register state.
+func (b *Backend) acceptedClaims() protocol.AcceptedClaims {
+	udp := make([]protocol.UDPRouteClaim, 0, len(b.udpRoutes))
+	for _, r := range b.udpRoutes {
+		seconds := int(r.FlowIdleTimeout / time.Second)
+		udp = append(udp, protocol.UDPRouteClaim{
+			Port:                   r.Port,
+			FlowIdleTimeoutSeconds: &seconds,
+		})
+	}
+	return protocol.AcceptedClaims{
+		Hostnames:             append([]string{}, b.hostnames...),
+		TCPPorts:              append([]int{}, b.tcpPorts...),
+		UDPRoutes:             udp,
+		OutboundAllowed:       b.outboundAllowed,
+		AllowedOutboundPorts:  append([]int{}, b.allowedOutboundPorts...),
+		OutboundPortsExplicit: b.outboundPortsExplicit,
+	}
 }
 
 // ReplenishStats returns the lifetime credit replenishment counters for
@@ -352,6 +393,11 @@ func (b *Backend) AttachBandwidthScheduler(s *bandwidth.Scheduler) {
 	}
 }
 
+// Close tears down the backend connection. **Bare close — sends NO 1008
+// close-frame to the peer.** For policy-violation terminals (where the
+// device must learn WHY the session ended), call sendPolicyClose(rejected, err)
+// first, which writes a 1008 frame with rejected codes before invoking Close.
+// See hub.encodeRejectedReason and Backend.sendPolicyClose.
 func (b *Backend) Close() {
 	b.closeOnce.Do(func() {
 		b.closed.Store(true)
@@ -697,7 +743,11 @@ func (b *Backend) readPump() {
 	for {
 		messageType, message, err := b.conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+			// ClosePolicyViolation is the expected close code when a policy
+			// terminal (set drift, empty-after-filter) fires; relay's close
+			// frame carries rejected codes in the reason string. Don't log as
+			// ERROR — the relay's own INFO log lists the codes.
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.ClosePolicyViolation) {
 				log.Printf("ERROR: Unexpected close error from backend %s: %v", b.id, err)
 			}
 			break
@@ -956,7 +1006,13 @@ func (b *Backend) handleOutboundConnect(msg protocol.ControlMessage) {
 		sendFailure(fmt.Sprintf("outbound port %d not allowed by server", port))
 		return
 	}
-	if len(b.allowedOutboundPorts) > 0 && !portAllowed(b.allowedOutboundPorts, port) {
+	// Use the explicit-list bit, not len(). The slice can be empty when the
+	// backend's attestation claim listed ports but ALL got soft-rejected
+	// (e.g., the device claimed [25] against a server allowlist of [443]).
+	// Empty-slice-via-soft-reject means "device restricted itself to nothing",
+	// NOT "device unrestricted" — falling back to len() would let the device
+	// dial any server-allowed port.
+	if b.outboundPortsExplicit && !portAllowed(b.allowedOutboundPorts, port) {
 		sendFailure(fmt.Sprintf("outbound port %d not allowed for this backend", port))
 		return
 	}
@@ -1071,6 +1127,15 @@ func (b *Backend) writePump() {
 	}()
 
 	writeOutbound := func(outbound outboundMessage) bool {
+		b.connWriteMu.Lock()
+		defer b.connWriteMu.Unlock()
+		// RFC 6455 §5.5.1: no data frames after a Close frame. If sendPolicyClose
+		// has already written the 1008 frame and set closed=true, skip this
+		// write — bytes-after-close are spec violations and would log a
+		// confusing post-mortem "Failed to write" ERROR on every policy-close.
+		if b.closed.Load() {
+			return false
+		}
 		_ = b.conn.SetWriteDeadline(time.Now().Add(writeWait))
 		if err := b.conn.WriteMessage(outbound.messageType, outbound.data); err != nil {
 			log.Printf("ERROR: Failed to write to backend %s: %v", b.id, err)
@@ -1099,8 +1164,15 @@ func (b *Backend) writePump() {
 				return
 			}
 		case <-ticker.C:
+			b.connWriteMu.Lock()
+			if b.closed.Load() {
+				b.connWriteMu.Unlock()
+				return
+			}
 			_ = b.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := b.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			err := b.conn.WriteMessage(websocket.PingMessage, nil)
+			b.connWriteMu.Unlock()
+			if err != nil {
 				return
 			}
 		}
@@ -1127,9 +1199,13 @@ func (b *Backend) reauthLoop() {
 		case <-b.quit:
 			return
 		case <-timer.C:
-			if err := b.performReauth(); err != nil {
+			rejected, _, terminalKind, err := b.performReauth()
+			if err != nil {
 				log.Printf("ERROR: Re-authentication failed for backend %s: %v", b.id, err)
-				b.Close()
+				// Policy-shaped reauth failure (set drift, empty-after-filter) → encode
+				// rejected codes in 1008 close-reason so device learns the cause.
+				// Input-malformed → fallback prose only.
+				b.sendPolicyClose(terminalKind, rejected, err)
 				return
 			}
 			next := b.reauthInterval
@@ -1142,7 +1218,12 @@ func (b *Backend) reauthLoop() {
 	}
 }
 
-func (b *Backend) performReauth() error {
+// performReauth returns (rejected, truncated, terminalKind, err). On success,
+// err is nil; rejected may still be non-empty (informational disposition for
+// the reauth-result frame). On terminal error, err is non-nil and terminalKind
+// indicates whether the cause is policy-shaped (codes go in close-reason) or
+// input-malformed (fallback prose only).
+func (b *Backend) performReauth() ([]protocol.RejectedClaim, bool, terminalKind, error) {
 	if b.authorizerStatusURI != "" {
 		for {
 			healthy, err := b.authorizerHealthy()
@@ -1159,13 +1240,13 @@ func (b *Backend) performReauth() error {
 
 	nonce, err := generateNonce()
 	if err != nil {
-		return fmt.Errorf("generate nonce: %w", err)
+		return nil, false, terminalInputMalformed, fmt.Errorf("generate nonce: %w", err)
 	}
 
 	challenge := protocol.ChallengeMessage{Type: protocol.ChallengeReauth, Nonce: nonce}
 	payload, err := json.Marshal(challenge)
 	if err != nil {
-		return fmt.Errorf("marshal reauth challenge: %w", err)
+		return nil, false, terminalInputMalformed, fmt.Errorf("marshal reauth challenge: %w", err)
 	}
 
 	b.prepareForNonce(nonce)
@@ -1179,11 +1260,11 @@ func (b *Backend) performReauth() error {
 	select {
 	case <-b.quit:
 		b.clearPendingNonce()
-		return errors.New("backend closing during reauth challenge")
+		return nil, false, terminalInputMalformed, errors.New("backend closing during reauth challenge")
 	case b.outgoingControl <- outbound:
 	default:
 		b.clearPendingNonce()
-		return errors.New("reauth challenge channel full")
+		return nil, false, terminalInputMalformed, errors.New("reauth challenge channel full")
 	}
 
 	// Drain any stale token.
@@ -1199,80 +1280,134 @@ func (b *Backend) performReauth() error {
 	select {
 	case <-b.quit:
 		b.clearPendingNonce()
-		return errors.New("backend closed during reauth")
+		return nil, false, terminalInputMalformed, errors.New("backend closed during reauth")
 	case <-timer.C:
 		b.clearPendingNonce()
-		return fmt.Errorf("reauthentication timed out after %s", b.reauthGrace)
+		return nil, false, terminalInputMalformed, fmt.Errorf("reauthentication timed out after %s", b.reauthGrace)
 	case token = <-b.reauthTokens:
 	}
 	b.clearPendingNonce()
 
-	return b.processReauthToken(token, nonce)
+	rejected, truncated, terminalKind, err := b.processReauthToken(token, nonce)
+	if err != nil {
+		return rejected, truncated, terminalKind, err
+	}
+
+	// Send reauth-result frame on success via the priority control lane. Frame
+	// is informational; enqueue failure (channel full) is best-effort drop.
+	b.sendReauthResult(rejected, truncated)
+
+	logRejectedCodes(b.id, rejected, truncated)
+
+	return rejected, truncated, terminalPolicyShaped, nil
 }
 
-func (b *Backend) processReauthToken(token, expectedNonce string) error {
+func (b *Backend) processReauthToken(token, expectedNonce string) ([]protocol.RejectedClaim, bool, terminalKind, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), authTimeout)
 	defer cancel()
 
 	claims, err := b.validator.Validate(ctx, token)
 	if err != nil {
-		return fmt.Errorf("validate token: %w", err)
+		return nil, false, terminalInputMalformed, fmt.Errorf("validate token: %w", err)
 	}
 	if claims.SessionNonce != expectedNonce {
-		return fmt.Errorf("session nonce mismatch: expected %s got %s", expectedNonce, claims.SessionNonce)
+		return nil, false, terminalInputMalformed, fmt.Errorf("session nonce mismatch: expected %s got %s", expectedNonce, claims.SessionNonce)
 	}
 
 	return b.applyClaims(claims)
 }
 
-func (b *Backend) applyClaims(claims *auth.Claims) error {
+// applyClaims returns (rejected, truncated, terminalKind, err). Reauth Option A:
+// the device's claim set is expected to remain stable for the session lifetime;
+// set-drift between handshake-time and reauth-time is terminal-policy-shaped
+// (the client must reconnect to re-handshake under the new claim set).
+//
+// CONFIG-IMMUTABILITY INVARIANT: This function assumes h.config.AllowedTCPPortClaims
+// (and siblings) are immutable for the process lifetime. Verified at write time
+// (no hot-reload patterns in the codebase). Any future config-reload PR MUST
+// first redesign Option A here — otherwise a legitimate operator allowlist
+// change will terminate healthy long-running sessions at the next reauth tick.
+func (b *Backend) applyClaims(claims *auth.Claims) ([]protocol.RejectedClaim, bool, terminalKind, error) {
+	var allRejected []protocol.RejectedClaim
+	var anyTruncated bool
+
 	var normalizedHosts []string
 	if len(claims.Hostnames) > 0 {
-		var err error
-		normalizedHosts, err = normalizeHostnames(claims.Hostnames)
+		hosts, rejected, truncated, err := normalizeHostnames(claims.Hostnames)
 		if err != nil {
-			return err
+			return nil, false, terminalInputMalformed, err
 		}
+		normalizedHosts = hosts
+		allRejected = append(allRejected, rejected...)
+		anyTruncated = anyTruncated || truncated
 	}
 
-	tcpPorts, err := normalizeTCPPortClaims(b.config, claims.TCPPorts)
+	tcpPorts, tcpRejected, tcpTrunc, err := normalizeTCPPortClaims(b.config, claims.TCPPorts)
 	if err != nil {
-		return err
+		return nil, false, terminalInputMalformed, err
 	}
-	udpRoutes, err := normalizeUDPRouteClaims(b.config, claims.UDPRoutes)
+	allRejected = append(allRejected, tcpRejected...)
+	anyTruncated = anyTruncated || tcpTrunc
+
+	udpRoutes, udpRejected, udpTrunc, err := normalizeUDPRouteClaims(b.config, claims.UDPRoutes)
 	if err != nil {
-		return err
+		return nil, false, terminalInputMalformed, err
 	}
+	allRejected = append(allRejected, udpRejected...)
+	anyTruncated = anyTruncated || udpTrunc
 
 	if len(normalizedHosts) == 0 && len(tcpPorts) == 0 && len(udpRoutes) == 0 {
-		return errors.New("claims missing hostnames and port claims")
+		return allRejected, anyTruncated, terminalPolicyShaped, errors.New("claims missing hostnames and port claims")
 	}
 
 	if !sameStringSets(normalizedHosts, b.hostnames) {
-		return errors.New("hostnames in token differ from registered set")
+		return allRejected, anyTruncated, terminalPolicyShaped, errors.New("hostnames in token differ from registered set")
 	}
 	if !sameIntSets(tcpPorts, b.tcpPorts) {
-		return errors.New("tcp port claims in token differ from registered set")
+		return allRejected, anyTruncated, terminalPolicyShaped, errors.New("tcp port claims in token differ from registered set")
 	}
 	if !sameUDPRoutes(udpRoutes, b.udpRoutes) {
-		return errors.New("udp route claims in token differ from registered set")
+		return allRejected, anyTruncated, terminalPolicyShaped, errors.New("udp route claims in token differ from registered set")
 	}
 	if claims.OutboundAllowed != b.outboundAllowed {
-		return errors.New("outbound_allowed in token differs from registered value")
+		return allRejected, anyTruncated, terminalPolicyShaped, errors.New("outbound_allowed in token differs from registered value")
 	}
-	outboundPorts, err := normalizeOutboundPortClaims(b.config, claims.OutboundAllowed, claims.AllowedOutboundPorts)
+	outboundPorts, obRejected, obTrunc, err := normalizeOutboundPortClaims(b.config, claims.OutboundAllowed, claims.AllowedOutboundPorts)
 	if err != nil {
-		return err
+		return nil, false, terminalInputMalformed, err
 	}
+	allRejected = append(allRejected, obRejected...)
+	anyTruncated = anyTruncated || obTrunc
+
 	if !sameIntSets(outboundPorts, b.allowedOutboundPorts) {
-		return errors.New("outbound port claims in token differ from registered set")
+		return allRejected, anyTruncated, terminalPolicyShaped, errors.New("outbound port claims in token differ from registered set")
+	}
+	// The "claim had explicit outbound ports" bit must not drift across reauth —
+	// flipping it would change privilege boundaries at outbound-dial time even
+	// when the filtered set is the same (both empty).
+	if (len(claims.AllowedOutboundPorts) > 0) != b.outboundPortsExplicit {
+		return allRejected, anyTruncated, terminalPolicyShaped, errors.New("outbound_ports_explicit in token differs from registered value")
 	}
 
 	if claims.Weight != 0 && claims.Weight != b.weight {
 		// Weight changes are not supported without rebalancing pools.
-		return errors.New("weight change requested via token is not supported")
+		return allRejected, anyTruncated, terminalPolicyShaped, errors.New("weight change requested via token is not supported")
 	}
 
+	// Validate all input-malformed conditions BEFORE applying any mutations
+	// so applyClaims is transactional w.r.t. observable backend state. If a
+	// future patch loosens these terminals to soft errors, no half-applied
+	// state remains on the Backend.
+	if capVal := claims.MaintenanceGraceCapSeconds; capVal != nil && *capVal < 0 {
+		return allRejected, anyTruncated, terminalInputMalformed, errors.New("maintenance_grace_cap_seconds cannot be negative")
+	}
+	if uri := claims.AuthorizerStatusURI; uri != "" {
+		if err := validateAuthorizerStatusURI(uri); err != nil {
+			return allRejected, anyTruncated, terminalInputMalformed, fmt.Errorf("invalid authorizer_status_uri in reauth token: %w", err)
+		}
+	}
+
+	// All validations passed — apply mutations.
 	if val := claims.ReauthIntervalSeconds; val != nil && *val > 0 {
 		b.reauthInterval = time.Duration(*val) * time.Second
 	} else {
@@ -1288,16 +1423,10 @@ func (b *Backend) applyClaims(claims *auth.Claims) error {
 	}
 
 	if capVal := claims.MaintenanceGraceCapSeconds; capVal != nil {
-		if *capVal < 0 {
-			return errors.New("maintenance_grace_cap_seconds cannot be negative")
-		}
 		b.maintenanceCap = time.Duration(*capVal) * time.Second
 	}
 
 	if uri := claims.AuthorizerStatusURI; uri != "" {
-		if err := validateAuthorizerStatusURI(uri); err != nil {
-			return fmt.Errorf("invalid authorizer_status_uri in reauth token: %w", err)
-		}
 		b.authorizerStatusURI = uri
 	} else {
 		b.authorizerStatusURI = ""
@@ -1305,7 +1434,63 @@ func (b *Backend) applyClaims(claims *auth.Claims) error {
 	b.policyVersion = claims.PolicyVersion
 	b.maintenanceUsed = 0
 
-	return nil
+	return allRejected, anyTruncated, terminalPolicyShaped, nil
+}
+
+// sendReauthResult enqueues an AttestationResultMessage(reauth_result) onto
+// outgoingControl. Best-effort: full-channel → WARN+drop. Informational frame;
+// reauth itself already succeeded.
+func (b *Backend) sendReauthResult(rejected []protocol.RejectedClaim, truncated bool) {
+	msg := protocol.AttestationResultMessage{
+		Type:      protocol.AttestationResultReauth,
+		Accepted:  b.acceptedClaims(),
+		Rejected:  rejected,
+		Truncated: truncated,
+	}
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("WARN: Backend %s reauth result frame marshal failed: %v", b.id, err)
+		return
+	}
+	if len(payload) > maxAttestationResultPayloadBytes {
+		log.Printf("WARN: Backend %s reauth_result frame oversize (%d > %d); dropping (informational frame).", b.id, len(payload), maxAttestationResultPayloadBytes)
+		return
+	}
+	outbound := outboundMessage{messageType: websocket.TextMessage, data: payload}
+	select {
+	case <-b.quit:
+		return
+	case b.outgoingControl <- outbound:
+	default:
+		log.Printf("WARN: Backend %s reauth result frame dropped (channel full)", b.id)
+	}
+}
+
+// sendPolicyClose writes a 1008 close frame with rejected codes encoded in the
+// reason string per encodeRejectedReason semantics, then invokes Close. The
+// frame write acquires connWriteMu to serialize with writePump. This is the
+// ONLY path that should be used when a policy-violation terminal needs the
+// device to learn the cause; bare Close() sends no frame.
+//
+// The closed.Store(true) is set BEFORE releasing connWriteMu so any concurrent
+// writePump iteration waiting on the mutex will observe closed=true on acquire
+// and skip its data/ping write — preventing data-frames-after-close per RFC
+// 6455 §5.5.1 and the spurious "Failed to write" ERROR log that would follow.
+func (b *Backend) sendPolicyClose(kind terminalKind, rejected []protocol.RejectedClaim, fallbackErr error) {
+	fallback := ""
+	if fallbackErr != nil {
+		fallback = fallbackErr.Error()
+	}
+	reason := encodeRejectedReason(kind, rejected, fallback)
+
+	if b.conn != nil {
+		b.connWriteMu.Lock()
+		_ = b.conn.SetWriteDeadline(time.Now().Add(writeWait))
+		_ = b.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, reason))
+		b.closed.Store(true)
+		b.connWriteMu.Unlock()
+	}
+	b.Close()
 }
 
 func (b *Backend) authorizerHealthy() (bool, error) {

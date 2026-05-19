@@ -10,14 +10,14 @@ import (
 func TestNormalizeOutboundPortClaims_DisabledByConfig(t *testing.T) {
 	t.Parallel()
 	cfg := &config.Config{AllowOutbound: false}
-	_, err := normalizeOutboundPortClaims(cfg, true, nil)
+	_, _, _, err := normalizeOutboundPortClaims(cfg, true, nil)
 	require.Error(t, err, "should reject when server disables outbound")
 }
 
 func TestNormalizeOutboundPortClaims_NotAllowedByBackend(t *testing.T) {
 	t.Parallel()
 	cfg := &config.Config{AllowOutbound: true}
-	ports, err := normalizeOutboundPortClaims(cfg, false, nil)
+	ports, _, _, err := normalizeOutboundPortClaims(cfg, false, nil)
 	require.NoError(t, err)
 	require.Nil(t, ports)
 }
@@ -25,14 +25,14 @@ func TestNormalizeOutboundPortClaims_NotAllowedByBackend(t *testing.T) {
 func TestNormalizeOutboundPortClaims_PortsWithoutAllowed(t *testing.T) {
 	t.Parallel()
 	cfg := &config.Config{AllowOutbound: true}
-	_, err := normalizeOutboundPortClaims(cfg, false, []int{80})
+	_, _, _, err := normalizeOutboundPortClaims(cfg, false, []int{80})
 	require.Error(t, err, "ports set without outbound_allowed should error")
 }
 
 func TestNormalizeOutboundPortClaims_AllowedAllPorts(t *testing.T) {
 	t.Parallel()
 	cfg := &config.Config{AllowOutbound: true}
-	ports, err := normalizeOutboundPortClaims(cfg, true, nil)
+	ports, _, _, err := normalizeOutboundPortClaims(cfg, true, nil)
 	require.NoError(t, err)
 	require.Nil(t, ports, "empty means all ports when allowed")
 }
@@ -40,7 +40,7 @@ func TestNormalizeOutboundPortClaims_AllowedAllPorts(t *testing.T) {
 func TestNormalizeOutboundPortClaims_DeduplicatesAndSorts(t *testing.T) {
 	t.Parallel()
 	cfg := &config.Config{AllowOutbound: true}
-	ports, err := normalizeOutboundPortClaims(cfg, true, []int{443, 80, 443, 25})
+	ports, _, _, err := normalizeOutboundPortClaims(cfg, true, []int{443, 80, 443, 25})
 	require.NoError(t, err)
 	require.Equal(t, []int{25, 80, 443}, ports)
 }
@@ -48,9 +48,9 @@ func TestNormalizeOutboundPortClaims_DeduplicatesAndSorts(t *testing.T) {
 func TestNormalizeOutboundPortClaims_InvalidPort(t *testing.T) {
 	t.Parallel()
 	cfg := &config.Config{AllowOutbound: true}
-	_, err := normalizeOutboundPortClaims(cfg, true, []int{0})
+	_, _, _, err := normalizeOutboundPortClaims(cfg, true, []int{0})
 	require.Error(t, err)
-	_, err = normalizeOutboundPortClaims(cfg, true, []int{70000})
+	_, _, _, err = normalizeOutboundPortClaims(cfg, true, []int{70000})
 	require.Error(t, err)
 }
 
@@ -59,13 +59,15 @@ func TestNormalizeOutboundPortClaims_ServerAllowlistEnforced(t *testing.T) {
 	cfg := &config.Config{AllowOutbound: true, AllowedOutboundPorts: []int{80, 443}}
 
 	// Allowed
-	ports, err := normalizeOutboundPortClaims(cfg, true, []int{80})
+	ports, _, _, err := normalizeOutboundPortClaims(cfg, true, []int{80})
 	require.NoError(t, err)
 	require.Equal(t, []int{80}, ports)
 
-	// Not in server allowlist
-	_, err = normalizeOutboundPortClaims(cfg, true, []int{25})
-	require.Error(t, err)
+	// Not in server allowlist → soft-rejected, NOT terminal.
+	ports, rejected, _, err := normalizeOutboundPortClaims(cfg, true, []int{25})
+	require.NoError(t, err)
+	require.Empty(t, ports)
+	require.Len(t, rejected, 1)
 }
 
 func TestConfigMaxOutboundConns_Defaults(t *testing.T) {

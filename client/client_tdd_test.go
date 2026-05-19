@@ -542,3 +542,105 @@ func TestHandleControlMessageWithUnrecognizedTransport(t *testing.T) {
 		t.Fatalf("expected unrecognized transport to default to TCP, got %s", capturedReq.Transport)
 	}
 }
+
+func TestHandleTextMessageEmitsHandshakeResultEvent(t *testing.T) {
+	c := newTestClient(t)
+	c.beginSession()
+
+	msg := []byte(`{"type":"handshake_result","accepted":{"tcp_ports":[443]},"rejected":[{"kind":"tcp_port","code":"tcp_port_not_allowed","value":"2222"}]}`)
+	if err := c.handleTextMessage(msg); err != nil {
+		t.Fatalf("handleTextMessage: %v", err)
+	}
+
+	// emit() pushes to c.eventCh; pull directly without spinning up the dispatcher.
+	select {
+	case ev := <-c.eventCh:
+		if ev.Type != EventHandshakeResult {
+			t.Fatalf("expected EventHandshakeResult, got %v", ev.Type)
+		}
+		if ev.AcceptedClaims == nil || len(ev.AcceptedClaims.TCPPorts) != 1 || ev.AcceptedClaims.TCPPorts[0] != 443 {
+			t.Fatalf("accepted mismatch: %+v", ev.AcceptedClaims)
+		}
+		if len(ev.RejectedClaims) != 1 || ev.RejectedClaims[0].Value != "2222" {
+			t.Fatalf("rejected mismatch: %+v", ev.RejectedClaims)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("expected EventHandshakeResult to be queued")
+	}
+}
+
+func TestHandleTextMessageEmitsReauthResultEvent(t *testing.T) {
+	c := newTestClient(t)
+	c.beginSession()
+
+	msg := []byte(`{"type":"reauth_result","accepted":{"tcp_ports":[443]},"rejected":[]}`)
+	if err := c.handleTextMessage(msg); err != nil {
+		t.Fatalf("handleTextMessage: %v", err)
+	}
+
+	select {
+	case ev := <-c.eventCh:
+		if ev.Type != EventReauthResult {
+			t.Fatalf("expected EventReauthResult, got %v", ev.Type)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("expected EventReauthResult to be queued")
+	}
+}
+
+func TestHandleTextMessageUnknownTypeIsTolerant(t *testing.T) {
+	c := newTestClient(t)
+	c.beginSession()
+
+	msg := []byte(`{"type":"some_future_frame","data":"whatever"}`)
+	if err := c.handleTextMessage(msg); err != nil {
+		t.Fatalf("expected unknown-type to be tolerated, got error: %v", err)
+	}
+}
+
+func TestParsePolicyCloseReason_PolicyPrefix(t *testing.T) {
+	rejected, truncated, raw := parsePolicyCloseReason("policy:tcp_port_not_allowed:2222,outbound_port_not_allowed:25")
+	if len(rejected) != 2 {
+		t.Fatalf("expected 2 entries, got %d: %+v", len(rejected), rejected)
+	}
+	if rejected[0].Code != "tcp_port_not_allowed" || rejected[0].Value != "2222" {
+		t.Errorf("first entry mismatch: %+v", rejected[0])
+	}
+	if truncated {
+		t.Error("unexpected truncated=true")
+	}
+	if raw != "" {
+		t.Errorf("expected empty raw, got %q", raw)
+	}
+}
+
+func TestParsePolicyCloseReason_TruncationTail(t *testing.T) {
+	rejected, truncated, _ := parsePolicyCloseReason("policy:tcp_port_not_allowed:2222,...")
+	if len(rejected) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(rejected))
+	}
+	if !truncated {
+		t.Error("expected truncated=true")
+	}
+}
+
+func TestParsePolicyCloseReason_NoPolicyPrefix(t *testing.T) {
+	rejected, _, raw := parsePolicyCloseReason("session ended: unknown error")
+	if len(rejected) != 0 {
+		t.Errorf("expected no rejected, got %+v", rejected)
+	}
+	if raw != "session ended: unknown error" {
+		t.Errorf("raw mismatch: %q", raw)
+	}
+}
+
+func TestParsePolicyCloseReason_MalformedEntry(t *testing.T) {
+	// Missing ':' in second entry → parse anomaly, fall back to raw.
+	rejected, _, raw := parsePolicyCloseReason("policy:tcp_port_not_allowed:2222,malformed_no_colon")
+	if len(rejected) != 0 {
+		t.Errorf("expected fall-back to raw, got rejected=%+v", rejected)
+	}
+	if raw == "" {
+		t.Error("expected raw to carry original on parse failure")
+	}
+}

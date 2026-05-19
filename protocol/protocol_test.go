@@ -79,6 +79,74 @@ func TestBackendClaims_OutboundFields(t *testing.T) {
 	}
 }
 
+func TestAttestationResultMessage_RoundTrip(t *testing.T) {
+	five := 5
+	orig := AttestationResultMessage{
+		Type: AttestationResultHandshake,
+		Accepted: AcceptedClaims{
+			Hostnames:            []string{"a.example.com", "b.example.com"},
+			TCPPorts:             []int{443, 80},
+			UDPRoutes:            []UDPRouteClaim{{Port: 53, FlowIdleTimeoutSeconds: &five}},
+			OutboundAllowed:      true,
+			AllowedOutboundPorts: []int{443},
+		},
+		Rejected: []RejectedClaim{
+			{Kind: RejectedKindTCPPort, Code: RejectedCodeTCPPortNotAllowed, Value: "2222", Reason: "not in allowlist"},
+		},
+		Truncated: true,
+	}
+	data, err := json.Marshal(orig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded AttestationResultMessage
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Type != AttestationResultHandshake {
+		t.Errorf("type = %q", decoded.Type)
+	}
+	if len(decoded.Rejected) != 1 || decoded.Rejected[0].Code != RejectedCodeTCPPortNotAllowed {
+		t.Errorf("rejected mismatch: %+v", decoded.Rejected)
+	}
+	if !decoded.Truncated {
+		t.Error("truncated lost")
+	}
+	if len(decoded.Accepted.TCPPorts) != 2 {
+		t.Errorf("tcp_ports lost: %v", decoded.Accepted.TCPPorts)
+	}
+}
+
+// TestHubBackendTextFrames_HaveTypeField enforces the discriminator contract:
+// every hub→backend text-frame type has a non-empty "type" field that survives
+// JSON round-trip. The contract is documented in protocol.go and consumed by
+// client/handleTextMessage's envelope-decode pattern.
+func TestHubBackendTextFrames_HaveTypeField(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  interface{}
+	}{
+		{"ChallengeMessage_handshake", ChallengeMessage{Type: ChallengeHandshake, Nonce: "n"}},
+		{"ChallengeMessage_reauth", ChallengeMessage{Type: ChallengeReauth, Nonce: "n"}},
+		{"AttestationResult_handshake", AttestationResultMessage{Type: AttestationResultHandshake}},
+		{"AttestationResult_reauth", AttestationResultMessage{Type: AttestationResultReauth}},
+	}
+	for _, tt := range tests {
+		data, err := json.Marshal(tt.msg)
+		if err != nil {
+			t.Fatalf("%s: marshal: %v", tt.name, err)
+		}
+		var env map[string]interface{}
+		if err := json.Unmarshal(data, &env); err != nil {
+			t.Fatalf("%s: unmarshal envelope: %v", tt.name, err)
+		}
+		typ, ok := env["type"].(string)
+		if !ok || typ == "" {
+			t.Errorf("%s: missing or empty 'type' discriminator: %s", tt.name, data)
+		}
+	}
+}
+
 func TestBackendClaims_OutboundOmitEmpty(t *testing.T) {
 	// When outbound is not set, the fields should be omitted from JSON.
 	claims := BackendClaims{Weight: 1}

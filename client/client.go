@@ -195,8 +195,22 @@ const (
 	EventPaused
 	EventResumed
 	EventError
+	// EventReauthStarted fires when the client begins reauth (challenge received).
 	EventReauthStarted
+	// EventReauthCompleted fires immediately after the client sends its reauth
+	// token. Consumer-actionable signal — does NOT indicate the relay accepted
+	// the token. The accept/reject outcome arrives later as EventReauthResult
+	// (informational; may not arrive if the relay drops the result frame).
 	EventReauthCompleted
+	// EventHandshakeResult fires when the relay delivers the post-handshake
+	// AttestationResultMessage with the policy disposition (accepted +
+	// rejected claims). Informational only; consumers MUST NOT branch policy
+	// decisions on RejectedClaims content.
+	EventHandshakeResult
+	// EventReauthResult fires when the relay delivers the post-reauth
+	// disposition. Best-effort telemetry — relay may drop this frame on
+	// outgoingControl saturation; consumers MUST NOT block on it.
+	EventReauthResult
 )
 
 func (e EventType) String() string {
@@ -219,6 +233,10 @@ func (e EventType) String() string {
 		return "reauth_started"
 	case EventReauthCompleted:
 		return "reauth_completed"
+	case EventHandshakeResult:
+		return "handshake_result"
+	case EventReauthResult:
+		return "reauth_result"
 	default:
 		return "unknown"
 	}
@@ -236,6 +254,18 @@ type Event struct {
 	// Error context (if applicable)
 	Error  error
 	Reason string
+
+	// Attestation result context. Populated on:
+	//   - EventHandshakeResult / EventReauthResult: Accepted is non-nil,
+	//     RejectedClaims describes the policy disposition.
+	//   - EventDisconnected when the close-reason carried a parseable
+	//     "policy:" prefix: RejectedClaims contains the parsed entries;
+	//     Accepted is nil (close-reason carries codes only, not accepted set).
+	// For terminal Events, Truncated indicates the encoder truncated the
+	// rejected list at the byte budget (count is unreliable).
+	AcceptedClaims *protocol.AcceptedClaims
+	RejectedClaims []protocol.RejectedClaim
+	Truncated      bool
 }
 
 // EventHandler is a callback function for client events.
@@ -605,6 +635,15 @@ type Client struct {
 	// Outbound proxy (SOCKS5)
 	socks5Listener  net.Listener
 	outboundPending sync.Map // uuid.UUID → chan error
+
+	// lastCloseInfo carries the WebSocket *CloseError captured by readPump on
+	// exit to the reconnect-loop disconnect-emit site. Without this plumbing,
+	// the close-reason data (including encoded "policy:" codes from the relay)
+	// is never surfaced on EventDisconnected. Guarded by closeInfoMu; safe to
+	// read in the reconnect loop because c.wg.Wait() establishes the
+	// happens-before with the prior session's readPump.
+	closeInfoMu   sync.Mutex
+	lastCloseInfo *websocket.CloseError
 }
 
 // New creates a new Client instance for a specific backend configuration.
@@ -890,7 +929,12 @@ func (c *Client) Start(ctx context.Context) {
 			})
 
 			c.stats.sessionStart.Store(0)
-			c.emit(Event{Type: EventDisconnected})
+			// Safe to read lastCloseInfo here: c.wg.Wait() above established
+			// the happens-before with the prior session's readPump; the next
+			// session's readPump cannot start until this iteration completes.
+			disconnectEvent := Event{Type: EventDisconnected}
+			c.consumeCloseInfoInto(&disconnectEvent)
+			c.emit(disconnectEvent)
 			log.Printf("INFO: [%s] Disconnected from Nexus Proxy.", c.config.Name)
 			continue
 		}
@@ -909,7 +953,9 @@ func (c *Client) Start(ctx context.Context) {
 			permanentFailures++
 			if permanentFailures >= maxPermanentFailures {
 				log.Printf("ERROR: [%s] Permanent failure after %d attempts: %v. Stopping.", c.config.Name, permanentFailures, err)
-				c.emit(Event{Type: EventError, Error: err, Reason: "permanent_failure"})
+				ev := Event{Type: EventError, Error: err, Reason: "permanent_failure"}
+				c.consumeCloseInfoInto(&ev)
+				c.emit(ev)
 				return // Exit loop
 			}
 			delay = backoffDelay(permanentFailures)
@@ -919,7 +965,9 @@ func (c *Client) Start(ctx context.Context) {
 			delay = maxReconnectDelay
 			log.Printf("WARN: [%s] Rate limited. Backing off for %s", c.config.Name, delay)
 		}
-		c.emit(Event{Type: EventError, Error: err, Reason: catErr.Reason})
+		ev := Event{Type: EventError, Error: err, Reason: catErr.Reason}
+		c.consumeCloseInfoInto(&ev)
+		c.emit(ev)
 
 		select {
 		case <-c.ctx.Done():
@@ -1062,7 +1110,23 @@ func (c *Client) issueToken(ctx context.Context, stage TokenStage, nonce string)
 	return value, nil
 }
 
-func (c *Client) connectAndAuthenticate() error {
+func (c *Client) connectAndAuthenticate() (err error) {
+	// Stash any *CloseError surfaced during the handshake so the reconnect
+	// loop's error-emit can populate Event.RejectedClaims/Truncated for
+	// stage0 / stage1 policy rejections (where readPump never runs to
+	// capture the close info itself).
+	defer func() {
+		if err == nil {
+			return
+		}
+		var ce *websocket.CloseError
+		if errors.As(err, &ce) {
+			c.closeInfoMu.Lock()
+			c.lastCloseInfo = ce
+			c.closeInfoMu.Unlock()
+		}
+	}()
+
 	ctx := c.ctx
 	if ctx == nil {
 		ctx = context.Background()
@@ -1156,7 +1220,20 @@ func (c *Client) readPump() {
 	for {
 		msgType, message, err := ws.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+			// Stash *CloseError so the reconnect-loop disconnect-emit can
+			// surface the close-reason (parsed for policy: prefix) in the
+			// EventDisconnected payload. c.wg.Wait() in the reconnect loop
+			// establishes happens-before; the next session's readPump cannot
+			// start until after the emit site reads and clears.
+			var ce *websocket.CloseError
+			if errors.As(err, &ce) {
+				c.closeInfoMu.Lock()
+				c.lastCloseInfo = ce
+				c.closeInfoMu.Unlock()
+			}
+			// 1008 is expected on benign-drift disconnects; codes surface via
+			// EventDisconnected.RejectedClaims, not as ERROR log spam.
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.ClosePolicyViolation) {
 				log.Printf("ERROR: [%s] Unexpected close from Nexus: %v", c.config.Name, err)
 			}
 			return
@@ -2487,26 +2564,134 @@ func (c *Client) handleBinaryMessage(message []byte) {
 	}
 }
 
+// textEnvelope is the minimal envelope used to dispatch hub→backend text
+// frames by their "type" discriminator. All such frames carry a top-level
+// "type" field per the discriminator contract in protocol/protocol.go.
+type textEnvelope struct {
+	Type string `json:"type"`
+}
+
 func (c *Client) handleTextMessage(message []byte) error {
-	var challenge protocol.ChallengeMessage
-	if err := json.Unmarshal(message, &challenge); err != nil {
-		log.Printf("WARN: [%s] Failed to decode text message from Nexus: %v", c.config.Name, err)
+	var env textEnvelope
+	if err := json.Unmarshal(message, &env); err != nil {
+		log.Printf("WARN: [%s] Failed to decode text message envelope from Nexus: %v", c.config.Name, err)
 		return nil
 	}
 
-	switch challenge.Type {
-	case protocol.ChallengeReauth:
+	switch env.Type {
+	case string(protocol.ChallengeReauth):
+		var challenge protocol.ChallengeMessage
+		if err := json.Unmarshal(message, &challenge); err != nil {
+			log.Printf("WARN: [%s] Failed to decode reauth challenge: %v", c.config.Name, err)
+			return nil
+		}
 		if strings.TrimSpace(challenge.Nonce) == "" {
 			return fmt.Errorf("reauth challenge missing nonce")
 		}
 		return c.handleReauthChallenge(challenge.Nonce)
-	case protocol.ChallengeHandshake:
+	case string(protocol.ChallengeHandshake):
 		// Should not occur after initial handshake; ignore quietly.
 		log.Printf("WARN: [%s] Received unexpected handshake challenge after session establishment", c.config.Name)
+	case string(protocol.AttestationResultHandshake):
+		return c.handleAttestationResult(message, EventHandshakeResult)
+	case string(protocol.AttestationResultReauth):
+		return c.handleAttestationResult(message, EventReauthResult)
 	default:
-		log.Printf("WARN: [%s] Ignoring unknown text message type '%s' from Nexus", c.config.Name, challenge.Type)
+		// Unknown text-frame type. Downgrade to DEBUG (was WARN) for rollout
+		// hygiene — when a new relay ships a new frame type, old-client logs
+		// would otherwise spam WARN across the deploy window. The forward-compat
+		// contract (unknown types are ignored, not erroring) is preserved.
+		log.Printf("DEBUG: [%s] Ignoring unknown text message type '%s' from Nexus", c.config.Name, env.Type)
 	}
 	return nil
+}
+
+// handleAttestationResult decodes an AttestationResultMessage text frame and
+// emits the corresponding Event. Informational only — the relay's policy
+// decisions are already applied; this event surfaces the disposition to
+// consumers (piccolod) for UI / telemetry. Consumers MUST NOT branch policy
+// decisions on RejectedClaims content per the protocol-level contract.
+func (c *Client) handleAttestationResult(payload []byte, eventType EventType) error {
+	var msg protocol.AttestationResultMessage
+	if err := json.Unmarshal(payload, &msg); err != nil {
+		log.Printf("WARN: [%s] Failed to decode attestation_result: %v", c.config.Name, err)
+		return nil
+	}
+	accepted := msg.Accepted
+	c.emit(Event{
+		Type:           eventType,
+		AcceptedClaims: &accepted,
+		RejectedClaims: msg.Rejected,
+		Truncated:      msg.Truncated,
+	})
+	return nil
+}
+
+// consumeCloseInfoInto reads (and clears) c.lastCloseInfo, populates the
+// passed Event's Reason / RejectedClaims / Truncated fields if a 1008 close
+// reason with policy codes was captured, or leaves them unset on plain close.
+// No-op when no close info is pending. Safe to call from both
+// EventDisconnected (post-readPump) and EventError (post-connectAndAuthenticate)
+// emit sites — the underlying mutex serializes; happens-before with the
+// captured readPump exit is established by c.wg.Wait() at the disconnect site.
+func (c *Client) consumeCloseInfoInto(ev *Event) {
+	c.closeInfoMu.Lock()
+	closeInfo := c.lastCloseInfo
+	c.lastCloseInfo = nil
+	c.closeInfoMu.Unlock()
+	if closeInfo == nil {
+		return
+	}
+	rejected, truncated, raw := parsePolicyCloseReason(closeInfo.Text)
+	if len(rejected) > 0 {
+		ev.RejectedClaims = rejected
+		ev.Truncated = truncated
+		if ev.Reason == "" {
+			ev.Reason = closeInfo.Text
+		}
+	} else if ev.Reason == "" {
+		ev.Reason = raw
+	}
+}
+
+// parsePolicyCloseReason parses a 1008 close-frame reason string of the form
+// "policy:<code>:<value>[,<code>:<value>]*[,...]" produced by the relay's
+// encodeRejectedReason helper. Returns the parsed rejected entries, whether
+// truncation was indicated (",..." tail), and the raw fallback string when
+// the reason does not carry the policy prefix.
+//
+// Liberal-charset on Value — accepts any byte sequence between separators,
+// including the relay's "<elided>" sentinel. The "informational only" contract
+// enforces that consumers MUST NOT branch on Value content; a Value beginning
+// with "<" indicates relay-side elision (full value in relay log).
+func parsePolicyCloseReason(text string) (rejected []protocol.RejectedClaim, truncated bool, rawFallback string) {
+	if !strings.HasPrefix(text, protocol.ClosePolicyReasonPrefix) {
+		return nil, false, text
+	}
+	body := text[len(protocol.ClosePolicyReasonPrefix):]
+	// Strip the truncation tail before splitting so we don't produce a final
+	// empty entry from the trailing comma.
+	if strings.HasSuffix(body, protocol.ClosePolicyReasonTruncTail) {
+		truncated = true
+		body = strings.TrimSuffix(body, protocol.ClosePolicyReasonTruncTail)
+	}
+	if body == "" {
+		return nil, truncated, ""
+	}
+	for _, entry := range strings.Split(body, ",") {
+		// Split on the FIRST ':' only — Value is liberal-charset and could in
+		// principle contain ':' if the relay ever relaxes its encoder constraint.
+		idx := strings.Index(entry, ":")
+		if idx <= 0 || idx == len(entry)-1 {
+			// Malformed entry — parse anomaly, fall back to raw.
+			return nil, false, text
+		}
+		rejected = append(rejected, protocol.RejectedClaim{
+			Code:  entry[:idx],
+			Value: entry[idx+1:],
+		})
+	}
+	return rejected, truncated, ""
 }
 
 func (c *Client) handleReauthChallenge(nonce string) error {

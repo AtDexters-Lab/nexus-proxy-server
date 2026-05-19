@@ -122,6 +122,104 @@ type ChallengeMessage struct {
 	Nonce string        `json:"nonce"`
 }
 
+// AttestationResultType identifies a hub→backend disposition frame indicating
+// which claims the relay accepted vs. soft-rejected during attestation.
+type AttestationResultType string
+
+const (
+	AttestationResultHandshake AttestationResultType = "handshake_result"
+	AttestationResultReauth    AttestationResultType = "reauth_result"
+)
+
+// Discriminator contract: all hub→backend text frames carry a top-level
+// "type" field as JSON discriminator (ChallengeMessage and AttestationResultMessage).
+// Future text-frame types MUST follow the same shape; protocol_test.go enforces it.
+
+// Closed-set Kind values for RejectedClaim.
+const (
+	RejectedKindHostname     = "hostname"
+	RejectedKindTCPPort      = "tcp_port"
+	RejectedKindUDPRoute     = "udp_route"
+	RejectedKindOutboundPort = "outbound_port"
+)
+
+// Closed-set Code values for RejectedClaim (snake_case <resource>_<reason>).
+const (
+	RejectedCodeHostnameReservedRouteKey = "hostname_reserved_route_key"
+	RejectedCodeTCPPortNotAllowed        = "tcp_port_not_allowed"
+	RejectedCodeUDPRouteNotAllowed       = "udp_route_not_allowed"
+	RejectedCodeOutboundPortNotAllowed   = "outbound_port_not_allowed"
+)
+
+// RejectedClaim describes a single claim entry the relay soft-rejected.
+//
+// INFORMATIONAL ONLY. Downstream consumers MUST NOT branch policy decisions
+// on rejected entries; future schema changes are explicitly permitted to
+// break consumers that do. See deferred_result_frame_integrity for the
+// signing work that will lift this constraint.
+//
+// Value is ATTACKER-CONTROLLED (a backend's claim string — hostnames can
+// survive IDNA-fallback with embedded control bytes; future Kinds may carry
+// other backend-supplied strings). Log/wire sinks must escape it: the relay's
+// log uses %q formatting; the close-reason path filters to an ASCII charset
+// with <elided> sentinel; the wire frame is JSON-encoded (escapes control
+// bytes by spec). Any new sink reading Value MUST apply a comparable escape.
+//
+// Code is the stable machine-readable string consumers may read for telemetry.
+// Reason is human prose for debug aid; never used for equality or branching.
+type RejectedClaim struct {
+	Kind   string `json:"kind"`
+	Code   string `json:"code"`
+	Value  string `json:"value"`
+	Reason string `json:"reason"`
+}
+
+// AcceptedClaims echoes the final accepted set after policy filtering.
+//
+// OutboundPortsExplicit disambiguates two states that would otherwise look
+// identical on the wire (both produce an empty AllowedOutboundPorts):
+//   - false: the device's attestation claim omitted the port list entirely;
+//            outbound is unrestricted at the backend level (the server-side
+//            allowlist still applies).
+//   - true:  the device's claim listed ports but every entry was soft-rejected
+//            by the server allowlist. Backend-level restriction is in effect
+//            and the device can dial no port (consistent with runtime behavior).
+type AcceptedClaims struct {
+	Hostnames             []string        `json:"hostnames,omitempty"`
+	TCPPorts              []int           `json:"tcp_ports,omitempty"`
+	UDPRoutes             []UDPRouteClaim `json:"udp_routes,omitempty"`
+	OutboundAllowed       bool            `json:"outbound_allowed"`
+	AllowedOutboundPorts  []int           `json:"allowed_outbound_ports,omitempty"`
+	OutboundPortsExplicit bool            `json:"outbound_ports_explicit,omitempty"`
+}
+
+// AttestationResultMessage is a JSON text-frame the hub sends to the backend
+// post-success (handshake or reauth) carrying the policy disposition.
+// On terminal-close paths, rejected codes ride in the 1008 close-frame
+// reason string instead (see hub.encodeRejectedReason).
+type AttestationResultMessage struct {
+	Type      AttestationResultType `json:"type"`
+	Accepted  AcceptedClaims        `json:"accepted"`
+	Rejected  []RejectedClaim       `json:"rejected,omitempty"`
+	Truncated bool                  `json:"truncated,omitempty"`
+}
+
+// RejectedListBound caps the number of rejected entries per Kind in the
+// success-path text frame. Prevents DoS from a hostile backend claiming
+// thousands of disallowed entries.
+const RejectedListBound = 32
+
+// ClosePolicyReasonPrefix is the wire-format prefix for the 1008 close-frame
+// reason when the relay encodes rejected codes (instead of a separate text
+// frame) on terminal close paths. Encoder (hub) and parser (client) share
+// this constant so framing-format drift is a compile error.
+const ClosePolicyReasonPrefix = "policy:"
+
+// ClosePolicyReasonTruncTail is the suffix appended when the encoder dropped
+// trailing entries to fit the 123-byte budget. Client parsers detect this
+// suffix to set Event.Truncated on EventDisconnected.
+const ClosePolicyReasonTruncTail = ",..."
+
 // BackendClaims represents the custom attestation fields shared by both the
 // client (token producer) and the server (token consumer). Each side embeds
 // this struct alongside jwt.RegisteredClaims locally.
